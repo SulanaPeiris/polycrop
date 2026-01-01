@@ -28,4 +28,8 @@ export type RootStackParamList = {
 
   // Settings
   Thresholds: undefined;
+  
+  // camera
+  Camera: undefined;
+
 };

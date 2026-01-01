@@ -1,4 +1,5 @@
 import React from "react";
+import { View, StyleSheet } from "react-native";
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
 import { Ionicons } from "@expo/vector-icons";
 
@@ -7,11 +8,13 @@ import MonitorScreen from "../screens/monitor/MonitorScreen";
 import AlertsScreen from "../screens/alerts/AlertsScreen";
 import ActionsScreen from "../screens/actions/ActionsScreen";
 import SettingsScreen from "../screens/settings/SettingsScreen";
+import FloatingCameraButton from "../screens/components/FloatingCameraButton";
 
 const Tab = createBottomTabNavigator();
 
 export default function TabNavigator() {
   return (
+     <View style={styles.container}>
     <Tab.Navigator
       screenOptions={({ route }) => ({
         headerShown: true,
@@ -33,5 +36,13 @@ export default function TabNavigator() {
       <Tab.Screen name="Actions" component={ActionsScreen} />
       <Tab.Screen name="Settings" component={SettingsScreen} />
     </Tab.Navigator>
+
+  {/* ✅ Floating camera button (always visible on tabs) */}
+      <FloatingCameraButton />
+    </View>
   );
 }
+
+const styles = StyleSheet.create({
+  container: { flex: 1 },
+});

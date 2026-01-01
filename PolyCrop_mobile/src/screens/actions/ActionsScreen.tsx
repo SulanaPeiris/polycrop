@@ -1,8 +1,10 @@
 import React from "react";
 import { ScrollView, Text, StyleSheet, TouchableOpacity } from "react-native";
 import Card from "../components/Card";
+import { useTunnelHeader } from "../../hooks/useTunnelHeader";
 
 export default function ActionsScreen({ navigation }: any) {
+  useTunnelHeader("Actions");
   const items = [
     { title: "Irrigation Control", screen: "IrrigationControl" },
     { title: "Fertigation", screen: "Fertigation" },
@@ -19,6 +21,7 @@ export default function ActionsScreen({ navigation }: any) {
           <Card>
             <Text style={styles.title}>{i.title}</Text>
             <Text>Open</Text>
+            
           </Card>
         </TouchableOpacity>
       ))}

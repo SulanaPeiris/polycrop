@@ -3,6 +3,7 @@ import { NavigationContainer } from "@react-navigation/native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import TabNavigator from "./TabNavigator";
 import { RootStackParamList } from "./types";
+import { TunnelProvider } from "../context/TunnelContext";
 
 import LoginScreen from "../screens/auth/LoginScreen";
 import SensorDetailsScreen from "../screens/monitor/SensorDetailsScreen";
@@ -21,6 +22,7 @@ import ManualOverrideScreen from "../screens/actions/ManualOverrideScreen";
 
 import SystemHealthScreen from "../screens/system/SystemHealthScreen";
 import SensorFaultLogsScreen from "../screens/system/SensorFaultLogsScreen";
+import CameraScreen from "../screens/camera/CameraScreen";
 
 import ThresholdsScreen from "../screens/settings/ThresholdsScreen";
 
@@ -30,6 +32,7 @@ export default function AppNavigator() {
   const isLoggedIn = true; // later connect to real auth
 
   return (
+     <TunnelProvider>
     <NavigationContainer>
       <Stack.Navigator>
         {!isLoggedIn ? (
@@ -62,9 +65,14 @@ export default function AppNavigator() {
 
             {/* Settings */}
             <Stack.Screen name="Thresholds" component={ThresholdsScreen} options={{ title: "Thresholds" }} />
+          
+          {/* Camera */}
+          <Stack.Screen name="Camera" component={CameraScreen} options={{ headerShown: false }} />
+
           </>
         )}
       </Stack.Navigator>
     </NavigationContainer>
+    </TunnelProvider>
   );
 }

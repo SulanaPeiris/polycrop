@@ -1,28 +1,24 @@
 import React from "react";
-import { ScrollView, Text, StyleSheet, TouchableOpacity } from "react-native";
+import { ScrollView, Text, StyleSheet } from "react-native";
 import Card from "../components/Card";
+import { useTunnel } from "../../context/TunnelContext";
+import { useTunnelHeader } from "../../hooks/useTunnelHeader";
 
-const alerts = [
-  { id: "a1", title: "High humidity", time: "10:12 AM", level: "warning" },
-  { id: "a2", title: "Node battery low", time: "Yesterday", level: "info" },
-];
-
-export default function AlertsScreen({ navigation }: any) {
+export default function AlertsScreen() {
+  const { selectedTunnel } = useTunnel();
+  useTunnelHeader("Alerts");
+  
   return (
     <ScrollView contentContainerStyle={styles.container}>
-      {alerts.map((a) => (
-        <TouchableOpacity key={a.id} onPress={() => navigation.navigate("AlertDetail", { alertId: a.id })}>
-          <Card>
-            <Text style={styles.title}>{a.title}</Text>
-            <Text>{a.time}</Text>
-          </Card>
-        </TouchableOpacity>
-      ))}
+      <Card>
+        <Text style={styles.title}>Alerts for {selectedTunnel.name}</Text>
+        <Text>Fetch alerts where tunnelId = {selectedTunnel.id}</Text>
+      </Card>
     </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
   container: { padding: 16 },
-  title: { fontSize: 16, fontWeight: "700", marginBottom: 6 },
+  title: { fontSize: 16, fontWeight: "800", marginBottom: 6 },
 });
