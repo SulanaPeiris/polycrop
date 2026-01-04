@@ -11,8 +11,8 @@ from ultralytics import YOLO
 # ----------------------------
 # CONFIG
 # ----------------------------
-MODEL_PATH = r"C:\Users\dinil\OneDrive\Documents\Github\polycrop\cucumber_flower_detection\ml_models\cucumber_flower_detection.pt"
-CONF_THRESHOLD = 0.25
+MODEL_PATH = r"C:\Users\dinil\OneDrive\Documents\Github\polycrop\cucumber_flower_detection\ml_models\cucumberFlower_detection.pt"
+CONF_THRESHOLD = 0.75
 
 # ----------------------------
 # LOAD MODEL ON STARTUP
