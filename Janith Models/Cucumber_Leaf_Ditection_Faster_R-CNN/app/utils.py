@@ -34,7 +34,7 @@ def draw_boxes_opencv(
         )
 
         text_x = x1
-        text_y = y1 - 10
+        text_y = y1 - 20
         if text_y - th - pad < 0:
             text_y = y1 + th + pad + 5
 

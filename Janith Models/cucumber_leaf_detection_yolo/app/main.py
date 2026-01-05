@@ -11,7 +11,7 @@ from ultralytics import YOLO
 # ----------------------------
 # CONFIG
 # ----------------------------
-MODEL_PATH = r"C:\Users\Janith Wijethunga\Documents\GitHub\polycrop\cucumber_leaf_detection_yolo\model\cucumber_leaf_detection.pt"
+MODEL_PATH = r"C:\Users\Janith Wijethunga\Documents\GitHub\polycrop\Janith Models\cucumber_leaf_detection_yolo\model\cucumber_leaf_detection.pt"
 CONF_THRESHOLD = 0.85
 
 # ----------------------------
