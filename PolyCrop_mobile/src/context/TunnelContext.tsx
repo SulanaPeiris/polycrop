@@ -1,48 +1,72 @@
-import React, { createContext, useContext, useMemo, useState } from "react";
+import React, { createContext, useContext, useState, ReactNode } from "react";
 
-export type Tunnel = {
-  id: string;
-  name: string;
-  location?: string;
-  status?: "GOOD" | "WARN" | "CRITICAL";
-};
+export interface Tunnel {
+    id: string;
+    name: string;
+    status: "GOOD" | "WARN" | "ERROR";
+    cropType?: string;
+    rows?: number;
+    columns?: number;
+    size?: string;
+    sensorCount?: number;
+    robotId?: string;
+    fertigationUnitId?: string;
+    sensors?: {
+        temp?: number;
+        humidity?: number;
+        soil?: number;
+    };
+}
 
-type TunnelContextValue = {
-  tunnels: Tunnel[];
-  selectedTunnel: Tunnel;
-  selectedTunnelId: string;
-  setSelectedTunnelId: (id: string) => void;
-};
+interface TunnelContextType {
+    tunnels: Tunnel[];
+    selectedTunnelId: string;
+    setSelectedTunnelId: (id: string) => void;
+    selectedTunnel: Tunnel | undefined;
+    addTunnel: (tunnel: Omit<Tunnel, 'id' | 'status'>) => void;
+}
 
-const TunnelContext = createContext<TunnelContextValue | null>(null);
+const TunnelContext = createContext<TunnelContextType | undefined>(undefined);
 
-// Temporary dummy tunnels (later replace from API)
-const DUMMY_TUNNELS: Tunnel[] = [
-  { id: "t1", name: "Tunnel 01", location: "Farm - A", status: "GOOD" },
-  { id: "t2", name: "Tunnel 02", location: "Farm - A", status: "WARN" },
-  { id: "t3", name: "Tunnel 03", location: "Farm - B", status: "CRITICAL" },
-];
+export function TunnelProvider({ children }: { children: ReactNode }) {
+    const [tunnels, setTunnels] = useState<Tunnel[]>([
+        { id: "1", name: "Tunnel A", status: "GOOD", cropType: "Cucumber", rows: 10, columns: 20, size: "500 m²", sensorCount: 8, robotId: "R-001", fertigationUnitId: "F-001", sensors: { temp: 24.5, humidity: 65, soil: 40 } },
+        { id: "2", name: "Tunnel B", status: "WARN", cropType: "Tomato", rows: 8, columns: 15, size: "350 m²", sensorCount: 6, robotId: "R-002", fertigationUnitId: "F-002", sensors: { temp: 28.0, humidity: 70, soil: 35 } },
+        { id: "3", name: "Tunnel C", status: "GOOD", cropType: "Lettuce", rows: 12, columns: 25, size: "600 m²", sensorCount: 10, robotId: "R-003", fertigationUnitId: "F-003", sensors: { temp: 23.0, humidity: 60, soil: 45 } },
+    ]);
+    const [selectedTunnelId, setSelectedTunnelId] = useState("1");
 
-export function TunnelProvider({ children }: { children: React.ReactNode }) {
-  // ✅ Default selection = first tunnel
-  const [selectedTunnelId, setSelectedTunnelId] = useState<string>(DUMMY_TUNNELS[0]?.id);
+    const selectedTunnel = tunnels.find((t) => t.id === selectedTunnelId);
 
-  const selectedTunnel = useMemo(() => {
-    return DUMMY_TUNNELS.find((t) => t.id === selectedTunnelId) ?? DUMMY_TUNNELS[0];
-  }, [selectedTunnelId]);
+    const addTunnel = (tunnel: Omit<Tunnel, 'id' | 'status'>) => {
+        const newTunnel: Tunnel = {
+            ...tunnel,
+            id: Date.now().toString(),
+            status: "GOOD",
+        };
+        setTunnels([...tunnels, newTunnel]);
+        setSelectedTunnelId(newTunnel.id);
+    };
 
-  const value: TunnelContextValue = {
-    tunnels: DUMMY_TUNNELS,
-    selectedTunnel,
-    selectedTunnelId,
-    setSelectedTunnelId,
-  };
-
-  return <TunnelContext.Provider value={value}>{children}</TunnelContext.Provider>;
+    return (
+        <TunnelContext.Provider
+            value={{
+                tunnels,
+                selectedTunnelId,
+                setSelectedTunnelId,
+                selectedTunnel,
+                addTunnel,
+            }}
+        >
+            {children}
+        </TunnelContext.Provider>
+    );
 }
 
 export function useTunnel() {
-  const ctx = useContext(TunnelContext);
-  if (!ctx) throw new Error("useTunnel must be used inside TunnelProvider");
-  return ctx;
+    const context = useContext(TunnelContext);
+    if (!context) {
+        throw new Error("useTunnel must be used within TunnelProvider");
+    }
+    return context;
 }

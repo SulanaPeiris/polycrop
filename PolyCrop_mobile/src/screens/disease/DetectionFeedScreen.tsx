@@ -1,27 +1,19 @@
 import React from "react";
-import { ScrollView, Text, StyleSheet, TouchableOpacity } from "react-native";
-import Card from "../components/Card";
+import { View, Text, StyleSheet } from "react-native";
 
-const items = [
-  { id: "img1", title: "Zone A - Leaf 12", time: "Today 09:12" },
-  { id: "img2", title: "Zone B - Leaf 04", time: "Yesterday 16:40" },
-];
-
-export default function DetectionFeedScreen({ navigation }: any) {
+export default function DetectionDetailScreen({ route }: any) {
+  const { imageId } = route.params;
   return (
-    <ScrollView contentContainerStyle={styles.container}>
-      {items.map((x) => (
-        <TouchableOpacity key={x.id} onPress={() => navigation.navigate("DetectionDetail", { imageId: x.id })}>
-          <Card>
-            <Text style={styles.title}>{x.title}</Text>
-            <Text>{x.time}</Text>
-          </Card>
-        </TouchableOpacity>
-      ))}
-    </ScrollView>
+    <View style={styles.container}>
+      <Text style={styles.h}>Detection Detail</Text>
+      <Text>imageId: {imageId}</Text>
+      <Text style={{ marginTop: 12 }}>
+        Later: show image preview + confidence + recommended actions + spray trigger (if needed)
+      </Text>
+    </View>
   );
 }
 const styles = StyleSheet.create({
   container: { padding: 16 },
-  title: { fontSize: 16, fontWeight: "700", marginBottom: 6 },
+  h: { fontSize: 22, fontWeight: "800", marginBottom: 10 },
 });
