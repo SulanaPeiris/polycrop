@@ -3,6 +3,7 @@ export type RootStackParamList = {
 
   // Auth
   Login: undefined;
+  SignUp: undefined;
 
   // Monitor
   SensorDetails: { sensorId: string; title: string };
@@ -19,6 +20,7 @@ export type RootStackParamList = {
   // Actions
   IrrigationControl: undefined;
   Fertigation: undefined;
+  FertigationConfig: undefined;
   Schedules: undefined;
   ManualOverride: undefined;
 
@@ -28,4 +30,19 @@ export type RootStackParamList = {
 
   // Settings
   Thresholds: undefined;
+  AddTunnel: undefined;
+  EditProfile: undefined;
+  ChangePassword: undefined;
+
+  // Camera
+  Camera: undefined;
+};
+
+export type TabParamList = {
+  Home: undefined;
+  Monitor: undefined;
+  CameraTab: undefined; // specific to the floating button
+  Actions: undefined;
+  Settings: undefined;
+  Alerts: undefined;
 };
