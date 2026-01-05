@@ -23,6 +23,7 @@ export type RootStackParamList = {
   FertigationConfig: undefined;
   Schedules: undefined;
   ManualOverride: undefined;
+  HarvestReady: undefined;
 
   // System
   SystemHealth: undefined;

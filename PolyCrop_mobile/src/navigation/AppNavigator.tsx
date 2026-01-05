@@ -23,6 +23,7 @@ import FertigationScreen from "../screens/actions/FertigationScreen";
 import FertigationConfigScreen from "../screens/actions/FertigationConfigScreen";
 import SchedulesScreen from "../screens/actions/SchedulesScreen";
 import ManualOverrideScreen from "../screens/actions/ManualOverrideScreen";
+import HarvestReadyScreen from "../screens/actions/HarvestReadyScreen";
 
 import SystemHealthScreen from "../screens/system/SystemHealthScreen";
 import SensorFaultLogsScreen from "../screens/system/SensorFaultLogsScreen";
@@ -35,8 +36,16 @@ import ChangePasswordScreen from "../screens/settings/ChangePasswordScreen";
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
 
+import LoadingScreen from "../screens/LoadingScreen";
+
+// ... previous imports ...
+
 function AppContent() {
-  const { isLoggedIn } = useAuth();
+  const { isLoggedIn, isLoading } = useAuth();
+
+  if (isLoading) {
+    return <LoadingScreen />;
+  }
 
   return (
     <Stack.Navigator>
@@ -67,6 +76,7 @@ function AppContent() {
           <Stack.Screen name="FertigationConfig" component={FertigationConfigScreen} options={{ title: "Configuration" }} />
           <Stack.Screen name="Schedules" component={SchedulesScreen} options={{ title: "Schedules" }} />
           <Stack.Screen name="ManualOverride" component={ManualOverrideScreen} options={{ title: "Manual Override" }} />
+          <Stack.Screen name="HarvestReady" component={HarvestReadyScreen} options={{ title: "Harvest Ready" }} />
 
           {/* System */}
           <Stack.Screen name="SystemHealth" component={SystemHealthScreen} options={{ title: "System Health" }} />

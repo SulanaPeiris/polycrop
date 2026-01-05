@@ -44,6 +44,14 @@ export default function ActionsScreen({ navigation }: any) {
       bg: "#E8F5E9",
       screen: "SystemHealth"
     },
+    {
+      title: "Harvest Ready",
+      desc: "Ripe cucumbers",
+      icon: "basket-outline",
+      color: "#EF6C00",
+      bg: "#FFF3E0",
+      screen: "HarvestReady"
+    },
   ];
 
   return (
