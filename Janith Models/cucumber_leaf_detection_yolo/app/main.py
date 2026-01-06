@@ -13,6 +13,7 @@ from ultralytics import YOLO
 # ----------------------------
 MODEL_PATH = r"C:\Users\Janith Wijethunga\Documents\GitHub\polycrop\Janith Models\cucumber_leaf_detection_yolo\model\cucumber_leaf_detection.pt"
 CONF_THRESHOLD = 0.85
+BOX_THICKNESS = 8
 
 # ----------------------------
 # LOAD MODEL ON STARTUP
@@ -48,7 +49,7 @@ def draw_detections(image_bgr: np.ndarray, detections: List[Dict[str, Any]]) -> 
         cls_name = det["class_name"]
 
         # rectangle
-        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), BOX_THICKNESS)
 
         # label text
         label = f"{cls_name} {conf:.2f}"
