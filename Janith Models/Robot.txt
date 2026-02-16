@@ -1,0 +1,153 @@
+#include <SPI.h>
+#include <MFRC522.h>
+
+// ================= MOTOR + IR PINS (UNCHANGED) =================
+// Left Motor Driver
+#define L_RPWM 25
+#define L_LPWM 26
+#define L_REN  27
+#define L_LEN  14
+
+// Right Motor Driver
+#define R_RPWM 33
+#define R_LPWM 32
+#define R_REN  15
+#define R_LEN  4
+
+// IR Sensors
+#define IR_LEFT  34
+#define IR_RIGHT 35
+
+// PWM Channels
+#define CH_L_RPWM 0
+#define CH_L_LPWM 1
+#define CH_R_RPWM 2
+#define CH_R_LPWM 3
+
+#define PWM_FREQ 1000
+#define PWM_RES 8
+#define SPEED 180
+
+// ================= RFID PINS =================
+#define SS_PIN  5
+#define RST_PIN 22
+
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+
+// ================= STATE CONTROL =================
+bool rfidDetected = false;
+unsigned long stopTime = 0;
+const unsigned long STOP_DURATION = 5000; // 5 seconds
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(9600);
+
+  // Motor Enable Pins
+  pinMode(L_REN, OUTPUT);
+  pinMode(L_LEN, OUTPUT);
+  pinMode(R_REN, OUTPUT);
+  pinMode(R_LEN, OUTPUT);
+
+  digitalWrite(L_REN, HIGH);
+  digitalWrite(L_LEN, HIGH);
+  digitalWrite(R_REN, HIGH);
+  digitalWrite(R_LEN, HIGH);
+
+  // PWM Setup
+  ledcSetup(CH_L_RPWM, PWM_FREQ, PWM_RES);
+  ledcSetup(CH_L_LPWM, PWM_FREQ, PWM_RES);
+  ledcSetup(CH_R_RPWM, PWM_FREQ, PWM_RES);
+  ledcSetup(CH_R_LPWM, PWM_FREQ, PWM_RES);
+
+  ledcAttachPin(L_RPWM, CH_L_RPWM);
+  ledcAttachPin(L_LPWM, CH_L_LPWM);
+  ledcAttachPin(R_RPWM, CH_R_RPWM);
+  ledcAttachPin(R_LPWM, CH_R_LPWM);
+
+  // IR Sensors
+  pinMode(IR_LEFT, INPUT);
+  pinMode(IR_RIGHT, INPUT);
+
+  // RFID
+  SPI.begin();        // SCK=18, MISO=19, MOSI=23
+  mfrc522.PCD_Init(); // Init RC522
+  Serial.println("RFID Ready");
+}
+
+// ================= MOTOR FUNCTIONS =================
+void forward() {
+  ledcWrite(CH_L_RPWM, SPEED);
+  ledcWrite(CH_L_LPWM, 0);
+  ledcWrite(CH_R_RPWM, SPEED);
+  ledcWrite(CH_R_LPWM, 0);
+}
+
+void leftTurn() {
+  ledcWrite(CH_L_RPWM, 0);
+  ledcWrite(CH_L_LPWM, 0);
+  ledcWrite(CH_R_RPWM, SPEED);
+  ledcWrite(CH_R_LPWM, 0);
+}
+
+void rightTurn() {
+  ledcWrite(CH_L_RPWM, SPEED);
+  ledcWrite(CH_L_LPWM, 0);
+  ledcWrite(CH_R_RPWM, 0);
+  ledcWrite(CH_R_LPWM, 0);
+}
+
+void stopMotors() {
+  ledcWrite(CH_L_RPWM, 0);
+  ledcWrite(CH_L_LPWM, 0);
+  ledcWrite(CH_R_RPWM, 0);
+  ledcWrite(CH_R_LPWM, 0);
+}
+
+// ================= LOOP =================
+void loop() {
+
+  // ---------- RFID CHECK ----------
+  if (!rfidDetected &&
+      mfrc522.PICC_IsNewCardPresent() &&
+      mfrc522.PICC_ReadCardSerial()) {
+
+    Serial.println("RFID detected!");
+    rfidDetected = true;
+    stopTime = millis();
+    stopMotors();
+
+    mfrc522.PICC_HaltA();
+    mfrc522.PCD_StopCrypto1();
+  }
+
+  // ---------- STOP TIMER ----------
+  if (rfidDetected) {
+    stopMotors();
+
+    if (millis() - stopTime >= STOP_DURATION) {
+      rfidDetected = false;
+      Serial.println("Resuming line follow...");
+    }
+    return; // do NOT line follow during stop
+  }
+
+  // ---------- LINE FOLLOWING ----------
+  int leftIR = digitalRead(IR_LEFT);
+  int rightIR = digitalRead(IR_RIGHT);
+
+  if (leftIR == LOW && rightIR == LOW) {
+    forward();
+  }
+  else if (leftIR == LOW && rightIR == HIGH) {
+    leftTurn();
+  }
+  else if (leftIR == HIGH && rightIR == LOW) {
+    rightTurn();
+  }
+  else {
+    stopMotors();
+  }
+
+  delay(10);
+}
