@@ -1,5 +1,6 @@
 #include <SPI.h>
 #include <MFRC522.h>
+#include <AccelStepper.h>
 
 // ================= MOTOR + IR PINS (UNCHANGED) =================
 // Left Motor Driver
@@ -28,52 +29,43 @@
 #define PWM_RES 8
 #define SPEED 180
 
-// ================= RFID PINS =================
+// ================= RFID (RC522) =================
 #define SS_PIN  5
 #define RST_PIN 22
-
 MFRC522 mfrc522(SS_PIN, RST_PIN);
 
-// ================= STATE CONTROL =================
-bool rfidDetected = false;
-unsigned long stopTime = 0;
-const unsigned long STOP_DURATION = 5000; // 5 seconds
+// ================= A4988 STEPPER (NEW PINS) =================
+#define STEP_PIN 16
+#define DIR_PIN  17
+#define EN_PIN   21
 
-// ================= SETUP =================
-void setup() {
-  Serial.begin(9600);
+// AccelStepper: DRIVER mode uses STEP+DIR
+AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
 
-  // Motor Enable Pins
-  pinMode(L_REN, OUTPUT);
-  pinMode(L_LEN, OUTPUT);
-  pinMode(R_REN, OUTPUT);
-  pinMode(R_LEN, OUTPUT);
+// ================= LED (NEW) =================
+// Most ESP32 dev boards have a built-in LED on GPIO 2.
+// If yours is different, change this value.
+#define LED_PIN 2
 
-  digitalWrite(L_REN, HIGH);
-  digitalWrite(L_LEN, HIGH);
-  digitalWrite(R_REN, HIGH);
-  digitalWrite(R_LEN, HIGH);
+// ================= STEPPER SETTINGS =================
+// If MS1=MS2=MS3 = HIGH => 1/16 microstep
+const int MOTOR_STEPS_PER_REV = 200;  // 1.8° stepper = 200 full steps/rev
 
-  // PWM Setup
-  ledcSetup(CH_L_RPWM, PWM_FREQ, PWM_RES);
-  ledcSetup(CH_L_LPWM, PWM_FREQ, PWM_RES);
-  ledcSetup(CH_R_RPWM, PWM_FREQ, PWM_RES);
-  ledcSetup(CH_R_LPWM, PWM_FREQ, PWM_RES);
+const long ROUNDS = 5;
+const long TARGET_STEPS = ROUNDS * MOTOR_STEPS_PER_REV; // 15 revolutions
 
-  ledcAttachPin(L_RPWM, CH_L_RPWM);
-  ledcAttachPin(L_LPWM, CH_L_LPWM);
-  ledcAttachPin(R_RPWM, CH_R_RPWM);
-  ledcAttachPin(R_LPWM, CH_R_LPWM);
+// Speed/accel (tune if needed)
+const float STEPPER_MAX_SPEED = 2000;     // steps/sec
+const float STEPPER_ACCEL     = 1500;     // steps/sec^2
 
-  // IR Sensors
-  pinMode(IR_LEFT, INPUT);
-  pinMode(IR_RIGHT, INPUT);
+// ================= STATE MACHINE =================
+enum Mode {
+  LINE_FOLLOW,
+  STEPPER_CW,
+  STEPPER_CCW
+};
 
-  // RFID
-  SPI.begin();        // SCK=18, MISO=19, MOSI=23
-  mfrc522.PCD_Init(); // Init RC522
-  Serial.println("RFID Ready");
-}
+Mode mode = LINE_FOLLOW;
 
 // ================= MOTOR FUNCTIONS =================
 void forward() {
@@ -104,50 +96,127 @@ void stopMotors() {
   ledcWrite(CH_R_LPWM, 0);
 }
 
+// ================= LED BLINK (NEW) =================
+void blinkLED(int times, int onMs, int offMs) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(onMs);
+    digitalWrite(LED_PIN, LOW);
+    delay(offMs);
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(9600);
+
+  // LED pin setup (NEW)
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // Motor Enable Pins
+  pinMode(L_REN, OUTPUT);
+  pinMode(L_LEN, OUTPUT);
+  pinMode(R_REN, OUTPUT);
+  pinMode(R_LEN, OUTPUT);
+
+  digitalWrite(L_REN, HIGH);
+  digitalWrite(L_LEN, HIGH);
+  digitalWrite(R_REN, HIGH);
+  digitalWrite(R_LEN, HIGH);
+
+  // PWM Setup
+  ledcSetup(CH_L_RPWM, PWM_FREQ, PWM_RES);
+  ledcSetup(CH_L_LPWM, PWM_FREQ, PWM_RES);
+  ledcSetup(CH_R_RPWM, PWM_FREQ, PWM_RES);
+  ledcSetup(CH_R_LPWM, PWM_FREQ, PWM_RES);
+
+  ledcAttachPin(L_RPWM, CH_L_RPWM);
+  ledcAttachPin(L_LPWM, CH_L_LPWM);
+  ledcAttachPin(R_RPWM, CH_R_RPWM);
+  ledcAttachPin(R_LPWM, CH_R_LPWM);
+
+  // IR Sensors
+  pinMode(IR_LEFT, INPUT);
+  pinMode(IR_RIGHT, INPUT);
+
+  // RFID
+  SPI.begin();        // ESP32 default VSPI pins
+  mfrc522.PCD_Init();
+  Serial.println("RFID Ready");
+
+  // Stepper pins
+  pinMode(EN_PIN, OUTPUT);
+  digitalWrite(EN_PIN, LOW); // enable A4988 (LOW = enabled)
+
+  stepper.setMaxSpeed(STEPPER_MAX_SPEED);
+  stepper.setAcceleration(STEPPER_ACCEL);
+  stepper.setCurrentPosition(0);
+
+  stopMotors();
+}
+
 // ================= LOOP =================
 void loop() {
 
-  // ---------- RFID CHECK ----------
-  if (!rfidDetected &&
-      mfrc522.PICC_IsNewCardPresent() &&
-      mfrc522.PICC_ReadCardSerial()) {
+  // --------- MODE: LINE FOLLOW ---------
+  if (mode == LINE_FOLLOW) {
 
-    Serial.println("RFID detected!");
-    rfidDetected = true;
-    stopTime = millis();
-    stopMotors();
+    // RFID check (trigger stepper sequence)
+    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+      Serial.println("RFID detected -> STOP and rotate stepper CW 15 rounds");
 
-    mfrc522.PICC_HaltA();
-    mfrc522.PCD_StopCrypto1();
-  }
+      stopMotors();
 
-  // ---------- STOP TIMER ----------
-  if (rfidDetected) {
-    stopMotors();
+      // Blink LED when RFID detected (NEW)
+      blinkLED(1, 150, 150);
 
-    if (millis() - stopTime >= STOP_DURATION) {
-      rfidDetected = false;
-      Serial.println("Resuming line follow...");
+      // Start CW move
+      stepper.moveTo(TARGET_STEPS); // go to +TARGET_STEPS
+      mode = STEPPER_CW;
+
+      mfrc522.PICC_HaltA();
+      mfrc522.PCD_StopCrypto1();
+      return;
     }
-    return; // do NOT line follow during stop
+
+    // Normal line follow
+    int leftIR = digitalRead(IR_LEFT);
+    int rightIR = digitalRead(IR_RIGHT);
+
+    if (leftIR == LOW && rightIR == LOW) forward();
+    else if (leftIR == LOW && rightIR == HIGH) leftTurn();
+    else if (leftIR == HIGH && rightIR == LOW) rightTurn();
+    else stopMotors();
+
+    delay(10);
+    return;
   }
 
-  // ---------- LINE FOLLOWING ----------
-  int leftIR = digitalRead(IR_LEFT);
-  int rightIR = digitalRead(IR_RIGHT);
+  // --------- MODE: STEPPER CW ---------
+  if (mode == STEPPER_CW) {
+    stopMotors();           // robot must not move
+    stepper.run();          // keep stepping smoothly
 
-  if (leftIR == LOW && rightIR == LOW) {
-    forward();
+    if (stepper.distanceToGo() == 0) {
+      Serial.println("CW done -> rotate CCW 15 rounds");
+
+      // Now go back to 0 (CCW 15 rounds)
+      stepper.moveTo(0);
+      mode = STEPPER_CCW;
+    }
+    return;
   }
-  else if (leftIR == LOW && rightIR == HIGH) {
-    leftTurn();
-  }
-  else if (leftIR == HIGH && rightIR == LOW) {
-    rightTurn();
-  }
-  else {
+
+  // --------- MODE: STEPPER CCW ---------
+  if (mode == STEPPER_CCW) {
     stopMotors();
-  }
+    stepper.run();
 
-  delay(10);
+    if (stepper.distanceToGo() == 0) {
+      Serial.println("CCW done -> resume line follow");
+      mode = LINE_FOLLOW;
+    }
+    return;
+  }
 }
