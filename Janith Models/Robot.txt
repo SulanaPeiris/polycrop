@@ -168,7 +168,7 @@ void loop() {
 
       stopMotors();
 
-      // Blink LED when RFID detected (NEW)
+      // Blink LED when RFID detected
       blinkLED(1, 150, 150);
 
       // Start CW move
