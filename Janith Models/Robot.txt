@@ -51,8 +51,8 @@ AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
 // If MS1=MS2=MS3 = HIGH => 1/16 microstep
 const int MOTOR_STEPS_PER_REV = 200;  // 1.8° stepper = 200 full steps/rev
 
-const long ROUNDS = 5;
-const long TARGET_STEPS = ROUNDS * MOTOR_STEPS_PER_REV; // 15 revolutions
+const long ROUNDS = 55;
+const long TARGET_STEPS = ROUNDS * MOTOR_STEPS_PER_REV; // 55 revolutions
 
 // Speed/accel (tune if needed)
 const float STEPPER_MAX_SPEED = 2000;     // steps/sec
@@ -164,11 +164,11 @@ void loop() {
 
     // RFID check (trigger stepper sequence)
     if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
-      Serial.println("RFID detected -> STOP and rotate stepper CW 15 rounds");
+      Serial.println("RFID detected -> STOP and rotate stepper CW 55 rounds");
 
       stopMotors();
 
-      // Blink LED when RFID detected
+      // Blink LED when RFID detected (NEW)
       blinkLED(1, 150, 150);
 
       // Start CW move
@@ -199,9 +199,9 @@ void loop() {
     stepper.run();          // keep stepping smoothly
 
     if (stepper.distanceToGo() == 0) {
-      Serial.println("CW done -> rotate CCW 15 rounds");
+      Serial.println("CW done -> rotate CCW 55 rounds");
 
-      // Now go back to 0 (CCW 15 rounds)
+      // Now go back to 0 (CCW 55 rounds)
       stepper.moveTo(0);
       mode = STEPPER_CCW;
     }
