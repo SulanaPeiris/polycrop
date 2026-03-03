@@ -2,6 +2,47 @@
 #include <MFRC522.h>
 #include <AccelStepper.h>
 
+// === FIREBASE ADDITION: LIBRARIES ===
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <time.h>  // ✅ required for TLS (NTP time)
+
+// Provide the token generation process info.
+#include "addons/TokenHelper.h"
+// Provide the RTDB payload printing info and other helper functions.
+// (kept as you requested “don’t remove anything”, even though we use Firestore)
+#include "addons/RTDBHelper.h"
+
+// === FIREBASE ADDITION: CREDENTIALS ===
+#define WIFI_SSID "Janith"
+#define WIFI_PASSWORD "11223344"
+#define API_KEY "AIzaSyCw9ojsjWlbr-YvVH1_BkOjyy1xOedro88"
+
+// You said: DO NOT use RTDB. Kept for compatibility with your old define, but NOT used.
+#define DATABASE_URL "https://rfid-robot-ff91d-default-rtdb.firebaseio.com"
+
+// ====== FIRESTORE (NEW) ======
+#define FIREBASE_PROJECT_ID "rfid-robot-ff91d"  // ✅ confirm in Firebase Console → Project settings
+#define ROBOT_ID "ROBOT_01"                     // ✅ hardcoded robot id
+
+// Collections
+#define ROBOTS_COLLECTION "robots"
+#define PLANTS_COLLECTION "plants"
+#define SCANS_COLLECTION  "scanEvents"          // stores EVERY scan event as a new doc
+
+// === FIREBASE ADDITION: OBJECTS & VARIABLES ===
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+String currentRFID = "NONE";
+String robotMovingStatus = "MOVING";
+String scanningStatus = "IDLE";
+String pumpStatus = "OFF";
+
+// Track mode as string for Firestore
+String modeStr = "LINE_FOLLOW";
+
 // ================= MOTOR + IR PINS (UNCHANGED) =================
 // Left Motor Driver
 #define L_RPWM 25
@@ -34,7 +75,7 @@
 #define RST_PIN 22
 MFRC522 mfrc522(SS_PIN, RST_PIN);
 
-// ================= A4988 STEPPER (NEW PINS) =================
+// ================= A4988 STEPPER =================
 #define STEP_PIN 16
 #define DIR_PIN  17
 #define EN_PIN   21
@@ -42,15 +83,12 @@ MFRC522 mfrc522(SS_PIN, RST_PIN);
 // AccelStepper: DRIVER mode uses STEP+DIR
 AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
 
-// ================= LED (NEW) =================
-// Most ESP32 dev boards have a built-in LED on GPIO 2.
-// If yours is different, change this value.
+// ================= LED & WATER PUMP =================
 #define LED_PIN 2
+#define PUMP_PIN 13 // Connected to L298N IN1
 
 // ================= STEPPER SETTINGS =================
-// If MS1=MS2=MS3 = HIGH => 1/16 microstep
 const int MOTOR_STEPS_PER_REV = 200;  // 1.8° stepper = 200 full steps/rev
-
 const long ROUNDS = 55;
 const long TARGET_STEPS = ROUNDS * MOTOR_STEPS_PER_REV; // 55 revolutions
 
@@ -64,7 +102,6 @@ enum Mode {
   STEPPER_CW,
   STEPPER_CCW
 };
-
 Mode mode = LINE_FOLLOW;
 
 // ================= MOTOR FUNCTIONS =================
@@ -96,7 +133,7 @@ void stopMotors() {
   ledcWrite(CH_R_LPWM, 0);
 }
 
-// ================= LED BLINK (NEW) =================
+// ================= LED BLINK =================
 void blinkLED(int times, int onMs, int offMs) {
   for (int i = 0; i < times; i++) {
     digitalWrite(LED_PIN, HIGH);
@@ -106,13 +143,227 @@ void blinkLED(int times, int onMs, int offMs) {
   }
 }
 
+// ================= TIME SYNC (CRITICAL FOR TLS) =================
+void initTime() {
+  // Sri Lanka UTC +5:30 => 19800 seconds
+  configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
+
+  Serial.print("Syncing time");
+  time_t now = time(nullptr);
+  int retry = 0;
+
+  while (now < 1700000000 && retry < 60) { // wait until time is valid (>= ~2023)
+    Serial.print(".");
+    delay(500);
+    now = time(nullptr);
+    retry++;
+  }
+
+  Serial.println();
+  if (now < 1700000000) {
+    Serial.println("⚠️ Time sync failed. TLS may fail.");
+  } else {
+    Serial.print("Time OK: ");
+    Serial.println(ctime(&now));
+  }
+}
+
+// ✅ Firestore timestamp must be RFC3339 with Z (UTC)
+// Example: 2026-03-02T07:59:20Z
+String nowRFC3339Z() {
+  time_t now = time(nullptr);
+  if (now < 1700000000) return "1970-01-01T00:00:00Z"; // fallback (should not happen if NTP ok)
+
+  struct tm tm_utc;
+  gmtime_r(&now, &tm_utc);
+
+  char buf[25];
+  // YYYY-MM-DDTHH:MM:SSZ => 20 chars + null
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+  return String(buf);
+}
+
+// === FIREBASE/SCAN HELPERS ===
+String getRFIDTag() {
+  String tagID = "";
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    tagID += String(mfrc522.uid.uidByte[i] < 0x10 ? "0" : "");
+    tagID += String(mfrc522.uid.uidByte[i], HEX);
+  }
+  tagID.toUpperCase();
+  return tagID;
+}
+
+// Create a reasonably-unique Firestore doc id for scanEvents
+String makeEventDocId() {
+  uint32_t r = (uint32_t)esp_random();
+  String id = String(millis()) + "_" + String(r, HEX);
+  return id;
+}
+
+// ------------------------- FIRESTORE WRITE FUNCTIONS -------------------------
+
+// 1) Update live robot doc: robots/{ROBOT_ID}
+void updateRobotDoc() {
+  if (!Firebase.ready()) return;
+
+  String documentPath = String(ROBOTS_COLLECTION) + "/" + String(ROBOT_ID);
+
+  FirebaseJson content;
+  content.set("fields/robotId/stringValue", String(ROBOT_ID));
+  content.set("fields/rfid/stringValue", currentRFID);
+  content.set("fields/moving/stringValue", robotMovingStatus);
+  content.set("fields/scanning/stringValue", scanningStatus);
+  content.set("fields/pump/stringValue", pumpStatus);
+  content.set("fields/mode/stringValue", modeStr);
+
+  content.set("fields/rssi/integerValue", (int)WiFi.RSSI());
+  content.set("fields/updatedAt/timestampValue", nowRFC3339Z());  // ✅ FIXED
+
+  String mask = "robotId,rfid,moving,scanning,pump,mode,rssi,updatedAt";
+
+  if (!Firebase.Firestore.patchDocument(&fbdo, FIREBASE_PROJECT_ID, "", documentPath.c_str(),
+                                        content.raw(), mask.c_str())) {
+    Serial.print("Robot doc update FAILED: ");
+    Serial.println(fbdo.errorReason());
+  } else {
+    Serial.println("Robot doc updated OK");
+  }
+}
+
+// 2) Update/initialize plant doc: plants/{RFID}
+// Includes diseaseDetected, imageUrl, notes (as you requested)
+void updatePlantDocOnRFID() {
+  if (!Firebase.ready()) return;
+  if (currentRFID == "NONE") return;
+
+  String documentPath = String(PLANTS_COLLECTION) + "/" + currentRFID;
+
+  FirebaseJson content;
+  content.set("fields/rfid/stringValue", currentRFID);
+  content.set("fields/lastSeenRobotId/stringValue", String(ROBOT_ID));
+  content.set("fields/scanStatus/stringValue", "SCANNING");
+  content.set("fields/lastScanAt/timestampValue", nowRFC3339Z()); // ✅ FIXED
+
+  // Required fields you asked:
+  content.set("fields/diseaseDetected/booleanValue", false);
+  content.set("fields/imageUrl/stringValue", "");
+  content.set("fields/notes/stringValue", "");
+
+  String mask = "rfid,lastSeenRobotId,scanStatus,lastScanAt,diseaseDetected,imageUrl,notes";
+
+  if (!Firebase.Firestore.patchDocument(&fbdo, FIREBASE_PROJECT_ID, "", documentPath.c_str(),
+                                        content.raw(), mask.c_str())) {
+    Serial.print("Plant doc update FAILED: ");
+    Serial.println(fbdo.errorReason());
+  } else {
+    Serial.println("Plant doc updated OK");
+  }
+}
+
+// 3) Update plant after pump/scan finish
+void updatePlantDocAfterPump() {
+  if (!Firebase.ready()) return;
+  if (currentRFID == "NONE") return;
+
+  String documentPath = String(PLANTS_COLLECTION) + "/" + currentRFID;
+
+  FirebaseJson content;
+  content.set("fields/scanStatus/stringValue", "DONE");
+  content.set("fields/lastPumpAt/timestampValue", nowRFC3339Z()); // ✅ FIXED
+
+  String mask = "scanStatus,lastPumpAt";
+
+  if (!Firebase.Firestore.patchDocument(&fbdo, FIREBASE_PROJECT_ID, "", documentPath.c_str(),
+                                        content.raw(), mask.c_str())) {
+    Serial.print("Plant after-pump update FAILED: ");
+    Serial.println(fbdo.errorReason());
+  } else {
+    Serial.println("Plant after-pump updated OK");
+  }
+}
+
+// 4) Store EVERY scan event: scanEvents/{eventDocId}
+void logScanEvent(String eventType, String eventNote) {
+  if (!Firebase.ready()) return;
+
+  String eventId = makeEventDocId();
+  String documentPath = String(SCANS_COLLECTION) + "/" + eventId;
+
+  FirebaseJson content;
+  content.set("fields/eventType/stringValue", eventType);
+  content.set("fields/robotId/stringValue", String(ROBOT_ID));
+  content.set("fields/rfid/stringValue", currentRFID);
+  content.set("fields/mode/stringValue", modeStr);
+  content.set("fields/moving/stringValue", robotMovingStatus);
+  content.set("fields/scanning/stringValue", scanningStatus);
+  content.set("fields/pump/stringValue", pumpStatus);
+  content.set("fields/rssi/integerValue", (int)WiFi.RSSI());
+  content.set("fields/note/stringValue", eventNote);
+  content.set("fields/ts/timestampValue", nowRFC3339Z()); // ✅ FIXED
+
+  if (!Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "",
+                                         documentPath.c_str(), content.raw())) {
+    Serial.print("Scan event log FAILED: ");
+    Serial.println(fbdo.errorReason());
+  } else {
+    Serial.println("Scan event logged OK: " + eventType);
+  }
+}
+
+// === KEEP YOUR OLD FUNCTION NAME (DON'T REMOVE ANYTHING) ===
+void pushDataToFirebase() {
+  updateRobotDoc();
+}
+
 // ================= SETUP =================
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
 
-  // LED pin setup (NEW)
+  // === WIFI ===
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println("\nConnected to WiFi!");
+
+  // ✅ keep WiFi awake for stable TLS
+  WiFi.setSleep(false);
+
+  // ✅ sync time for TLS certificates
+  initTime();
+
+  // === FIREBASE INIT ===
+  config.api_key = API_KEY;
+  config.token_status_callback = tokenStatusCallback;
+
+  // Anonymous sign-in
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    Serial.println("Firebase Auth Ready");
+  } else {
+    Serial.print("Signup error: ");
+    Serial.println(config.signer.signupError.message.c_str());
+  }
+
+  // ✅ bigger SSL buffers (reduces connection lost / write error)
+  fbdo.setBSSLBufferSize(4096, 1024);  // RX, TX
+  fbdo.setResponseSize(4096);
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // Push initial default states to Firestore
+  pushDataToFirebase();
+  logScanEvent("BOOT", "Robot booted and connected to WiFi/Firebase");
+
+  // LED and Pump setup
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
+
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, LOW); // Ensure pump is OFF at startup
 
   // Motor Enable Pins
   pinMode(L_REN, OUTPUT);
@@ -161,6 +412,7 @@ void loop() {
 
   // --------- MODE: LINE FOLLOW ---------
   if (mode == LINE_FOLLOW) {
+    modeStr = "LINE_FOLLOW";
 
     // RFID check (trigger stepper sequence)
     if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
@@ -168,12 +420,26 @@ void loop() {
 
       stopMotors();
 
-      // Blink LED when RFID detected (NEW)
+      // === UPDATE STATE ON RFID DETECT ===
+      currentRFID = getRFIDTag();
+      robotMovingStatus = "STOPPED";
+      scanningStatus = "SCANNING";
+      pumpStatus = "OFF";
+
+      // Write robot + plant + event
+      pushDataToFirebase();
+      updatePlantDocOnRFID();
+      logScanEvent("RFID_DETECTED", "Robot stopped, scanning started");
+
+      // Blink LED when RFID detected
       blinkLED(1, 150, 150);
 
       // Start CW move
       stepper.moveTo(TARGET_STEPS); // go to +TARGET_STEPS
       mode = STEPPER_CW;
+      modeStr = "STEPPER_CW";
+
+      logScanEvent("STEPPER_CW_START", "Stepper CW move started (55 rounds)");
 
       mfrc522.PICC_HaltA();
       mfrc522.PCD_StopCrypto1();
@@ -195,27 +461,60 @@ void loop() {
 
   // --------- MODE: STEPPER CW ---------
   if (mode == STEPPER_CW) {
-    stopMotors();           // robot must not move
-    stepper.run();          // keep stepping smoothly
+    modeStr = "STEPPER_CW";
+
+    stopMotors();
+    stepper.run();
 
     if (stepper.distanceToGo() == 0) {
       Serial.println("CW done -> rotate CCW 55 rounds");
 
-      // Now go back to 0 (CCW 55 rounds)
+      logScanEvent("STEPPER_CW_DONE", "Stepper CW finished, starting CCW");
+
       stepper.moveTo(0);
       mode = STEPPER_CCW;
+      modeStr = "STEPPER_CCW";
+
+      logScanEvent("STEPPER_CCW_START", "Stepper CCW move started (55 rounds)");
     }
     return;
   }
 
   // --------- MODE: STEPPER CCW ---------
   if (mode == STEPPER_CCW) {
+    modeStr = "STEPPER_CCW";
+
     stopMotors();
     stepper.run();
 
     if (stepper.distanceToGo() == 0) {
-      Serial.println("CCW done -> resume line follow");
+      Serial.println("CCW done -> Turning ON water pump for 5 seconds");
+
+      logScanEvent("STEPPER_CCW_DONE", "Stepper CCW finished, pump sequence starting");
+
+      // === PUMP IS ON ===
+      pumpStatus = "ON";
+      scanningStatus = "IDLE";
+      pushDataToFirebase();
+      logScanEvent("PUMP_ON", "Pump turned ON");
+
+      digitalWrite(PUMP_PIN, HIGH);
+      delay(5000);
+      digitalWrite(PUMP_PIN, LOW);
+
+      Serial.println("Pump done -> resume line follow");
+
+      // === RESUME MOVING ===
+      pumpStatus = "OFF";
+      robotMovingStatus = "MOVING";
+      pushDataToFirebase();
+      logScanEvent("PUMP_OFF", "Pump turned OFF, robot resuming line follow");
+
+      updatePlantDocAfterPump();
+      logScanEvent("PLANT_SCAN_DONE", "Plant scan marked DONE (pump finished)");
+
       mode = LINE_FOLLOW;
+      modeStr = "LINE_FOLLOW";
     }
     return;
   }
