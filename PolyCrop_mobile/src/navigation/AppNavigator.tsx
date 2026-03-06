@@ -37,15 +37,19 @@ import ChangePasswordScreen from "../screens/settings/ChangePasswordScreen";
 const Stack = createNativeStackNavigator<RootStackParamList>();
 
 import LoadingScreen from "../screens/LoadingScreen";
+import ScansAndResultsScreen from "../screens/settings/ScansAndResultsScreen";
+import ScanPreviewScreen from "../screens/settings/ScanPreviewScreen";
+import TunnelSetupScreen from "../screens/settings/TunnelSetupScreen";
+import EditTunnelScreen from "../screens/settings/EditTunnelScreen";
+import TunnelSettingsScreen from "../screens/settings/TunnelSettingsScreen";
 
 // ... previous imports ...
 
 function AppContent() {
-  const { isLoggedIn, isLoading } = useAuth();
+  const { user, isLoading } = useAuth();
+  const isLoggedIn = !!user;
 
-  if (isLoading) {
-    return <LoadingScreen />;
-  }
+  if (isLoading) return <LoadingScreen />;
 
   return (
     <Stack.Navigator>
@@ -87,7 +91,12 @@ function AppContent() {
           <Stack.Screen name="AddTunnel" component={AddTunnelScreen} options={{ title: "Add Tunnel" }} />
           <Stack.Screen name="EditProfile" component={EditProfileScreen} options={{ title: "Edit Profile" }} />
           <Stack.Screen name="ChangePassword" component={ChangePasswordScreen} options={{ title: "Change Password" }} />
-
+          <Stack.Screen name="ScansAndResults" component={ScansAndResultsScreen} options={{ title: "Scans & Results" }} />
+          <Stack.Screen name="ScanPreview" component={ScanPreviewScreen} options={{ title: "Scan Result" }} />
+          <Stack.Screen name="TunnelSettings" component={TunnelSettingsScreen} options={{ title: "Tunnel Settings" }} />
+<Stack.Screen name="EditTunnel" component={EditTunnelScreen} options={{ title: "Edit Tunnel" }} />
+<Stack.Screen name="TunnelSetup" component={TunnelSetupScreen} options={{ title: "Setup Plants" }} />
+          
           {/* Camera */}
           <Stack.Screen name="Camera" component={CameraScreen} options={{ headerShown: false }} />
 

@@ -92,6 +92,7 @@ export default function TabNavigator() {
   return (
     <View style={styles.container}>
       <Tab.Navigator
+      initialRouteName="Home"
         tabBar={(props) => <CustomTabBar {...props} />}
         screenOptions={({ navigation }) => ({
           headerShown: true,

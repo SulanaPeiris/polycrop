@@ -20,20 +20,19 @@ type Props = {
 export default function LoginScreen({ navigation }: Props) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const { login } = useAuth();
+  const { signIn } = useAuth();
 
-  const handleLogin = () => {
-    if (email === "test" && password === "test") {
-      login();
-    } else {
-      // Allow any login for demo purposes if fields are filled
-      if (email && password) {
-        login();
-      } else {
-        Alert.alert("Error", "Please enter email and password");
-      }
-    }
-  };
+  const handleLogin = async () => {
+  if (!email || !password) {
+    Alert.alert("Error", "Please enter email and password");
+    return;
+  }
+  try {
+    await signIn(email, password);
+  } catch (e: any) {
+    Alert.alert("Login failed", e?.message ?? "Try again");
+  }
+};
 
   return (
     <KeyboardAvoidingView

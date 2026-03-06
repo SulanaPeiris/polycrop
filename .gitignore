@@ -1,2 +1,142 @@
 # Ignore local training datasets
 JanithLeafProject/my_leaf_dataset/
+
+# -----------------------------
+# OS / Editor
+# -----------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# -----------------------------
+# Logs
+# -----------------------------
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# -----------------------------
+# Env / secrets
+# -----------------------------
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Firebase / Google / service account secrets
+**/serviceAccountKey.json
+**/*serviceAccount*.json
+**/google-services.json
+**/GoogleService-Info.plist
+*.pem
+*.key
+*.p12
+*.p8
+*.jks
+*.keystore
+*.mobileprovision
+
+# -----------------------------
+# Node / React Native / Expo
+# -----------------------------
+node_modules/
+.expo/
+.expo-shared/
+dist/
+build/
+web-build/
+coverage/
+.metro-health-check*
+expo-env.d.ts
+*.tsbuildinfo
+
+# Native generated folders
+**/android/
+**/ios/
+
+# React Native / Expo local files
+**/.gradle/
+**/.kotlin/
+**/local.properties
+**/.bundle/
+
+# App bundles / release artifacts
+*.apk
+*.aab
+*.apks
+*.ipa
+*.xcarchive
+*.app
+*.dSYM.zip
+*.dSYM
+
+# -----------------------------
+# Python
+# -----------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# -----------------------------
+# ML / model outputs / large files
+# -----------------------------
+# Weights / checkpoints
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.pb
+*.tflite
+*.torchscript
+*.joblib
+*.pkl
+*.h5
+*.weights
+
+# Training / inference outputs
+runs/
+outputs/
+results/
+predictions/
+artifacts/
+wandb/
+mlruns/
+
+# Large archives / bundles
+*.zip
+*.tar
+*.gz
+*.7z
+*.rar
+
+# -----------------------------
+# Project-specific
+# -----------------------------
+# Inference API local stuff
+inference-api/.venv/
+inference-api/__pycache__/
+inference-api/weights/
+inference-api/serviceAccountKey.json
+
+# Expo / mobile local env
+PolyCrop_mobile/.env
+PolyCrop_mobile/.env.*

@@ -8,7 +8,7 @@ export function useTunnelHeader(prefix: string) {
 
   useLayoutEffect(() => {
     navigation.setOptions({
-      headerTitle: `${prefix} • ${selectedTunnel.name}`,
+      headerTitle: selectedTunnel?.name ? `${prefix} • ${selectedTunnel.name}` : prefix,
     });
-  }, [navigation, prefix, selectedTunnel.name]);
+  }, [navigation, prefix, selectedTunnel?.name]);
 }

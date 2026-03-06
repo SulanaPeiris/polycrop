@@ -1,205 +1,258 @@
-import React, { useState } from "react";
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, TextInput, Alert } from "react-native";
-import { Ionicons } from "@expo/vector-icons";
+import React, { useMemo, useState } from "react";
+import {
+  View,
+  Text,
+  StyleSheet,
+  ScrollView,
+  TouchableOpacity,
+  TextInput,
+  Alert,
+  ActivityIndicator,
+  KeyboardAvoidingView,
+  Platform,
+} from "react-native";
 import { useTunnelHeader } from "../../hooks/useTunnelHeader";
-import { useTunnel } from "../../context/TunnelContext";
+import { useAuth } from "../../context/AuthContext";
+import { createTunnelWithPlants } from "../../services/tunnels";
+
+function onlyDigits(v: string) {
+  return v.replace(/[^\d]/g, "");
+}
+
+function toInt(v: string) {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : 0;
+}
 
 export default function AddTunnelScreen({ navigation }: any) {
-    useTunnelHeader("Add New Tunnel");
+  useTunnelHeader("Add New Tunnel");
 
-    const { addTunnel } = useTunnel();
+  const { user } = useAuth();
+  const [loading, setLoading] = useState(false);
 
-    const [formData, setFormData] = useState({
-        name: "",
-        cropType: "",
-        rows: "",
-        columns: "",
-        size: "",
-        sensorCount: "",
-        robotId: "",
-        fertigationUnitId: "",
-    });
+  const [form, setForm] = useState({
+    tunnelName: "",
+    cropType: "",
+    size: "",
+    rows: "",
+    columns: "",
+    sensorCount: "",
+    robotId: "",
+    fertigationUnitId: "",
+  });
 
-    const updateField = (field: string, value: string) => {
-        setFormData({ ...formData, [field]: value });
-    };
+  const totalPlants = useMemo(() => {
+    const r = toInt(form.rows || "0");
+    const c = toInt(form.columns || "0");
+    return r > 0 && c > 0 ? r * c : 0;
+  }, [form.rows, form.columns]);
 
-    const handleSubmit = () => {
-        // Validation
-        if (!formData.name || !formData.cropType) {
-            Alert.alert("Error", "Please fill in at least Tunnel Name and Crop Type");
-            return;
-        }
+  const update = (k: string, v: string) => setForm((p) => ({ ...p, [k]: v }));
 
-        addTunnel({
-            name: formData.name,
-            cropType: formData.cropType,
-            rows: formData.rows ? parseInt(formData.rows) : undefined,
-            columns: formData.columns ? parseInt(formData.columns) : undefined,
-            size: formData.size || undefined,
-            sensorCount: formData.sensorCount ? parseInt(formData.sensorCount) : undefined,
-            robotId: formData.robotId || undefined,
-            fertigationUnitId: formData.fertigationUnitId || undefined,
-        });
+  const validate = () => {
+    const tunnelName = form.tunnelName.trim();
+    const cropType = form.cropType.trim();
 
-        Alert.alert("Success", "Tunnel added successfully!", [
-            { text: "OK", onPress: () => navigation.goBack() }
-        ]);
-    };
+    if (tunnelName.length < 3) return "Tunnel name must be at least 3 characters.";
+    if (cropType.length < 3) return "Crop type must be at least 3 characters.";
 
-    return (
-        <ScrollView contentContainerStyle={styles.container}>
+    const rows = toInt(form.rows);
+    const cols = toInt(form.columns);
 
-            {/* Basic Info */}
-            <View style={styles.section}>
-                <Text style={styles.sectionTitle}>Basic Information</Text>
+    if (!rows || !cols) return "Rows and Columns are required.";
+    if (rows < 1 || rows > 200) return "Rows must be between 1 and 200.";
+    if (cols < 1 || cols > 200) return "Columns must be between 1 and 200.";
 
-                <View style={styles.inputGroup}>
-                    <Text style={styles.label}>Tunnel Name *</Text>
-                    <TextInput
-                        style={styles.input}
-                        placeholder="e.g., Tunnel D"
-                        value={formData.name}
-                        onChangeText={(val) => updateField("name", val)}
-                    />
-                </View>
+    const plants = rows * cols;
+    if (plants > 5000) return `Too many plants (${plants}). Reduce layout (max 5000 recommended).`;
 
-                <View style={styles.inputGroup}>
-                    <Text style={styles.label}>Crop Type *</Text>
-                    <TextInput
-                        style={styles.input}
-                        placeholder="e.g., Cucumber, Tomato"
-                        value={formData.cropType}
-                        onChangeText={(val) => updateField("cropType", val)}
-                    />
-                </View>
+    const sensorCount = form.sensorCount ? toInt(form.sensorCount) : 0;
+    if (form.sensorCount && (sensorCount < 0 || sensorCount > 200)) return "Sensor count must be 0–200.";
 
-                <View style={styles.inputGroup}>
-                    <Text style={styles.label}>Size (m²)</Text>
-                    <TextInput
-                        style={styles.input}
-                        placeholder="e.g., 500 m²"
-                        value={formData.size}
-                        onChangeText={(val) => updateField("size", val)}
-                    />
-                </View>
+    return null;
+  };
+
+  const handleCreate = async () => {
+    if (!user) {
+      Alert.alert("Not logged in", "Please log in again.");
+      return;
+    }
+
+    const err = validate();
+    if (err) {
+      Alert.alert("Invalid input", err);
+      return;
+    }
+
+    try {
+      setLoading(true);
+
+      const tunnelId = await createTunnelWithPlants({
+        ownerId: user.uid,
+        tunnelName: form.tunnelName.trim(),
+        cropType: form.cropType.trim(),
+        size: form.size.trim() || undefined,
+        rows: toInt(form.rows),
+        columns: toInt(form.columns),
+        sensorCount: form.sensorCount ? toInt(form.sensorCount) : undefined,
+        robotId: form.robotId.trim() || undefined,
+        fertigationUnitId: form.fertigationUnitId.trim() || undefined,
+        status: "GOOD",
+        setupCompleted: false,
+      });
+
+      Alert.alert("Tunnel created", "Now assign RFID tags for each plant.", [
+        { text: "Open Setup Map", onPress: () => navigation.replace("TunnelSetup", { tunnelId }) },
+      ]);
+    } catch (e: any) {
+      Alert.alert("Error", e?.message ?? "Failed to create tunnel");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={{ flex: 1 }}>
+      <ScrollView contentContainerStyle={styles.container} showsVerticalScrollIndicator={false}>
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Tunnel Details</Text>
+
+          <View style={styles.inputGroup}>
+            <Text style={styles.label}>Tunnel Name *</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="e.g., Tunnel A (Polytunnel 1)"
+              value={form.tunnelName}
+              onChangeText={(v) => update("tunnelName", v)}
+            />
+          </View>
+
+          <View style={styles.inputGroup}>
+            <Text style={styles.label}>Crop Type *</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="e.g., Cucumber"
+              value={form.cropType}
+              onChangeText={(v) => update("cropType", v)}
+            />
+          </View>
+
+          <View style={styles.inputGroup}>
+            <Text style={styles.label}>Size</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="e.g., 500 m² or 10m x 50m"
+              value={form.size}
+              onChangeText={(v) => update("size", v)}
+            />
+          </View>
+        </View>
+
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Plant Layout</Text>
+
+          <View style={styles.row}>
+            <View style={[styles.inputGroup, { flex: 1, marginRight: 8 }]}>
+              <Text style={styles.label}>Rows *</Text>
+              <TextInput
+                style={styles.input}
+                placeholder="e.g., 10"
+                keyboardType="number-pad"
+                value={form.rows}
+                onChangeText={(v) => update("rows", onlyDigits(v))}
+              />
             </View>
 
-            {/* Plant Layout */}
-            <View style={styles.section}>
-                <Text style={styles.sectionTitle}>Plant Layout</Text>
-
-                <View style={styles.row}>
-                    <View style={[styles.inputGroup, { flex: 1, marginRight: 8 }]}>
-                        <Text style={styles.label}>Rows</Text>
-                        <TextInput
-                            style={styles.input}
-                            placeholder="10"
-                            keyboardType="number-pad"
-                            value={formData.rows}
-                            onChangeText={(val) => updateField("rows", val)}
-                        />
-                    </View>
-
-                    <View style={[styles.inputGroup, { flex: 1, marginLeft: 8 }]}>
-                        <Text style={styles.label}>Columns</Text>
-                        <TextInput
-                            style={styles.input}
-                            placeholder="20"
-                            keyboardType="number-pad"
-                            value={formData.columns}
-                            onChangeText={(val) => updateField("columns", val)}
-                        />
-                    </View>
-                </View>
+            <View style={[styles.inputGroup, { flex: 1, marginLeft: 8 }]}>
+              <Text style={styles.label}>Columns *</Text>
+              <TextInput
+                style={styles.input}
+                placeholder="e.g., 20"
+                keyboardType="number-pad"
+                value={form.columns}
+                onChangeText={(v) => update("columns", onlyDigits(v))}
+              />
             </View>
+          </View>
 
-            {/* Equipment */}
-            <View style={styles.section}>
-                <Text style={styles.sectionTitle}>Equipment Configuration</Text>
+          <Text style={styles.hint}>
+            Plants to be created: <Text style={{ fontWeight: "900" }}>{totalPlants || "-"}</Text>
+          </Text>
+        </View>
 
-                <View style={styles.inputGroup}>
-                    <Text style={styles.label}>Sensor Count</Text>
-                    <TextInput
-                        style={styles.input}
-                        placeholder="8"
-                        keyboardType="number-pad"
-                        value={formData.sensorCount}
-                        onChangeText={(val) => updateField("sensorCount", val)}
-                    />
-                </View>
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Equipment</Text>
 
-                <View style={styles.inputGroup}>
-                    <Text style={styles.label}>Assigned Robot ID</Text>
-                    <TextInput
-                        style={styles.input}
-                        placeholder="e.g., R-004"
-                        value={formData.robotId}
-                        onChangeText={(val) => updateField("robotId", val)}
-                    />
-                </View>
+          <View style={styles.inputGroup}>
+            <Text style={styles.label}>Sensor Count</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="e.g., 8"
+              keyboardType="number-pad"
+              value={form.sensorCount}
+              onChangeText={(v) => update("sensorCount", onlyDigits(v))}
+            />
+          </View>
 
-                <View style={styles.inputGroup}>
-                    <Text style={styles.label}>Fertigation Unit ID</Text>
-                    <TextInput
-                        style={styles.input}
-                        placeholder="e.g., F-004"
-                        value={formData.fertigationUnitId}
-                        onChangeText={(val) => updateField("fertigationUnitId", val)}
-                    />
-                </View>
-            </View>
+          <View style={styles.inputGroup}>
+            <Text style={styles.label}>Robot ID</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="e.g., R-001"
+              value={form.robotId}
+              onChangeText={(v) => update("robotId", v)}
+              autoCapitalize="characters"
+            />
+          </View>
 
-            {/* Action Buttons */}
-            <TouchableOpacity style={styles.submitBtn} onPress={handleSubmit}>
-                <Text style={styles.submitText}>Add Tunnel</Text>
-            </TouchableOpacity>
+          <View style={styles.inputGroup}>
+            <Text style={styles.label}>Fertigation Unit ID</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="e.g., F-001"
+              value={form.fertigationUnitId}
+              onChangeText={(v) => update("fertigationUnitId", v)}
+              autoCapitalize="characters"
+            />
+          </View>
+        </View>
 
-            <TouchableOpacity style={styles.cancelBtn} onPress={() => navigation.goBack()}>
-                <Text style={styles.cancelText}>Cancel</Text>
-            </TouchableOpacity>
+        <TouchableOpacity style={[styles.submitBtn, loading && { opacity: 0.7 }]} onPress={handleCreate} disabled={loading}>
+          {loading ? <ActivityIndicator color="#fff" /> : <Text style={styles.submitText}>Create Tunnel</Text>}
+        </TouchableOpacity>
 
-            <View style={{ height: 40 }} />
-        </ScrollView>
-    );
+        <TouchableOpacity style={styles.cancelBtn} onPress={() => navigation.goBack()} disabled={loading}>
+          <Text style={styles.cancelText}>Cancel</Text>
+        </TouchableOpacity>
+
+        <View style={{ height: 40 }} />
+      </ScrollView>
+    </KeyboardAvoidingView>
+  );
 }
 
 const styles = StyleSheet.create({
-    container: { padding: 16, backgroundColor: "#F8F9FA", flexGrow: 1 },
+  container: { padding: 16, backgroundColor: "#F8F9FA", flexGrow: 1 },
+  section: { backgroundColor: "#fff", borderRadius: 20, padding: 20, marginBottom: 20, elevation: 1 },
+  sectionTitle: { fontSize: 16, fontWeight: "900", color: "#2E7D32", marginBottom: 16 },
 
-    section: { backgroundColor: "#fff", borderRadius: 20, padding: 20, marginBottom: 20, elevation: 1 },
-    sectionTitle: { fontSize: 16, fontWeight: "800", color: "#2E7D32", marginBottom: 16 },
+  inputGroup: { marginBottom: 16 },
+  label: { fontSize: 14, fontWeight: "700", color: "#555", marginBottom: 8 },
+  input: {
+    backgroundColor: "#F5F5F5",
+    borderRadius: 12,
+    padding: 14,
+    fontSize: 15,
+    color: "#333",
+    borderWidth: 1,
+    borderColor: "#E0E0E0",
+  },
+  row: { flexDirection: "row" },
+  hint: { marginTop: -6, color: "#757575", fontSize: 12 },
 
-    inputGroup: { marginBottom: 16 },
-    label: { fontSize: 14, fontWeight: "600", color: "#555", marginBottom: 8 },
-    input: {
-        backgroundColor: "#F5F5F5",
-        borderRadius: 12,
-        padding: 14,
-        fontSize: 15,
-        color: "#333",
-        borderWidth: 1,
-        borderColor: "#E0E0E0",
-    },
+  submitBtn: { backgroundColor: "#2E7D32", paddingVertical: 16, borderRadius: 16, alignItems: "center", marginBottom: 12 },
+  submitText: { color: "#fff", fontWeight: "900", fontSize: 16 },
 
-    row: { flexDirection: "row" },
-
-    submitBtn: {
-        backgroundColor: "#2E7D32",
-        paddingVertical: 16,
-        borderRadius: 16,
-        alignItems: "center",
-        marginBottom: 12,
-    },
-    submitText: { color: "#fff", fontWeight: "800", fontSize: 16 },
-
-    cancelBtn: {
-        backgroundColor: "#fff",
-        paddingVertical: 16,
-        borderRadius: 16,
-        alignItems: "center",
-        borderWidth: 1,
-        borderColor: "#E0E0E0",
-    },
-    cancelText: { color: "#757575", fontWeight: "700", fontSize: 16 },
+  cancelBtn: { backgroundColor: "#fff", paddingVertical: 16, borderRadius: 16, alignItems: "center", borderWidth: 1, borderColor: "#E0E0E0" },
+  cancelText: { color: "#757575", fontWeight: "800", fontSize: 16 },
 });

@@ -34,6 +34,11 @@ export type RootStackParamList = {
   AddTunnel: undefined;
   EditProfile: undefined;
   ChangePassword: undefined;
+  ScansAndResults: undefined;
+  ScanPreview: { captureId: string };
+  TunnelSettings: undefined;
+EditTunnel: { tunnelId: string };
+TunnelSetup: { tunnelId: string };
 
   // Camera
   Camera: undefined;

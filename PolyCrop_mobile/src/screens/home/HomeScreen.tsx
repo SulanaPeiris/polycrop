@@ -7,55 +7,68 @@ import { useTunnel } from "../../context/TunnelContext";
 import { useTunnelHeader } from "../../hooks/useTunnelHeader";
 
 export default function HomeScreen() {
-  const { tunnels, selectedTunnelId, setSelectedTunnelId, selectedTunnel } = useTunnel();
+  const { tunnels, selectedTunnelId, setSelectedTunnelId, selectedTunnel, isTunnelsLoading } = useTunnel();
+
   useTunnelHeader("Home");
 
   return (
     <ScrollView contentContainerStyle={styles.container} showsVerticalScrollIndicator={false}>
-
       {/* 1. Tunnel List Section */}
       <View style={styles.listSection}>
         <SectionTitle title="Your Polytunnels" />
+
+        {/* helper messages */}
+        {isTunnelsLoading ? (
+          <Text style={styles.helper}>Loading tunnels...</Text>
+        ) : tunnels.length === 0 ? (
+          <Text style={styles.helper}>No tunnels yet. Go to Settings → Add New Tunnel.</Text>
+        ) : null}
+
         <View style={styles.tunnelList}>
           {tunnels.map((t) => {
             const active = t.id === selectedTunnelId;
+
             return (
               <TouchableOpacity
                 key={t.id}
                 onPress={() => setSelectedTunnelId(t.id)}
                 style={[styles.tunnelButton, active && styles.tunnelButtonActive]}
+                activeOpacity={0.85}
               >
                 <View style={styles.tunnelRow}>
-                  <Ionicons
-                    name="business"
-                    size={16}
-                    color={active ? "#FFF" : "#555"}
-                  />
+                  <Ionicons name="business" size={16} color={active ? "#FFF" : "#555"} />
                   <Text style={[styles.tunnelBtnText, active && styles.tunnelBtnTextActive]}>
                     {t.name}
                   </Text>
                 </View>
-                {/* Status Dot */}
-                <View style={[
-                  styles.statusDot,
-                  { backgroundColor: t.status === "GOOD" ? "#4CAF50" : t.status === "WARN" ? "#FFC107" : "#F44336" }
-                ]} />
+
+                {/* Status Dot (2 statuses only) */}
+                <View
+                  style={[
+                    styles.statusDot,
+                    { backgroundColor: t.status === "GOOD" ? "#4CAF50" : "#FB8C00" },
+                  ]}
+                />
               </TouchableOpacity>
             );
           })}
         </View>
       </View>
 
-      {/* 2. Overview Section (Differentiated) */}
+      {/* 2. Overview Section */}
       <View style={styles.overviewSection}>
         <View style={styles.overviewHeader}>
           <Ionicons name="stats-chart" size={20} color="#2E7D32" />
           <Text style={styles.overviewTitle}>Detailed Overview</Text>
         </View>
 
-        <TunnelOverview tunnel={selectedTunnel} />
+        {/* guard selectedTunnel */}
+        {selectedTunnel ? (
+          <TunnelOverview tunnel={selectedTunnel} />
+        ) : (
+          <Text style={styles.helper}>Select a tunnel to view details.</Text>
+        )}
       </View>
-
     </ScrollView>
   );
 }
@@ -63,19 +76,19 @@ export default function HomeScreen() {
 const styles = StyleSheet.create({
   container: {
     paddingBottom: 40,
-    backgroundColor: "#FFFFFF"
+    backgroundColor: "#FFFFFF",
   },
 
   // List Section
   listSection: {
     padding: 16,
-    paddingBottom: 8
+    paddingBottom: 8,
   },
   tunnelList: {
     flexDirection: "row",
     flexWrap: "wrap",
     gap: 10,
-    marginTop: 8
+    marginTop: 8,
   },
   tunnelButton: {
     flexDirection: "row",
@@ -87,29 +100,29 @@ const styles = StyleSheet.create({
     backgroundColor: "#F5F5F5",
     borderWidth: 1,
     borderColor: "#EEEEEE",
-    minWidth: "47%" // 2 per row
+    minWidth: "47%", // 2 per row
   },
   tunnelButtonActive: {
-    backgroundColor: "#2E7D32", // Green Primary
+    backgroundColor: "#2E7D32",
     borderColor: "#2E7D32",
   },
   tunnelRow: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 8
+    gap: 8,
   },
   tunnelBtnText: {
     fontSize: 14,
     fontWeight: "600",
-    color: "#333"
+    color: "#333",
   },
   tunnelBtnTextActive: {
-    color: "#FFFFFF"
+    color: "#FFFFFF",
   },
   statusDot: {
     width: 8,
     height: 8,
-    borderRadius: 4
+    borderRadius: 4,
   },
 
   // Overview Section
@@ -120,17 +133,23 @@ const styles = StyleSheet.create({
     borderTopRightRadius: 30,
     padding: 20,
     paddingTop: 24,
-    minHeight: 500 // Min height to fill screen visually
+    minHeight: 500,
   },
   overviewHeader: {
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
-    marginBottom: 16
+    marginBottom: 16,
   },
   overviewTitle: {
     fontSize: 18,
     fontWeight: "800",
-    color: "#1B5E20"
-  }
+    color: "#1B5E20",
+  },
+
+  helper: {
+    marginTop: 8,
+    color: "#757575",
+    fontSize: 13,
+  },
 });
