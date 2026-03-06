@@ -1,53 +1,124 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <time.h>
+
 #include <Wire.h>
 #include <SPI.h>
 #include <LoRa.h>
+
 #include "Adafruit_GFX.h"
 #include "Adafruit_SH110X.h"
 
-// I2C pins
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"   // optional, ok to keep
+
+// ================= WIFI =================
+#define WIFI_SSID "Janith"
+#define WIFI_PASSWORD "11223344"
+
+// ================= FIREBASE =================
+#define API_KEY "AIzaSyCw9ojsjWlbr-YvVH1_BkOjyy1xOedro88"
+#define DATABASE_URL "https://rfid-robot-ff91d-default-rtdb.firebaseio.com" // not used for Firestore
+#define FIREBASE_PROJECT_ID "rfid-robot-ff91d"
+
+#define ROBOT_ID "ROBOT_01"
+#define LORA_COLLECTION "loraReadings"
+
+// ================= FIREBASE OBJECTS =================
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ================= OLED (I2C) =================
 #define I2C_SDA 21
 #define I2C_SCL 22
+Adafruit_SH1107 display(128, 128, &Wire);
 
-// LoRa pins
+// ================= LoRa (SX1278) =================
 #define LORA_SCK  18
 #define LORA_MISO 19
 #define LORA_MOSI 23
 #define LORA_CS   5
 #define LORA_RST  14
 #define LORA_DIO0 26
-
 #define LORA_FREQ 433E6
 
-Adafruit_SH1107 display(128, 128, &Wire);
+// ================= TIMING =================
+unsigned long lastStoreMs = 0;
+const unsigned long STORE_INTERVAL_MS = 5000;
 
+// Waiting screen logic
+unsigned long lastPacketMs = 0;
+const unsigned long WAITING_TIMEOUT_MS = 3000; // no packet for 3s => show waiting
+bool showingWaiting = false;
+
+// ================= LATEST VALUES =================
+bool haveData = false;
+String lastCounter = "0";
+float lastT1 = NAN, lastH1 = NAN, lastT2 = NAN, lastH2 = NAN;
+int lastRSSI = 0;
+
+// ================= OLED HELPERS =================
 bool oledBegin() {
-  if (display.begin(0x3C, true)) return true; // common
-  if (display.begin(0x3D, true)) return true; // sometimes
+  if (display.begin(0x3C, true)) return true;
+  if (display.begin(0x3D, true)) return true;
   return false;
 }
 
-// Parse: counter,t1,h1,t2,h2
-bool parseCSV5(const String &s, float &t1, float &h1, float &t2, float &h2) {
-  int p1 = s.indexOf(',');
-  int p2 = s.indexOf(',', p1 + 1);
-  int p3 = s.indexOf(',', p2 + 1);
-  int p4 = s.indexOf(',', p3 + 1);
-  if (p1 < 0 || p2 < 0 || p3 < 0 || p4 < 0) return false;
+void oledStatus(const String &line1, const String &line2 = "", const String &line3 = "", const String &line4 = "") {
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  display.setTextSize(1);
 
-  t1 = s.substring(p1 + 1, p2).toFloat();
-  h1 = s.substring(p2 + 1, p3).toFloat();
-  t2 = s.substring(p3 + 1, p4).toFloat();
-  h2 = s.substring(p4 + 1).toFloat();
-  return true;
+  display.setCursor(0, 0);
+  display.println("LoRa Receiver Setup");
+
+  int y = 18;
+  if (line1.length()) { display.setCursor(0, y); display.println(line1); y += 12; }
+  if (line2.length()) { display.setCursor(0, y); display.println(line2); y += 12; }
+  if (line3.length()) { display.setCursor(0, y); display.println(line3); y += 12; }
+  if (line4.length()) { display.setCursor(0, y); display.println(line4); y += 12; }
+
+  display.display();
 }
 
-void draw(float t1, float h1, float t2, float h2, int rssi) {
+void showWaitingScreen() {
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+  display.println("LoRa Receiver");
+
+  display.setCursor(0, 20);
+  display.println("Waiting for LoRa...");
+
+  display.setCursor(0, 40);
+  display.print("WiFi: ");
+  display.println(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
+
+  display.setCursor(0, 55);
+  display.print("Firebase: ");
+  display.println(Firebase.ready() ? "Ready" : "Not ready");
+
+  display.setCursor(0, 70);
+  display.println("Receiver: Ready");
+
+  display.setCursor(0, 90);
+  display.println("Freq: 433MHz");
+
+  display.display();
+  showingWaiting = true;
+}
+
+void drawData(float t1, float h1, float t2, float h2, int rssi) {
   display.clearDisplay();
   display.setTextColor(SH110X_WHITE);
 
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.println("LoRa: 2x SHT3x");
+  display.println("LoRa RX + Firestore");
 
   display.setCursor(0, 18);
   display.print("S1 T: "); display.print(t1, 1); display.println(" C");
@@ -61,59 +132,248 @@ void draw(float t1, float h1, float t2, float h2, int rssi) {
   display.print("RSSI: "); display.print(rssi); display.print(" dBm");
 
   display.display();
+  showingWaiting = false;
 }
 
-void setup() {
-  Serial.begin(115200);
-  delay(500);
-
-  Wire.begin(I2C_SDA, I2C_SCL);
-
-  if (!oledBegin()) {
-    Serial.println("OLED not found at 0x3C/0x3D");
-    while (1) delay(10);
+// ================= TIME (TLS) =================
+bool initTime() {
+  configTime(19800, 0, "pool.ntp.org", "time.nist.gov"); // Sri Lanka UTC+5:30
+  time_t now = time(nullptr);
+  int retry = 0;
+  while (now < 1700000000 && retry < 60) {
+    delay(500);
+    now = time(nullptr);
+    retry++;
   }
+  return (now >= 1700000000);
+}
+
+String nowRFC3339Z() {
+  time_t now = time(nullptr);
+  if (now < 1700000000) return "1970-01-01T00:00:00Z";
+  struct tm tm_utc;
+  gmtime_r(&now, &tm_utc);
+  char buf[25];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+  return String(buf);
+}
+
+// ================= WIFI =================
+bool connectWiFiWithOLED() {
+  oledStatus("WiFi: Connecting...", WIFI_SSID);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long start = millis();
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(250);
+    // timeout after 20s (still continue trying, but show message)
+    if (millis() - start > 20000) {
+      oledStatus("WiFi: Still trying...", "Check password/router");
+      start = millis();
+    }
+  }
+
+  WiFi.setSleep(false);
+
+  String ip = WiFi.localIP().toString();
+  oledStatus("WiFi: Connected", "IP: " + ip);
+  delay(800);
+  return true;
+}
+
+// ================= FIREBASE =================
+bool initFirebaseWithOLED() {
+  oledStatus("Firebase: Auth...", "Anonymous SignUp");
+
+  config.api_key = API_KEY;
+  config.token_status_callback = tokenStatusCallback;
+
+  bool ok = Firebase.signUp(&config, &auth, "", "");
+  if (!ok) {
+    oledStatus("Firebase: SignUp FAIL", String(config.signer.signupError.message.c_str()));
+    delay(2000);
+    return false;
+  }
+
+  fbdo.setBSSLBufferSize(4096, 1024);
+  fbdo.setResponseSize(4096);
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // wait a moment for token
+  unsigned long start = millis();
+  while (!Firebase.ready() && millis() - start < 8000) {
+    delay(200);
+  }
+
+  oledStatus("Firebase: " + String(Firebase.ready() ? "Ready" : "Not ready"));
+  delay(800);
+  return Firebase.ready();
+}
+
+// ================= LORA =================
+bool initLoRaWithOLED() {
+  oledStatus("LoRa: Initializing...", "433MHz SX1278");
 
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
   LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
 
   if (!LoRa.begin(LORA_FREQ)) {
-    Serial.println("LoRa init failed (check wiring/3.3V/antenna)");
-    while (1) delay(10);
+    oledStatus("LoRa: INIT FAILED", "Check wiring", "3.3V + antenna");
+    return false;
   }
 
-  // Must match TX:
+  // Must match TX
   LoRa.setSpreadingFactor(7);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(5);
 
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println("Waiting LoRa...");
-  display.display();
-
-  Serial.println("RX ready");
+  oledStatus("LoRa: Receiver Ready");
+  delay(800);
+  return true;
 }
 
+// ================= PARSE =================
+// incoming: counter,t1,h1,t2,h2
+bool parseCSV5(const String &s, String &counterStr, float &t1, float &h1, float &t2, float &h2) {
+  int p1 = s.indexOf(',');
+  int p2 = s.indexOf(',', p1 + 1);
+  int p3 = s.indexOf(',', p2 + 1);
+  int p4 = s.indexOf(',', p3 + 1);
+  if (p1 < 0 || p2 < 0 || p3 < 0 || p4 < 0) return false;
+
+  counterStr = s.substring(0, p1);
+  t1 = s.substring(p1 + 1, p2).toFloat();
+  h1 = s.substring(p2 + 1, p3).toFloat();
+  t2 = s.substring(p3 + 1, p4).toFloat();
+  h2 = s.substring(p4 + 1).toFloat();
+  return true;
+}
+
+String makeDocId() {
+  uint32_t r = (uint32_t)esp_random();
+  return String(ROBOT_ID) + "_" + String(millis()) + "_" + String(r, HEX);
+}
+
+// ================= FIRESTORE WRITE =================
+bool storeToFirestore() {
+  if (!Firebase.ready()) return false;
+
+  String documentPath = String(LORA_COLLECTION) + "/" + makeDocId();
+
+  FirebaseJson content;
+  content.set("fields/robotId/stringValue", String(ROBOT_ID));
+  content.set("fields/counter/stringValue", lastCounter);
+
+  content.set("fields/s1_temp/doubleValue", lastT1);
+  content.set("fields/s1_hum/doubleValue", lastH1);
+  content.set("fields/s2_temp/doubleValue", lastT2);
+  content.set("fields/s2_hum/doubleValue", lastH2);
+
+  content.set("fields/rssi/integerValue", String(lastRSSI));
+  content.set("fields/ts/timestampValue", nowRFC3339Z());
+
+  bool ok = Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "",
+                                             documentPath.c_str(), content.raw());
+
+  if (!ok) {
+    Serial.print("Firestore FAILED: ");
+    Serial.println(fbdo.errorReason());
+  }
+  return ok;
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  if (!oledBegin()) {
+    Serial.println("OLED not found at 0x3C/0x3D");
+    while (1) delay(10);
+  }
+
+  oledStatus("Booting...");
+  delay(500);
+
+  // WiFi
+  connectWiFiWithOLED();
+
+  // Time (TLS)
+  oledStatus("Time: Syncing (NTP)...");
+  bool timeOk = initTime();
+  oledStatus(String("Time: ") + (timeOk ? "OK" : "FAILED"));
+  delay(800);
+
+  // Firebase
+  initFirebaseWithOLED();
+
+  // LoRa receiver init
+  if (!initLoRaWithOLED()) {
+    while (1) delay(10);
+  }
+
+  // Show waiting screen
+  lastPacketMs = millis();
+  showWaitingScreen();
+
+  Serial.println("Receiver ready.");
+}
+
+// ================= LOOP =================
 void loop() {
+  Firebase.ready(); // keep token alive
+
+  // ---- Receive packet ----
   int packetSize = LoRa.parsePacket();
-  if (!packetSize) return;
+  if (packetSize) {
+    String incoming = "";
+    while (LoRa.available()) incoming += (char)LoRa.read();
 
-  String incoming = "";
-  while (LoRa.available()) incoming += (char)LoRa.read();
+    int rssi = LoRa.packetRssi();
 
-  int rssi = LoRa.packetRssi();
+    Serial.print("Received: ");
+    Serial.print(incoming);
+    Serial.print(" | RSSI: ");
+    Serial.println(rssi);
 
-  Serial.print("Received: ");
-  Serial.print(incoming);
-  Serial.print(" | RSSI: ");
-  Serial.println(rssi);
+    String counterStr;
+    float t1, h1, t2, h2;
 
-  float t1, h1, t2, h2;
-  if (parseCSV5(incoming, t1, h1, t2, h2)) {
-    draw(t1, h1, t2, h2, rssi);
-  } else {
-    Serial.println("Parse error (expected counter,t1,h1,t2,h2)");
+    if (parseCSV5(incoming, counterStr, t1, h1, t2, h2)) {
+      lastPacketMs = millis();
+
+      lastCounter = counterStr;
+      lastT1 = t1; lastH1 = h1;
+      lastT2 = t2; lastH2 = h2;
+      lastRSSI = rssi;
+      haveData = true;
+
+      drawData(t1, h1, t2, h2, rssi);
+    }
+  }
+
+  // ---- If no packet for a while, show waiting ----
+  if ((millis() - lastPacketMs) > WAITING_TIMEOUT_MS) {
+    if (!showingWaiting) showWaitingScreen();
+  }
+
+  // ---- Store every 5 seconds ----
+  if (haveData && (millis() - lastStoreMs >= STORE_INTERVAL_MS)) {
+    lastStoreMs = millis();
+
+    if (WiFi.status() != WL_CONNECTED) {
+      oledStatus("WiFi: Reconnecting...");
+      connectWiFiWithOLED();
+      oledStatus("Time: Syncing (NTP)...");
+      initTime();
+      oledStatus("Time: OK");
+      delay(300);
+      showWaitingScreen();
+    }
+
+    storeToFirestore();
   }
 }
