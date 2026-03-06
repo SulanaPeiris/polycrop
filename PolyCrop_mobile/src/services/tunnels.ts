@@ -4,7 +4,6 @@ import {
   deleteDoc,
   doc,
   getDocs,
-  orderBy,
   query,
   serverTimestamp,
   updateDoc,
@@ -12,6 +11,7 @@ import {
   writeBatch,
 } from "firebase/firestore";
 import { db } from "../firebase/firebase";
+import { bindRobotToTunnel } from "./robots";
 
 export type TunnelStatus = "GOOD" | "NEED_ATTENTION";
 
@@ -19,7 +19,7 @@ export type Tunnel = {
   id: string;
   ownerId: string;
 
-  tunnelName: string;
+  name: string; // ✅ use "name" everywhere
   cropType: string;
   size?: string;
 
@@ -44,6 +44,11 @@ export async function createTunnelWithPlants(input: CreateTunnelInput) {
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   });
+
+  // ✅ bind robot -> tunnel (so robot can read assignedTunnelId)
+  if (input.robotId && input.robotId.trim().length > 0) {
+    await bindRobotToTunnel(input.robotId.trim(), tunnelRef.id);
+  }
 
   // create plants grid
   let batch = writeBatch(db);
@@ -79,14 +84,18 @@ export async function createTunnelWithPlants(input: CreateTunnelInput) {
 }
 
 export async function getMyTunnels(ownerId: string) {
-  const q = query(
-    collection(db, "tunnels"),
-    where("ownerId", "==", ownerId),
-    orderBy("createdAt", "desc")
-  );
-
+  // ✅ no orderBy to avoid composite index requirement
+  const q = query(collection(db, "tunnels"), where("ownerId", "==", ownerId));
   const snap = await getDocs(q);
-  return snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) })) as Tunnel[];
+
+  const items = snap.docs.map((d) => {
+    const data: any = d.data();
+    const createdAtMs = typeof data?.createdAt?.toMillis === "function" ? data.createdAt.toMillis() : 0;
+    return { id: d.id, ...data, __createdAtMs: createdAtMs };
+  });
+
+  items.sort((a: any, b: any) => (b.__createdAtMs ?? 0) - (a.__createdAtMs ?? 0));
+  return items.map(({ __createdAtMs, ...rest }: any) => rest) as Tunnel[];
 }
 
 export async function updateTunnel(
@@ -97,11 +106,9 @@ export async function updateTunnel(
 }
 
 /**
- * ✅ Deletes plants subcollection first (so it’s a real delete).
- * NOTE: This can take time for very large tunnels.
+ * ✅ Deletes plants subcollection first (real delete).
  */
 export async function deleteTunnelCascade(tunnelId: string) {
-  // delete plants in batches
   const plantsSnap = await getDocs(collection(db, "tunnels", tunnelId, "plants"));
   let batch = writeBatch(db);
   let ops = 0;
@@ -117,6 +124,5 @@ export async function deleteTunnelCascade(tunnelId: string) {
   }
   if (ops > 0) await batch.commit();
 
-  // delete tunnel doc
   await deleteDoc(doc(db, "tunnels", tunnelId));
 }

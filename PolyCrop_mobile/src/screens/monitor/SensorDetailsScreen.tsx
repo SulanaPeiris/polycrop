@@ -1,70 +1,125 @@
-import React, { useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { View, Text, StyleSheet, ScrollView, Dimensions, TouchableOpacity } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { LineChart } from "react-native-chart-kit";
 import { useNavigation } from "@react-navigation/native";
+import { collection, doc, limit, onSnapshot, orderBy, query } from "firebase/firestore";
 
 import Card from "../components/Card";
 import SectionTitle from "../components/SectionTitle";
+import { useTunnel } from "../../context/TunnelContext";
+import { db } from "../../firebase/firebase";
 
 const screenWidth = Dimensions.get("window").width;
+
+function tsToMs(ts: any): number {
+  if (!ts) return 0;
+  if (typeof ts.toMillis === "function") return ts.toMillis();
+  return 0;
+}
+
+function fmtTime(ts: any) {
+  const ms = tsToMs(ts);
+  if (!ms) return "";
+  const d = new Date(ms);
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
 
 export default function SensorDetailsScreen({ route }: any) {
   const { title, sensorId } = route.params;
   const navigation = useNavigation();
+  const { selectedTunnel } = useTunnel();
+
+  const tunnelId = selectedTunnel?.id ?? "";
+  const tunnelName = selectedTunnel?.name ?? "N/A";
 
   // "Day" | "Month" | "Year"
-  const [filter, setFilter] = useState("Day");
+  const [filter, setFilter] = useState<"Day" | "Month" | "Year">("Day");
 
-  const isFault = title.includes("Fault");
-  const isHumidity = title.includes("Humidity");
+  const isHumidity = (sensorId ?? "").toLowerCase().includes("hum") || (title ?? "").toLowerCase().includes("humidity");
+  const unit = isHumidity ? "%" : "°C";
 
-  // --- Dynamic Data based on Filter ---
-  let labels: string[] = [];
-  let dataPoints: number[] = [];
-  let summary = { avg: 0, min: 0, max: 0 };
+  const [summary, setSummary] = useState<any>(null);
+  const [readings, setReadings] = useState<any[]>([]);
 
-  if (filter === "Day") {
-    labels = ["12AM", "4AM", "8AM", "12PM", "4PM", "8PM"];
-    // Simulate hourly changes
-    dataPoints = isFault ? [22, 22, 21, 0, 0, 5] : [22, 21, 23, 29, 30, 24];
-    summary = { avg: 24.8, min: 21, max: 30 };
-  } else if (filter === "Month") {
-    labels = ["W1", "W2", "W3", "W4"];
-    // Simulate weekly avg
-    dataPoints = [24, 25, 22, 26];
-    summary = { avg: 24.2, min: 22, max: 26 };
-  } else {
-    // Year
-    labels = ["Jan", "Apr", "Jul", "Oct"];
-    dataPoints = [20, 28, 32, 25];
-    summary = { avg: 26.2, min: 20, max: 32 };
-  }
+  // ✅ live summary
+  useEffect(() => {
+    if (!tunnelId) {
+      setSummary(null);
+      return;
+    }
+    return onSnapshot(doc(db, "tunnels", tunnelId, "sensorSummary", "latest"), (snap) => {
+      setSummary(snap.exists() ? snap.data() : null);
+    });
+  }, [tunnelId]);
 
-  // Adjust values for humidity (higher range)
-  if (isHumidity) {
-    dataPoints = dataPoints.map(v => v * 2 + 10); // simply scaling for demo
-    summary = {
-      avg: Math.round(summary.avg * 2 + 10),
-      min: Math.round(summary.min * 2 + 10),
-      max: Math.round(summary.max * 2 + 10)
-    };
-  }
+  // ✅ readings based on filter
+  const limitN = filter === "Day" ? 24 : filter === "Month" ? 120 : 240;
 
+  useEffect(() => {
+    if (!tunnelId) {
+      setReadings([]);
+      return;
+    }
+    const q = query(
+      collection(db, "tunnels", tunnelId, "loraReadings"),
+      orderBy("ts", "desc"),
+      limit(limitN)
+    );
+
+    return onSnapshot(
+      q,
+      (snap) => setReadings(snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) })).reverse()),
+      (err) => {
+        console.log("SensorDetails loraReadings error:", err);
+        setReadings([]);
+      }
+    );
+  }, [tunnelId, limitN]);
+
+  // values from summary (live)
+  const s1 = isHumidity ? summary?.s1_hum : summary?.s1_temp;
+  const s2 = isHumidity ? summary?.s2_hum : summary?.s2_temp;
+  const avg = isHumidity ? summary?.avg_hum : summary?.avg_temp;
+
+  // connectivity
+  const gatewayId = summary?.gatewayId ?? "N/A";
+  const counter = summary?.counter ?? "—";
+  const rssi = summary?.rssi ?? null;
+  const snr = summary?.snr ?? null;
+  const lastSeenAtMs = tsToMs(summary?.lastSeenAt);
+  const online = lastSeenAtMs ? Date.now() - lastSeenAtMs < 60_000 : false;
+
+  // chart series
+  const s1Series = useMemo(
+    () => readings.map((r) => Number((isHumidity ? r.s1_hum : r.s1_temp) ?? 0)),
+    [readings, isHumidity]
+  );
+  const s2Series = useMemo(
+    () => readings.map((r) => Number((isHumidity ? r.s2_hum : r.s2_temp) ?? 0)),
+    [readings, isHumidity]
+  );
+  const avgSeries = useMemo(
+    () => readings.map((r) => Number((isHumidity ? r.avg_hum : r.avg_temp) ?? 0)),
+    [readings, isHumidity]
+  );
+
+  const labels = useMemo(() => readings.map((r: any, idx: number) => (idx % 4 === 0 ? fmtTime(r.ts) : "")), [readings]);
+
+  const stats = useMemo(() => {
+    const arr = avgSeries.filter((n) => Number.isFinite(n));
+    if (!arr.length) return { avg: 0, min: 0, max: 0 };
+    const min = Math.min(...arr);
+    const max = Math.max(...arr);
+    const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
+    return { avg: mean, min, max };
+  }, [avgSeries]);
 
   const getColor = (opacity = 1) => {
-    if (isFault) return `rgba(211, 47, 47, ${opacity})`;
-    if (isHumidity) return `rgba(2, 136, 209, ${opacity})`; // Blue
-    return `rgba(46, 125, 50, ${opacity})`; // Green/Default
-  }
-
-  const chartData = {
-    labels: labels,
-    datasets: [{
-      data: dataPoints,
-      color: getColor,
-      strokeWidth: 3
-    }]
+    if (isHumidity) return `rgba(2, 136, 209, ${opacity})`;
+    return `rgba(239, 108, 0, ${opacity})`;
   };
 
   const chartConfig = {
@@ -73,7 +128,30 @@ export default function SensorDetailsScreen({ route }: any) {
     color: (opacity = 1) => `rgba(0,0,0,${opacity})`,
     labelColor: (opacity = 1) => `rgba(0,0,0,${opacity})`,
     strokeWidth: 2,
-    decimalPlaces: 0,
+    decimalPlaces: 1,
+    propsForDots: { r: "4", strokeWidth: "2", stroke: "#fff" },
+  };
+
+  const chartData = {
+    labels,
+    datasets: [
+      {
+        data: s1Series.length ? s1Series : [0],
+        color: (opacity = 1) => getColor(opacity),
+        strokeWidth: 2,
+      },
+      {
+        data: s2Series.length ? s2Series : [0],
+        color: (opacity = 1) => (isHumidity ? `rgba(3, 169, 244, ${opacity})` : `rgba(255, 193, 7, ${opacity})`),
+        strokeWidth: 2,
+      },
+      {
+        data: avgSeries.length ? avgSeries : [0],
+        color: (opacity = 1) => `rgba(46, 125, 50, ${opacity})`,
+        strokeWidth: 3,
+      },
+    ],
+    legend: ["Sensor 1", "Sensor 2", "Average"],
   };
 
   return (
@@ -85,70 +163,90 @@ export default function SensorDetailsScreen({ route }: any) {
         </TouchableOpacity>
         <View>
           <Text style={styles.title}>{title}</Text>
-          <Text style={styles.subtitle}>ID: {sensorId.toUpperCase()}</Text>
+          <Text style={styles.subtitle}>
+            Tunnel: {tunnelName} • ID: {(sensorId ?? "sensor").toUpperCase()}
+          </Text>
         </View>
       </View>
 
       {/* Time Filter Tabs */}
       <View style={styles.tabContainer}>
-        {["Day", "Month", "Year"].map((t) => (
-          <TouchableOpacity
-            key={t}
-            style={[styles.tab, filter === t && styles.activeTab]}
-            onPress={() => setFilter(t)}
-          >
+        {(["Day", "Month", "Year"] as const).map((t) => (
+          <TouchableOpacity key={t} style={[styles.tab, filter === t && styles.activeTab]} onPress={() => setFilter(t)}>
             <Text style={[styles.tabText, filter === t && styles.activeTabText]}>{t}</Text>
           </TouchableOpacity>
         ))}
       </View>
 
-      {/* Main Chart */}
-      <Card>
-        <Text style={styles.sectionHeader}>{filter} Overview</Text>
-        <LineChart
-          data={chartData}
-          width={screenWidth - 48}
-          height={220}
-          chartConfig={chartConfig}
-          bezier
-          style={{ borderRadius: 16 }}
-        />
-      </Card>
-
-      {/* Report Summary */}
-      <SectionTitle title="Report Summary" />
-      <View style={styles.statsRow}>
-        <View style={styles.statCard}>
-          <Text style={styles.statLabel}>Average</Text>
-          <Text style={styles.statValue}>{summary.avg}{isHumidity ? "%" : "°C"}</Text>
+      {/* Live Values (two sensors + avg) */}
+      <SectionTitle title="Live Readings" />
+      <View style={styles.liveRow}>
+        <View style={styles.liveCard}>
+          <Text style={styles.liveLabel}>Sensor 1</Text>
+          <Text style={styles.liveValue}>{s1 != null ? `${Number(s1).toFixed(1)}${unit}` : "—"}</Text>
         </View>
-        <View style={styles.statCard}>
-          <Text style={styles.statLabel}>Min</Text>
-          <Text style={styles.statValue}>{summary.min}{isHumidity ? "%" : "°C"}</Text>
+        <View style={styles.liveCard}>
+          <Text style={styles.liveLabel}>Sensor 2</Text>
+          <Text style={styles.liveValue}>{s2 != null ? `${Number(s2).toFixed(1)}${unit}` : "—"}</Text>
         </View>
-        <View style={styles.statCard}>
-          <Text style={styles.statLabel}>Max</Text>
-          <Text style={styles.statValue}>{summary.max}{isHumidity ? "%" : "°C"}</Text>
+        <View style={[styles.liveCard, { backgroundColor: "#F1F8E9" }]}>
+          <Text style={styles.liveLabel}>Average</Text>
+          <Text style={[styles.liveValue, { color: "#2E7D32" }]}>{avg != null ? `${Number(avg).toFixed(1)}${unit}` : "—"}</Text>
         </View>
       </View>
 
+      {/* Main Chart */}
+      <Card>
+        <Text style={styles.sectionHeader}>{filter} Overview</Text>
+        <LineChart data={chartData} width={screenWidth - 48} height={240} chartConfig={chartConfig} bezier style={{ borderRadius: 16 }} />
+        <Text style={styles.chartNote}>Showing last {limitN} readings (approx.)</Text>
+      </Card>
 
-      {/* Sensor Specs / Details */}
-      <SectionTitle title="Technical Details" />
+      {/* Report Summary */}
+      <SectionTitle title="Report Summary (Average Series)" />
+      <View style={styles.statsRow}>
+        <View style={styles.statCard}>
+          <Text style={styles.statLabel}>Average</Text>
+          <Text style={styles.statValue}>{stats.avg.toFixed(1)}{unit}</Text>
+        </View>
+        <View style={styles.statCard}>
+          <Text style={styles.statLabel}>Min</Text>
+          <Text style={styles.statValue}>{stats.min.toFixed(1)}{unit}</Text>
+        </View>
+        <View style={styles.statCard}>
+          <Text style={styles.statLabel}>Max</Text>
+          <Text style={styles.statValue}>{stats.max.toFixed(1)}{unit}</Text>
+        </View>
+      </View>
+
+      {/* Technical Details (LoRa Connectivity) */}
+      <SectionTitle title="LoRa Connectivity & Details" />
       <View style={styles.specContainer}>
         <View style={styles.specRow}>
-          <Text style={styles.specLabel}>Model</Text>
-          <Text style={styles.specValue}>{isHumidity ? "DHT-22 Pro" : "DS18B20"}</Text>
+          <Text style={styles.specLabel}>Gateway ID</Text>
+          <Text style={styles.specValue}>{gatewayId}</Text>
         </View>
         <View style={styles.specRow}>
           <Text style={styles.specLabel}>Status</Text>
-          <Text style={[styles.specValue, isFault ? { color: "#D32F2F" } : { color: "#2E7D32" }]}>
-            {isFault ? "FAULT" : "Active"}
+          <Text style={[styles.specValue, online ? { color: "#2E7D32" } : { color: "#D32F2F" }]}>
+            {online ? "ONLINE" : "OFFLINE"}
           </Text>
         </View>
         <View style={styles.specRow}>
-          <Text style={styles.specLabel}>Last Calibrated</Text>
-          <Text style={styles.specValue}>2025-10-12</Text>
+          <Text style={styles.specLabel}>Packet Counter</Text>
+          <Text style={styles.specValue}>{counter}</Text>
+        </View>
+        <View style={styles.specRow}>
+          <Text style={styles.specLabel}>RSSI</Text>
+          <Text style={styles.specValue}>{rssi != null ? `${rssi} dBm` : "N/A"}</Text>
+        </View>
+        <View style={styles.specRow}>
+          <Text style={styles.specLabel}>SNR</Text>
+          <Text style={styles.specValue}>{snr != null ? `${Number(snr).toFixed(1)} dB` : "N/A"}</Text>
+        </View>
+        <View style={styles.specRow}>
+          <Text style={styles.specLabel}>Last Seen</Text>
+          <Text style={styles.specValue}>{lastSeenAtMs ? new Date(lastSeenAtMs).toLocaleString() : "N/A"}</Text>
         </View>
       </View>
 
@@ -162,15 +260,21 @@ const styles = StyleSheet.create({
   header: { flexDirection: "row", alignItems: "center", marginBottom: 16 },
   backButton: { marginRight: 16, padding: 8, backgroundColor: "#fff", borderRadius: 12 },
   title: { fontSize: 22, fontWeight: "800", color: "#1B5E20" },
-  subtitle: { fontSize: 12, color: "#666", fontWeight: "600" },
+  subtitle: { fontSize: 12, color: "#666", fontWeight: "600", marginTop: 2 },
 
-  tabContainer: { flexDirection: "row", backgroundColor: "#E0E0E0", borderRadius: 12, padding: 4, marginBottom: 20 },
+  tabContainer: { flexDirection: "row", backgroundColor: "#E0E0E0", borderRadius: 12, padding: 4, marginBottom: 16 },
   tab: { flex: 1, paddingVertical: 10, alignItems: "center", borderRadius: 10 },
   activeTab: { backgroundColor: "#fff", elevation: 2 },
   tabText: { fontWeight: "600", color: "#757575" },
   activeTabText: { color: "#1B5E20", fontWeight: "800" },
 
+  liveRow: { flexDirection: "row", gap: 12, marginBottom: 16 },
+  liveCard: { flex: 1, backgroundColor: "#fff", padding: 14, borderRadius: 16, elevation: 1, alignItems: "center" },
+  liveLabel: { fontSize: 12, color: "#888", marginBottom: 6, fontWeight: "700" },
+  liveValue: { fontSize: 18, fontWeight: "900", color: "#333" },
+
   sectionHeader: { fontSize: 16, fontWeight: "700", marginBottom: 12, color: "#444" },
+  chartNote: { marginTop: 10, color: "#757575", fontSize: 12, fontWeight: "600" },
 
   statsRow: { flexDirection: "row", gap: 12, marginBottom: 24 },
   statCard: { flex: 1, backgroundColor: "#fff", padding: 16, borderRadius: 16, alignItems: "center", elevation: 1 },
@@ -180,5 +284,5 @@ const styles = StyleSheet.create({
   specContainer: { backgroundColor: "#fff", borderRadius: 16, padding: 16, marginBottom: 24 },
   specRow: { flexDirection: "row", justifyContent: "space-between", paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: "#eee" },
   specLabel: { color: "#666", fontSize: 15 },
-  specValue: { fontWeight: "600", color: "#333", fontSize: 15 },
+  specValue: { fontWeight: "700", color: "#333", fontSize: 15 },
 });

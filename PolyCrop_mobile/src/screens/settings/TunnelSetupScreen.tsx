@@ -6,7 +6,7 @@ import { collection, doc, getDoc, onSnapshot } from "firebase/firestore";
 import { db } from "../../firebase/firebase";
 import { useTunnelHeader } from "../../hooks/useTunnelHeader";
 import { updateTunnel } from "../../services/tunnels";
-import { updatePlant } from "../../services/plants";
+import { bindRFIDToPlant, unbindRFID, updatePlant } from "../../services/plants";
 
 type PlantDoc = {
   plantUid: string;
@@ -83,33 +83,45 @@ export default function TunnelSetupScreen({ route }: any) {
   };
 
   const savePlant = async () => {
-    if (!activePlant) return;
+  if (!activePlant) return;
 
-    const nextName = plantName.trim();
-    const nextRFID = rfidTag.trim();
+  const nextName = plantName.trim();
+  const nextRFID = rfidTag.trim().toUpperCase();
+  const prevRFID = (activePlant.rfidTag ?? "").trim().toUpperCase();
 
-    if (nextName.length < 2) {
-      Alert.alert("Invalid name", "Plant name is too short.");
+  if (nextName.length < 2) {
+    Alert.alert("Invalid name", "Plant name is too short.");
+    return;
+  }
+
+  // prevent duplicate RFID inside same tunnel
+  if (nextRFID) {
+    const dup = plants.find(
+      (p) => p.id !== activePlant.id && ((p.rfidTag ?? "").trim().toUpperCase() === nextRFID)
+    );
+    if (dup) {
+      Alert.alert("Duplicate RFID", `This RFID is already used by ${dup.plantUid}.`);
       return;
     }
+  }
 
-    // prevent duplicate RFID inside the same tunnel (recommended)
-    if (nextRFID) {
-      const dup = plants.find((p) => p.id !== activePlant.id && (p.rfidTag ?? "").trim() === nextRFID);
-      if (dup) {
-        Alert.alert("Duplicate RFID", `This RFID is already used by ${dup.plantUid}.`);
-        return;
-      }
-    }
+  // 1) update name always
+  await updatePlant(tunnelId, activePlant.id, { plantName: nextName });
 
-    await updatePlant(tunnelId, activePlant.id, {
-      plantName: nextName,
-      rfidTag: nextRFID ? nextRFID : null,
-    });
+  // 2) RFID mapping logic
+  if (prevRFID && prevRFID !== nextRFID) {
+    await unbindRFID(tunnelId, activePlant.id, prevRFID);
+  }
 
-    setOpen(false);
-    setActivePlant(null);
-  };
+  if (nextRFID) {
+    await bindRFIDToPlant(tunnelId, activePlant.id, nextRFID);
+  } else if (prevRFID && !nextRFID) {
+    await unbindRFID(tunnelId, activePlant.id, prevRFID);
+  }
+
+  setOpen(false);
+  setActivePlant(null);
+};
 
   const markSetupComplete = async () => {
     await updateTunnel(tunnelId, { setupCompleted: true });
