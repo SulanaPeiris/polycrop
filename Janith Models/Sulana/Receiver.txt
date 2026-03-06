@@ -1,0 +1,119 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include "Adafruit_GFX.h"
+#include "Adafruit_SH110X.h"
+
+// I2C pins
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+// LoRa pins
+#define LORA_SCK  18
+#define LORA_MISO 19
+#define LORA_MOSI 23
+#define LORA_CS   5
+#define LORA_RST  14
+#define LORA_DIO0 26
+
+#define LORA_FREQ 433E6
+
+Adafruit_SH1107 display(128, 128, &Wire);
+
+bool oledBegin() {
+  if (display.begin(0x3C, true)) return true; // common
+  if (display.begin(0x3D, true)) return true; // sometimes
+  return false;
+}
+
+// Parse: counter,t1,h1,t2,h2
+bool parseCSV5(const String &s, float &t1, float &h1, float &t2, float &h2) {
+  int p1 = s.indexOf(',');
+  int p2 = s.indexOf(',', p1 + 1);
+  int p3 = s.indexOf(',', p2 + 1);
+  int p4 = s.indexOf(',', p3 + 1);
+  if (p1 < 0 || p2 < 0 || p3 < 0 || p4 < 0) return false;
+
+  t1 = s.substring(p1 + 1, p2).toFloat();
+  h1 = s.substring(p2 + 1, p3).toFloat();
+  t2 = s.substring(p3 + 1, p4).toFloat();
+  h2 = s.substring(p4 + 1).toFloat();
+  return true;
+}
+
+void draw(float t1, float h1, float t2, float h2, int rssi) {
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("LoRa: 2x SHT3x");
+
+  display.setCursor(0, 18);
+  display.print("S1 T: "); display.print(t1, 1); display.println(" C");
+  display.print("S1 H: "); display.print(h1, 1); display.println(" %");
+
+  display.setCursor(0, 58);
+  display.print("S2 T: "); display.print(t2, 1); display.println(" C");
+  display.print("S2 H: "); display.print(h2, 1); display.println(" %");
+
+  display.setCursor(0, 110);
+  display.print("RSSI: "); display.print(rssi); display.print(" dBm");
+
+  display.display();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  if (!oledBegin()) {
+    Serial.println("OLED not found at 0x3C/0x3D");
+    while (1) delay(10);
+  }
+
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+  LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
+
+  if (!LoRa.begin(LORA_FREQ)) {
+    Serial.println("LoRa init failed (check wiring/3.3V/antenna)");
+    while (1) delay(10);
+  }
+
+  // Must match TX:
+  LoRa.setSpreadingFactor(7);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setCodingRate4(5);
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Waiting LoRa...");
+  display.display();
+
+  Serial.println("RX ready");
+}
+
+void loop() {
+  int packetSize = LoRa.parsePacket();
+  if (!packetSize) return;
+
+  String incoming = "";
+  while (LoRa.available()) incoming += (char)LoRa.read();
+
+  int rssi = LoRa.packetRssi();
+
+  Serial.print("Received: ");
+  Serial.print(incoming);
+  Serial.print(" | RSSI: ");
+  Serial.println(rssi);
+
+  float t1, h1, t2, h2;
+  if (parseCSV5(incoming, t1, h1, t2, h2)) {
+    draw(t1, h1, t2, h2, rssi);
+  } else {
+    Serial.println("Parse error (expected counter,t1,h1,t2,h2)");
+  }
+}

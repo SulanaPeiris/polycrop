@@ -1,0 +1,82 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include "Adafruit_SHT31.h"
+
+// I2C pins (ESP32)
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+// LoRa pins (ESP32)
+#define LORA_SCK  18
+#define LORA_MISO 19
+#define LORA_MOSI 23
+#define LORA_CS   5
+#define LORA_RST  14
+#define LORA_DIO0 26
+
+#define LORA_FREQ 433E6
+
+Adafruit_SHT31 sht1 = Adafruit_SHT31();
+Adafruit_SHT31 sht2 = Adafruit_SHT31();
+
+uint32_t counter = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  // Sensor #1 should be 0x44 (AD->GND)
+  if (!sht1.begin(0x44)) {
+    Serial.println("Sensor #1 not found at 0x44 (AD should be GND)");
+    while (1) delay(10);
+  }
+
+  // Sensor #2 should be 0x45 (AD->3V3)
+  if (!sht2.begin(0x45)) {
+    Serial.println("Sensor #2 not found at 0x45 (AD should be 3V3)");
+    while (1) delay(10);
+  }
+
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+  LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
+
+  if (!LoRa.begin(LORA_FREQ)) {
+    Serial.println("LoRa init failed (check wiring/3.3V/antenna)");
+    while (1) delay(10);
+  }
+
+  // Must match receiver:
+  LoRa.setSpreadingFactor(7);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setCodingRate4(5);
+
+  Serial.println("TX ready (sending 2 sensors)");
+}
+
+void loop() {
+  float t1 = sht1.readTemperature();
+  float h1 = sht1.readHumidity();
+  float t2 = sht2.readTemperature();
+  float h2 = sht2.readHumidity();
+
+  if (isnan(t1) || isnan(h1) || isnan(t2) || isnan(h2)) {
+    Serial.println("Read failed from one sensor");
+    delay(2000);
+    return;
+  }
+
+  String payload = String(counter++) + "," +
+                   String(t1, 1) + "," + String(h1, 1) + "," +
+                   String(t2, 1) + "," + String(h2, 1);
+
+  Serial.println("Sending: " + payload);
+
+  LoRa.beginPacket();
+  LoRa.print(payload);
+  LoRa.endPacket();
+
+  delay(2000);
+}
