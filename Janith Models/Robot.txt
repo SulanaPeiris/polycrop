@@ -18,19 +18,21 @@
 // === FIREBASE ADDITION: CREDENTIALS ===
 #define WIFI_SSID "Janith"
 #define WIFI_PASSWORD "11223344"
-#define API_KEY "AIzaSyCw9ojsjWlbr-YvVH1_BkOjyy1xOedro88"
+#define API_KEY "AIzaSyA7mJ-uud7w7DDM94LGA4z-G8HJa2Q2qFA"
 
 // Kept for compatibility (not used)
 #define DATABASE_URL "https://rfid-robot-ff91d-default-rtdb.firebaseio.com"
 
-// ====== FIRESTORE (NEW) ======
-#define FIREBASE_PROJECT_ID "rfid-robot-ff91d"
+// ====== FIRESTORE ======
+#define FIREBASE_PROJECT_ID "polycrop"
 #define ROBOT_ID "ROBOT_01"
 
 // Collections
 #define ROBOTS_COLLECTION "robots"
-#define PLANTS_COLLECTION "plants"
-#define SCANS_COLLECTION  "scanEvents"
+#define TUNNELS_COLLECTION "tunnels"
+#define RFIDMAP_SUBCOLLECTION "rfidMap"
+#define PLANTS_SUBCOLLECTION "plants"
+#define SCANS_SUBCOLLECTION  "scanEvents"
 
 // === FIREBASE OBJECTS ===
 FirebaseData fbdo;
@@ -43,6 +45,12 @@ String robotMovingStatus = "MOVING";
 String scanningStatus = "IDLE";
 String actuatorStatus = "OFF"; // OFF | PUMP1_ON | PUMP2_ON | SERVO_MOVING
 String modeStr = "LINE_FOLLOW";
+
+// ✅ NEW: tunnel assignment + resolved plant doc id
+String assignedTunnelId = "";
+String currentPlantDocId = "";
+unsigned long lastTunnelFetchMs = 0;
+const unsigned long TUNNEL_REFRESH_MS = 30000; // refresh assignment every 30s
 
 // ================= MOTOR + IR PINS (UNCHANGED) =================
 // Left Motor Driver
@@ -83,9 +91,6 @@ MFRC522 mfrc522(SS_PIN, RST_PIN);
 AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
 
 // ================= L298N PUMPS (ON/OFF ONLY) =================
-// IMPORTANT: GPIO23 & GPIO19 are SPI for RFID, so we DO NOT use them.
-// Pump1: IN1=GPIO13, IN2=GND
-// Pump2: IN3=GPIO12, IN4=GND
 #define PUMP1_CTRL 13   // -> L298N IN1
 #define PUMP2_CTRL 12   // -> L298N IN3
 
@@ -183,12 +188,87 @@ String makeEventDocId() {
 }
 
 // ================= PUMPS (ON/OFF ONLY) =================
-// Because IN2 and IN4 are tied to GND, we only drive IN1 and IN3.
 void pump1On()  { digitalWrite(PUMP1_CTRL, HIGH); }
 void pump1Off() { digitalWrite(PUMP1_CTRL, LOW);  }
 
 void pump2On()  { digitalWrite(PUMP2_CTRL, HIGH); }
 void pump2Off() { digitalWrite(PUMP2_CTRL, LOW);  }
+
+// ------------------------- FIRESTORE HELPERS -------------------------
+void fetchAssignedTunnelId() {
+  if (!Firebase.ready()) return;
+
+  String path = String(ROBOTS_COLLECTION) + "/" + String(ROBOT_ID);
+
+  if (!Firebase.Firestore.getDocument(&fbdo, FIREBASE_PROJECT_ID, "", path.c_str())) {
+    Serial.print("fetchAssignedTunnelId getDocument FAILED: ");
+    Serial.println(fbdo.errorReason());
+    return;
+  }
+
+  FirebaseJson json;
+  json.setJsonData(fbdo.payload().c_str());
+
+  FirebaseJsonData data;
+  json.get(data, "fields/assignedTunnelId/stringValue");
+
+  if (data.success) {
+    String v = data.to<String>();
+    if (v != assignedTunnelId) {
+      assignedTunnelId = v;
+      Serial.print("✅ Assigned tunnel updated: ");
+      Serial.println(assignedTunnelId);
+    }
+  } else {
+    // field not set yet
+    // Keep assignedTunnelId as-is (could be empty)
+  }
+}
+
+// Resolve which plant document to update in tunnel plants subcollection
+// Reads: tunnels/{assignedTunnelId}/rfidMap/{RFID} -> fields/plantId/stringValue
+void resolvePlantDocIdFromRFID() {
+  currentPlantDocId = currentRFID; // fallback
+
+  if (!Firebase.ready()) return;
+  if (assignedTunnelId.length() == 0) return;
+  if (currentRFID == "NONE") return;
+
+  String mapPath = String(TUNNELS_COLLECTION) + "/" + assignedTunnelId + "/" +
+                   String(RFIDMAP_SUBCOLLECTION) + "/" + currentRFID;
+
+  if (!Firebase.Firestore.getDocument(&fbdo, FIREBASE_PROJECT_ID, "", mapPath.c_str())) {
+    // mapping not found (NOT_FOUND) -> keep fallback
+    return;
+  }
+
+  FirebaseJson json;
+  json.setJsonData(fbdo.payload().c_str());
+  FirebaseJsonData data;
+  json.get(data, "fields/plantId/stringValue");
+
+  if (data.success) {
+    currentPlantDocId = data.to<String>();
+  }
+}
+
+String buildScanEventPath(const String& eventId) {
+  if (assignedTunnelId.length() > 0) {
+    return String(TUNNELS_COLLECTION) + "/" + assignedTunnelId + "/" +
+           String(SCANS_SUBCOLLECTION) + "/" + eventId;
+  }
+  // fallback (old)
+  return String("scanEvents") + "/" + eventId;
+}
+
+String buildPlantPath() {
+  if (assignedTunnelId.length() > 0) {
+    return String(TUNNELS_COLLECTION) + "/" + assignedTunnelId + "/" +
+           String(PLANTS_SUBCOLLECTION) + "/" + currentPlantDocId;
+  }
+  // fallback (old)
+  return String("plants") + "/" + currentRFID;
+}
 
 // ------------------------- FIRESTORE WRITE FUNCTIONS -------------------------
 void updateRobotDoc() {
@@ -198,6 +278,7 @@ void updateRobotDoc() {
 
   FirebaseJson content;
   content.set("fields/robotId/stringValue", String(ROBOT_ID));
+  content.set("fields/assignedTunnelId/stringValue", assignedTunnelId); // ✅ NEW
   content.set("fields/rfid/stringValue", currentRFID);
   content.set("fields/moving/stringValue", robotMovingStatus);
   content.set("fields/scanning/stringValue", scanningStatus);
@@ -206,7 +287,7 @@ void updateRobotDoc() {
   content.set("fields/rssi/integerValue", (int)WiFi.RSSI());
   content.set("fields/updatedAt/timestampValue", nowRFC3339Z());
 
-  String mask = "robotId,rfid,moving,scanning,actuator,mode,rssi,updatedAt";
+  String mask = "robotId,assignedTunnelId,rfid,moving,scanning,actuator,mode,rssi,updatedAt";
 
   if (!Firebase.Firestore.patchDocument(&fbdo, FIREBASE_PROJECT_ID, "",
                                         documentPath.c_str(), content.raw(), mask.c_str())) {
@@ -219,7 +300,10 @@ void updatePlantDocOnRFID() {
   if (!Firebase.ready()) return;
   if (currentRFID == "NONE") return;
 
-  String documentPath = String(PLANTS_COLLECTION) + "/" + currentRFID;
+  // ✅ resolve correct plant doc id before update
+  resolvePlantDocIdFromRFID();
+
+  String documentPath = buildPlantPath();
 
   FirebaseJson content;
   content.set("fields/rfid/stringValue", currentRFID);
@@ -241,7 +325,7 @@ void updatePlantDocAfterAll() {
   if (!Firebase.ready()) return;
   if (currentRFID == "NONE") return;
 
-  String documentPath = String(PLANTS_COLLECTION) + "/" + currentRFID;
+  String documentPath = buildPlantPath();
 
   FirebaseJson content;
   content.set("fields/scanStatus/stringValue", "DONE");
@@ -257,11 +341,12 @@ void logScanEvent(String eventType, String eventNote) {
   if (!Firebase.ready()) return;
 
   String eventId = makeEventDocId();
-  String documentPath = String(SCANS_COLLECTION) + "/" + eventId;
+  String documentPath = buildScanEventPath(eventId);
 
   FirebaseJson content;
   content.set("fields/eventType/stringValue", eventType);
   content.set("fields/robotId/stringValue", String(ROBOT_ID));
+  content.set("fields/assignedTunnelId/stringValue", assignedTunnelId); // ✅ NEW
   content.set("fields/rfid/stringValue", currentRFID);
   content.set("fields/mode/stringValue", modeStr);
   content.set("fields/moving/stringValue", robotMovingStatus);
@@ -296,6 +381,7 @@ void setup() {
   config.api_key = API_KEY;
   config.token_status_callback = tokenStatusCallback;
 
+  // ✅ Anonymous Auth (must be enabled in Firebase Console)
   if (Firebase.signUp(&config, &auth, "", "")) {
     Serial.println("Firebase Auth Ready");
   } else {
@@ -361,12 +447,25 @@ void setup() {
 
   stopMotors();
 
+  // ✅ Load assigned tunnel once on boot
+  fetchAssignedTunnelId();
+  lastTunnelFetchMs = millis();
+
   pushDataToFirebase();
   logScanEvent("BOOT", "Robot booted and connected to WiFi/Firebase");
 }
 
 // ================= LOOP =================
 void loop() {
+
+  // ✅ periodically refresh tunnel assignment (does not change robot behavior)
+  if (Firebase.ready()) {
+    unsigned long nowMs = millis();
+    if (nowMs - lastTunnelFetchMs > TUNNEL_REFRESH_MS) {
+      fetchAssignedTunnelId();
+      lastTunnelFetchMs = nowMs;
+    }
+  }
 
   // --------- MODE: LINE FOLLOW ---------
   if (mode == LINE_FOLLOW) {

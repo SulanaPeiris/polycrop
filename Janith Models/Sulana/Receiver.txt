@@ -11,19 +11,23 @@
 
 #include <Firebase_ESP_Client.h>
 #include "addons/TokenHelper.h"
-#include "addons/RTDBHelper.h"   // optional, ok to keep
+#include "addons/RTDBHelper.h"
 
 // ================= WIFI =================
 #define WIFI_SSID "Janith"
 #define WIFI_PASSWORD "11223344"
 
 // ================= FIREBASE =================
-#define API_KEY "AIzaSyCw9ojsjWlbr-YvVH1_BkOjyy1xOedro88"
-#define DATABASE_URL "https://rfid-robot-ff91d-default-rtdb.firebaseio.com" // not used for Firestore
-#define FIREBASE_PROJECT_ID "rfid-robot-ff91d"
+#define API_KEY "AIzaSyA7mJ-uud7w7DDM94LGA4z-G8HJa2Q2qFA"
+#define DATABASE_URL "https://rfid-robot-ff91d-default-rtdb.firebaseio.com" // not used
+#define FIREBASE_PROJECT_ID "polycrop"
 
-#define ROBOT_ID "ROBOT_01"
-#define LORA_COLLECTION "loraReadings"
+// ✅ LoRa gateway (receiver) id
+#define GATEWAY_ID "LORA_RX_01"
+
+// collections
+#define GATEWAYS_COLLECTION "loraGateways"
+#define READINGS_SUBCOLLECTION "loraReadings"
 
 // ================= FIREBASE OBJECTS =================
 FirebaseData fbdo;
@@ -48,16 +52,21 @@ Adafruit_SH1107 display(128, 128, &Wire);
 unsigned long lastStoreMs = 0;
 const unsigned long STORE_INTERVAL_MS = 5000;
 
-// Waiting screen logic
 unsigned long lastPacketMs = 0;
-const unsigned long WAITING_TIMEOUT_MS = 3000; // no packet for 3s => show waiting
+const unsigned long WAITING_TIMEOUT_MS = 3000;
 bool showingWaiting = false;
+
+// ✅ assigned tunnel fetched from Firestore
+String assignedTunnelId = "";
+unsigned long lastAssignFetchMs = 0;
+const unsigned long ASSIGN_REFRESH_MS = 30000;
 
 // ================= LATEST VALUES =================
 bool haveData = false;
 String lastCounter = "0";
 float lastT1 = NAN, lastH1 = NAN, lastT2 = NAN, lastH2 = NAN;
 int lastRSSI = 0;
+float lastSNR = NAN;
 
 // ================= OLED HELPERS =================
 bool oledBegin() {
@@ -103,7 +112,8 @@ void showWaitingScreen() {
   display.println(Firebase.ready() ? "Ready" : "Not ready");
 
   display.setCursor(0, 70);
-  display.println("Receiver: Ready");
+  display.print("Tunnel: ");
+  display.println(assignedTunnelId.length() ? assignedTunnelId : "NOT SET");
 
   display.setCursor(0, 90);
   display.println("Freq: 433MHz");
@@ -112,24 +122,36 @@ void showWaitingScreen() {
   showingWaiting = true;
 }
 
-void drawData(float t1, float h1, float t2, float h2, int rssi) {
+void drawData(float t1, float h1, float t2, float h2, int rssi, float snr) {
   display.clearDisplay();
   display.setTextColor(SH110X_WHITE);
 
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.println("LoRa RX + Firestore");
+  display.println("LoRa Receiver");
 
-  display.setCursor(0, 18);
-  display.print("S1 T: "); display.print(t1, 1); display.println(" C");
-  display.print("S1 H: "); display.print(h1, 1); display.println(" %");
+  display.setCursor(0, 16);
+  display.print("Tunnel: ");
+  display.println(assignedTunnelId.length() ? assignedTunnelId : "NOT SET");
 
-  display.setCursor(0, 58);
-  display.print("S2 T: "); display.print(t2, 1); display.println(" C");
-  display.print("S2 H: "); display.print(h2, 1); display.println(" %");
+  display.setCursor(0, 34);
+  display.print("T1: "); display.print(t1, 1); display.print("C  ");
+  display.print("H1: "); display.print(h1, 1); display.println("%");
 
-  display.setCursor(0, 110);
-  display.print("RSSI: "); display.print(rssi); display.print(" dBm");
+  display.setCursor(0, 48);
+  display.print("T2: "); display.print(t2, 1); display.print("C  ");
+  display.print("H2: "); display.print(h2, 1); display.println("%");
+
+  float avgT = (t1 + t2) / 2.0;
+  float avgH = (h1 + h2) / 2.0;
+
+  display.setCursor(0, 66);
+  display.print("AvgT: "); display.print(avgT, 1); display.print("C  ");
+  display.print("AvgH: "); display.print(avgH, 1); display.println("%");
+
+  display.setCursor(0, 84);
+  display.print("RSSI: "); display.print(rssi);
+  display.print("  SNR: "); display.println(snr, 1);
 
   display.display();
   showingWaiting = false;
@@ -145,55 +167,44 @@ bool initTime() {
     now = time(nullptr);
     retry++;
   }
-  return (now >= 1700000000);
+  return now >= 1700000000;
 }
 
 String nowRFC3339Z() {
   time_t now = time(nullptr);
   if (now < 1700000000) return "1970-01-01T00:00:00Z";
+
   struct tm tm_utc;
   gmtime_r(&now, &tm_utc);
+
   char buf[25];
   strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
   return String(buf);
 }
 
 // ================= WIFI =================
-bool connectWiFiWithOLED() {
+void connectWiFiWithOLED() {
   oledStatus("WiFi: Connecting...", WIFI_SSID);
-
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   unsigned long start = millis();
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(250);
-    // timeout after 20s (still continue trying, but show message)
-    if (millis() - start > 20000) {
-      oledStatus("WiFi: Still trying...", "Check password/router");
-      start = millis();
-    }
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    delay(300);
   }
-
-  WiFi.setSleep(false);
-
-  String ip = WiFi.localIP().toString();
-  oledStatus("WiFi: Connected", "IP: " + ip);
-  delay(800);
-  return true;
+  oledStatus(String("WiFi: ") + (WiFi.status() == WL_CONNECTED ? "Connected" : "FAILED"));
+  delay(700);
 }
 
-// ================= FIREBASE =================
+// ================= FIREBASE INIT =================
 bool initFirebaseWithOLED() {
-  oledStatus("Firebase: Auth...", "Anonymous SignUp");
-
+  oledStatus("Firebase: Init...");
   config.api_key = API_KEY;
   config.token_status_callback = tokenStatusCallback;
 
-  bool ok = Firebase.signUp(&config, &auth, "", "");
-  if (!ok) {
-    oledStatus("Firebase: SignUp FAIL", String(config.signer.signupError.message.c_str()));
-    delay(2000);
-    return false;
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    Serial.println("Firebase Auth Ready (anonymous)");
+  } else {
+    Serial.print("Signup error: ");
+    Serial.println(config.signer.signupError.message.c_str());
   }
 
   fbdo.setBSSLBufferSize(4096, 1024);
@@ -202,14 +213,13 @@ bool initFirebaseWithOLED() {
   Firebase.begin(&config, &auth);
   Firebase.reconnectWiFi(true);
 
-  // wait a moment for token
   unsigned long start = millis();
   while (!Firebase.ready() && millis() - start < 8000) {
     delay(200);
   }
 
   oledStatus("Firebase: " + String(Firebase.ready() ? "Ready" : "Not ready"));
-  delay(800);
+  delay(700);
   return Firebase.ready();
 }
 
@@ -225,13 +235,12 @@ bool initLoRaWithOLED() {
     return false;
   }
 
-  // Must match TX
   LoRa.setSpreadingFactor(7);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(5);
 
   oledStatus("LoRa: Receiver Ready");
-  delay(800);
+  delay(700);
   return true;
 }
 
@@ -254,35 +263,108 @@ bool parseCSV5(const String &s, String &counterStr, float &t1, float &h1, float 
 
 String makeDocId() {
   uint32_t r = (uint32_t)esp_random();
-  return String(ROBOT_ID) + "_" + String(millis()) + "_" + String(r, HEX);
+  return String(GATEWAY_ID) + "_" + String(millis()) + "_" + String(r, HEX);
+}
+
+// ================= FETCH ASSIGNED TUNNEL =================
+void fetchAssignedTunnelId() {
+  if (!Firebase.ready()) return;
+
+  String path = String(GATEWAYS_COLLECTION) + "/" + String(GATEWAY_ID);
+
+  if (!Firebase.Firestore.getDocument(&fbdo, FIREBASE_PROJECT_ID, "", path.c_str())) {
+    return;
+  }
+
+  FirebaseJson json;
+  json.setJsonData(fbdo.payload().c_str());
+
+  FirebaseJsonData data;
+  json.get(data, "fields/assignedTunnelId/stringValue");
+  if (data.success) {
+    assignedTunnelId = data.to<String>();
+  }
+}
+
+// ================= UPDATE GATEWAY DOC =================
+void updateGatewayDoc() {
+  if (!Firebase.ready()) return;
+
+  String path = String(GATEWAYS_COLLECTION) + "/" + String(GATEWAY_ID);
+
+  FirebaseJson content;
+  content.set("fields/gatewayId/stringValue", String(GATEWAY_ID));
+  content.set("fields/assignedTunnelId/stringValue", assignedTunnelId);
+  content.set("fields/lastSeenAt/timestampValue", nowRFC3339Z());
+  content.set("fields/lastRssi/integerValue", (int)lastRSSI);
+  content.set("fields/lastSnr/doubleValue", isnan(lastSNR) ? 0.0 : lastSNR);
+
+  String mask = "gatewayId,assignedTunnelId,lastSeenAt,lastRssi,lastSnr";
+
+  Firebase.Firestore.patchDocument(&fbdo, FIREBASE_PROJECT_ID, "", path.c_str(), content.raw(), mask.c_str());
 }
 
 // ================= FIRESTORE WRITE =================
 bool storeToFirestore() {
   if (!Firebase.ready()) return false;
+  if (assignedTunnelId.length() == 0) return false;
 
-  String documentPath = String(LORA_COLLECTION) + "/" + makeDocId();
+  String readingPath = String("tunnels/") + assignedTunnelId + "/" + String(READINGS_SUBCOLLECTION) + "/" + makeDocId();
+  String summaryPath = String("tunnels/") + assignedTunnelId + "/sensorSummary/latest";
 
-  FirebaseJson content;
-  content.set("fields/robotId/stringValue", String(ROBOT_ID));
-  content.set("fields/counter/stringValue", lastCounter);
+  float avgT = (lastT1 + lastT2) / 2.0;
+  float avgH = (lastH1 + lastH2) / 2.0;
 
-  content.set("fields/s1_temp/doubleValue", lastT1);
-  content.set("fields/s1_hum/doubleValue", lastH1);
-  content.set("fields/s2_temp/doubleValue", lastT2);
-  content.set("fields/s2_hum/doubleValue", lastH2);
+  // 1) Create reading doc
+  FirebaseJson reading;
+  reading.set("fields/gatewayId/stringValue", String(GATEWAY_ID));
+  reading.set("fields/counter/stringValue", lastCounter);
 
-  content.set("fields/rssi/integerValue", String(lastRSSI));
-  content.set("fields/ts/timestampValue", nowRFC3339Z());
+  reading.set("fields/s1_temp/doubleValue", lastT1);
+  reading.set("fields/s1_hum/doubleValue", lastH1);
+  reading.set("fields/s2_temp/doubleValue", lastT2);
+  reading.set("fields/s2_hum/doubleValue", lastH2);
 
-  bool ok = Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "",
-                                             documentPath.c_str(), content.raw());
+  reading.set("fields/avg_temp/doubleValue", avgT);
+  reading.set("fields/avg_hum/doubleValue", avgH);
 
-  if (!ok) {
-    Serial.print("Firestore FAILED: ");
+  reading.set("fields/rssi/integerValue", (int)lastRSSI);
+  reading.set("fields/snr/doubleValue", isnan(lastSNR) ? 0.0 : lastSNR);
+  reading.set("fields/ts/timestampValue", nowRFC3339Z());
+
+  bool ok1 = Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", readingPath.c_str(), reading.raw());
+  if (!ok1) {
+    Serial.print("Reading create FAILED: ");
     Serial.println(fbdo.errorReason());
   }
-  return ok;
+
+  // 2) Patch summary/latest (fast UI)
+  FirebaseJson summary;
+  summary.set("fields/gatewayId/stringValue", String(GATEWAY_ID));
+  summary.set("fields/counter/stringValue", lastCounter);
+
+  summary.set("fields/s1_temp/doubleValue", lastT1);
+  summary.set("fields/s2_temp/doubleValue", lastT2);
+  summary.set("fields/avg_temp/doubleValue", avgT);
+
+  summary.set("fields/s1_hum/doubleValue", lastH1);
+  summary.set("fields/s2_hum/doubleValue", lastH2);
+  summary.set("fields/avg_hum/doubleValue", avgH);
+
+  summary.set("fields/rssi/integerValue", (int)lastRSSI);
+  summary.set("fields/snr/doubleValue", isnan(lastSNR) ? 0.0 : lastSNR);
+  summary.set("fields/lastSeenAt/timestampValue", nowRFC3339Z());
+
+  String mask = "gatewayId,counter,s1_temp,s2_temp,avg_temp,s1_hum,s2_hum,avg_hum,rssi,snr,lastSeenAt";
+
+  bool ok2 = Firebase.Firestore.patchDocument(&fbdo, FIREBASE_PROJECT_ID, "", summaryPath.c_str(), summary.raw(), mask.c_str());
+  if (!ok2) {
+    Serial.print("Summary patch FAILED: ");
+    Serial.println(fbdo.errorReason());
+  }
+
+  updateGatewayDoc();
+  return ok1 && ok2;
 }
 
 // ================= SETUP =================
@@ -298,24 +380,22 @@ void setup() {
   oledStatus("Booting...");
   delay(500);
 
-  // WiFi
   connectWiFiWithOLED();
 
-  // Time (TLS)
   oledStatus("Time: Syncing (NTP)...");
   bool timeOk = initTime();
   oledStatus(String("Time: ") + (timeOk ? "OK" : "FAILED"));
-  delay(800);
+  delay(700);
 
-  // Firebase
   initFirebaseWithOLED();
 
-  // LoRa receiver init
   if (!initLoRaWithOLED()) {
     while (1) delay(10);
   }
 
-  // Show waiting screen
+  fetchAssignedTunnelId();
+  lastAssignFetchMs = millis();
+
   lastPacketMs = millis();
   showWaitingScreen();
 
@@ -326,18 +406,19 @@ void setup() {
 void loop() {
   Firebase.ready(); // keep token alive
 
-  // ---- Receive packet ----
+  // refresh assigned tunnel
+  if (Firebase.ready() && (millis() - lastAssignFetchMs > ASSIGN_REFRESH_MS)) {
+    fetchAssignedTunnelId();
+    lastAssignFetchMs = millis();
+  }
+
   int packetSize = LoRa.parsePacket();
   if (packetSize) {
     String incoming = "";
     while (LoRa.available()) incoming += (char)LoRa.read();
 
     int rssi = LoRa.packetRssi();
-
-    Serial.print("Received: ");
-    Serial.print(incoming);
-    Serial.print(" | RSSI: ");
-    Serial.println(rssi);
+    float snr = LoRa.packetSnr(); // ✅ connectivity info
 
     String counterStr;
     float t1, h1, t2, h2;
@@ -349,18 +430,17 @@ void loop() {
       lastT1 = t1; lastH1 = h1;
       lastT2 = t2; lastH2 = h2;
       lastRSSI = rssi;
+      lastSNR = snr;
       haveData = true;
 
-      drawData(t1, h1, t2, h2, rssi);
+      drawData(t1, h1, t2, h2, rssi, snr);
     }
   }
 
-  // ---- If no packet for a while, show waiting ----
   if ((millis() - lastPacketMs) > WAITING_TIMEOUT_MS) {
     if (!showingWaiting) showWaitingScreen();
   }
 
-  // ---- Store every 5 seconds ----
   if (haveData && (millis() - lastStoreMs >= STORE_INTERVAL_MS)) {
     lastStoreMs = millis();
 
@@ -369,8 +449,7 @@ void loop() {
       connectWiFiWithOLED();
       oledStatus("Time: Syncing (NTP)...");
       initTime();
-      oledStatus("Time: OK");
-      delay(300);
+      fetchAssignedTunnelId();
       showWaitingScreen();
     }
 
