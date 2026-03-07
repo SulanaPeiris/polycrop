@@ -1,14 +1,119 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Dimensions } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useTunnelHeader } from "../../hooks/useTunnelHeader";
 import SectionTitle from "../components/SectionTitle";
 import { LinearGradient } from "expo-linear-gradient";
+import { collection, documentId, limit, onSnapshot, orderBy, query } from "firebase/firestore";
+import { db } from "../../firebase/firebase";
 
 const { width } = Dimensions.get("window");
 
+type NpkReading = {
+  n: number | null;
+  p: number | null;
+  k: number | null;
+  ts: string;
+};
+
+type ExecutionLog = {
+  id: string;
+  date: string;
+  n: number | null;
+  p: number | null;
+  k: number | null;
+};
+
+function formatReadingTs(ts: any): string {
+  if (!ts) return "";
+  if (typeof ts?.toDate === "function") return ts.toDate().toLocaleString();
+  if (typeof ts === "number") return new Date(ts).toLocaleString();
+  if (typeof ts === "string") return ts;
+  return "";
+}
+
+function parseLogDateFromId(id: string): string {
+  const m = /^log_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/.exec(id);
+  if (!m) return id;
+
+  const [, y, mo, d, h, mi, s] = m;
+  const dt = new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s));
+  return dt.toLocaleString();
+}
+
 export default function SchedulesScreen() {
   useTunnelHeader("Schedules & Logs");
+  const [currentNpk, setCurrentNpk] = useState<NpkReading>({ n: null, p: null, k: null, ts: "" });
+  const [executionLogs, setExecutionLogs] = useState<ExecutionLog[]>([]);
+
+  useEffect(() => {
+    const latestNpkQuery = query(
+      collection(db, "devices", "npk-esp32-01", "readings"),
+      orderBy(documentId(), "desc"),
+      limit(1)
+    );
+
+    return onSnapshot(
+      latestNpkQuery,
+      (snap) => {
+        const first = snap.docs[0];
+        if (!first) {
+          setCurrentNpk({ n: null, p: null, k: null, ts: "" });
+          return;
+        }
+
+        const data = first.data() as any;
+        const n = Number(data?.n);
+        const p = Number(data?.p);
+        const k = Number(data?.k);
+
+        setCurrentNpk({
+          n: Number.isFinite(n) ? n : null,
+          p: Number.isFinite(p) ? p : null,
+          k: Number.isFinite(k) ? k : null,
+          ts: formatReadingTs(data?.ts),
+        });
+      },
+      (err) => {
+        console.log("npk readings listener error:", err);
+        setCurrentNpk({ n: null, p: null, k: null, ts: "" });
+      }
+    );
+  }, []);
+
+  useEffect(() => {
+    const logsQuery = query(
+      collection(db, "dispenseLogs"),
+      orderBy(documentId(), "desc"),
+      limit(10)
+    );
+
+    return onSnapshot(
+      logsQuery,
+      (snap) => {
+        const logs = snap.docs.map((d) => {
+          const data = d.data() as any;
+          const n = Number(data?.inputMl1);
+          const p = Number(data?.inputMl2);
+          const k = Number(data?.inputMl3User);
+
+          return {
+            id: d.id,
+            date: formatReadingTs(data?.ts) || parseLogDateFromId(d.id),
+            n: Number.isFinite(n) ? n : null,
+            p: Number.isFinite(p) ? p : null,
+            k: Number.isFinite(k) ? k : null,
+          } satisfies ExecutionLog;
+        });
+
+        setExecutionLogs(logs);
+      },
+      (err) => {
+        console.log("dispenseLogs listener error:", err);
+        setExecutionLogs([]);
+      }
+    );
+  }, []);
 
   return (
     <ScrollView contentContainerStyle={styles.container}>
@@ -51,44 +156,75 @@ export default function SchedulesScreen() {
         </View>
       </LinearGradient>
 
+      {/* Current NPK Levels */}
+      <View style={styles.currentNpkCard}>
+        <View style={styles.currentNpkHeader}>
+          <View style={styles.currentNpkIcon}>
+            <Ionicons name="flask-outline" size={18} color="#2E7D32" />
+          </View>
+          <Text style={styles.currentNpkTitle}>Current NPK Levels</Text>
+        </View>
+
+        <View style={styles.currentNpkRow}>
+          <View style={styles.currentNpkItem}>
+            <View style={styles.currentNpkCircle}>
+              <Text style={styles.currentNpkValue}>{currentNpk.n ?? "—"}</Text>
+            </View>
+            <Text style={styles.currentNpkLabel}>N</Text>
+          </View>
+
+          <View style={styles.currentNpkItem}>
+            <View style={styles.currentNpkCircle}>
+              <Text style={styles.currentNpkValue}>{currentNpk.p ?? "—"}</Text>
+            </View>
+            <Text style={styles.currentNpkLabel}>P</Text>
+          </View>
+
+          <View style={styles.currentNpkItem}>
+            <View style={styles.currentNpkCircle}>
+              <Text style={styles.currentNpkValue}>{currentNpk.k ?? "—"}</Text>
+            </View>
+            <Text style={styles.currentNpkLabel}>K</Text>
+          </View>
+        </View>
+
+        {!!currentNpk.ts && <Text style={styles.currentNpkTs}>Updated: {currentNpk.ts}</Text>}
+      </View>
+
       {/* 2. Executed History Logs - Clean List */}
       <View style={styles.historySection}>
         <SectionTitle title="Execution History" />
         <View style={styles.logContainer}>
-          {[
-            { id: 1, date: "Today, 10:00 AM", stage: "Stage 2: Vegetative", n: 7, p: 5, k: 5, status: "Completed" },
-            { id: 2, date: "Yesterday, 04:00 PM", stage: "Stage 2: Vegetative", n: 7, p: 5, k: 5, status: "Completed" },
-            { id: 3, date: "Oct 24, 04:00 PM", stage: "Stage 1: Early Growth", n: 6, p: 4, k: 4, status: "Completed" },
-            { id: 4, date: "Oct 23, 04:00 PM", stage: "Stage 1: Early Growth", n: 6, p: 4, k: 4, status: "Skipped" },
-          ].map((log) => (
+          {executionLogs.map((log) => (
             <View key={log.id} style={styles.logItem}>
               <View style={styles.logMain}>
-                <View style={[styles.logIcon, { backgroundColor: log.status === 'Skipped' ? '#FFEBEE' : '#E8F5E9' }]}>
+                <View style={[styles.logIcon, { backgroundColor: '#E8F5E9' }]}>
                   <Ionicons
-                    name={log.status === 'Skipped' ? "close" : "checkmark"}
+                    name={"checkmark"}
                     size={18}
-                    color={log.status === 'Skipped' ? "#D32F2F" : "#2E7D32"}
+                    color={"#2E7D32"}
                   />
                 </View>
                 <View>
                   <Text style={styles.logDate}>{log.date}</Text>
-                  <Text style={styles.logStage}>{log.stage}</Text>
+                  <Text style={styles.logStage}>Dispense Log</Text>
                 </View>
               </View>
 
               <View style={{ alignItems: 'flex-end', gap: 6 }}>
                 <View style={styles.miniNpkRow}>
-                  <View style={styles.miniCircle}><Text style={styles.miniVal}>{log.n}</Text><Text style={styles.miniLabel}>N</Text></View>
-                  <View style={styles.miniCircle}><Text style={styles.miniVal}>{log.p}</Text><Text style={styles.miniLabel}>P</Text></View>
-                  <View style={styles.miniCircle}><Text style={styles.miniVal}>{log.k}</Text><Text style={styles.miniLabel}>K</Text></View>
+                  <View style={styles.miniCircle}><Text style={styles.miniVal}>{log.n ?? "—"}</Text><Text style={styles.miniLabel}>N</Text></View>
+                  <View style={styles.miniCircle}><Text style={styles.miniVal}>{log.p ?? "—"}</Text><Text style={styles.miniLabel}>P</Text></View>
+                  <View style={styles.miniCircle}><Text style={styles.miniVal}>{log.k ?? "—"}</Text><Text style={styles.miniLabel}>K</Text></View>
                 </View>
-                <Text style={[styles.logStatus, { color: log.status === 'Skipped' ? "#D32F2F" : "#9E9E9E" }]}>
-                  {log.status}
+                <Text style={[styles.logStatus, { color: "#9E9E9E" }]}>
+                  Completed
                 </Text>
               </View>
             </View>
           ))}
         </View>
+        {executionLogs.length === 0 && <Text style={styles.emptyHistoryText}>No dispense logs found.</Text>}
         <TouchableOpacity style={styles.viewAllBtn}>
           <Text style={styles.viewAllText}>View All History</Text>
         </TouchableOpacity>
@@ -122,6 +258,47 @@ const styles = StyleSheet.create({
   metaItem: { flexDirection: "row", alignItems: "center", gap: 6 },
   metaText: { color: "#757575", fontWeight: "600", fontSize: 13 },
 
+  currentNpkCard: {
+    backgroundColor: "#fff",
+    borderRadius: 20,
+    padding: 18,
+    marginBottom: 24,
+    elevation: 1,
+    shadowColor: "#000",
+    shadowOpacity: 0.03,
+    shadowRadius: 5,
+  },
+  currentNpkHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    marginBottom: 14,
+  },
+  currentNpkIcon: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: "#E8F5E9",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  currentNpkTitle: { fontSize: 15, fontWeight: "700", color: "#333" },
+  currentNpkRow: { flexDirection: "row", justifyContent: "space-around" },
+  currentNpkItem: { alignItems: "center", gap: 6 },
+  currentNpkCircle: {
+    width: 62,
+    height: 62,
+    borderRadius: 31,
+    backgroundColor: "#F1F8E9",
+    borderWidth: 1,
+    borderColor: "#A5D6A7",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  currentNpkValue: { fontSize: 20, fontWeight: "800", color: "#2E7D32" },
+  currentNpkLabel: { fontSize: 12, fontWeight: "700", color: "#4CAF50" },
+  currentNpkTs: { marginTop: 12, fontSize: 12, color: "#757575", textAlign: "center" },
+
   // History Section
   historySection: { flex: 1 },
   logContainer: { gap: 14 },
@@ -140,6 +317,8 @@ const styles = StyleSheet.create({
   miniLabel: { fontSize: 7, fontWeight: "700", color: "#4CAF50", lineHeight: 8 },
 
   logStatus: { fontSize: 11, fontWeight: "600" },
+
+  emptyHistoryText: { color: "#9E9E9E", fontSize: 13, textAlign: "center", marginTop: 6 },
 
   viewAllBtn: { alignItems: "center", paddingVertical: 20 },
   viewAllText: { color: "#757575", fontWeight: "600", fontSize: 13 }
