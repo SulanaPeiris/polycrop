@@ -1,9 +1,11 @@
-import React, { useState } from "react";
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Dimensions, Switch } from "react-native";
+import React, { useState, useEffect } from "react";
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Dimensions, Switch, TextInput, Alert } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useTunnelHeader } from "../../hooks/useTunnelHeader";
 import SectionTitle from "../components/SectionTitle";
 import { LinearGradient } from "expo-linear-gradient";
+import { setDoc, doc, onSnapshot } from "firebase/firestore";
+import { db } from "../../firebase/firebase";
 
 const { width } = Dimensions.get("window");
 
@@ -52,6 +54,60 @@ export default function FertigationScreen({ navigation }: any) {
   const [stage, setStage] = useState(2);
   const [npk, setNpk] = useState({ n: 7.0, p: 5.0, k: 5.0 });
   const [isFlowering, setIsFlowering] = useState(false);
+  
+  // Manual Dispense state
+  const [c1Value, setC1Value] = useState("");
+  const [c2Value, setC2Value] = useState("");
+  const [c3Value, setC3Value] = useState("");
+  const [isSending, setIsSending] = useState(false);
+
+  // Device status state
+  const [deviceStatus, setDeviceStatus] = useState<{
+    online: boolean;
+    busy: boolean;
+    state: string;
+    lastCommandId: string;
+  }>({
+    online: false,
+    busy: false,
+    state: "unknown",
+    lastCommandId: "",
+  });
+
+  // Listen to device status
+  useEffect(() => {
+    const statusRef = doc(db, "deviceStatus", "liquid-system-01");
+    return onSnapshot(
+      statusRef,
+      (snap) => {
+        if (snap.exists()) {
+          const data = snap.data();
+          setDeviceStatus({
+            online: data?.online ?? false,
+            busy: data?.busy ?? false,
+            state: data?.state ?? "unknown",
+            lastCommandId: data?.lastCommandId ?? "",
+          });
+        } else {
+          setDeviceStatus({
+            online: false,
+            busy: false,
+            state: "offline",
+            lastCommandId: "",
+          });
+        }
+      },
+      (err) => {
+        console.log("deviceStatus listener error:", err);
+        setDeviceStatus({
+          online: false,
+          busy: false,
+          state: "error",
+          lastCommandId: "",
+        });
+      }
+    );
+  }, []);
 
   // Mock Stage Metadata
   const stages = [
@@ -69,27 +125,161 @@ export default function FertigationScreen({ navigation }: any) {
     if (id === 4) setNpk({ n: 5.0, p: 5.0, k: 8.0 });
   };
 
+  const handleSendCommand = async () => {
+    // Trim and parse values
+    const c1 = c1Value.trim();
+    const c2 = c2Value.trim();
+    const c3 = c3Value.trim();
+
+    const parsedC1 = c1 === "" ? 0 : Number(c1);
+    const parsedC2 = c2 === "" ? 0 : Number(c2);
+    const parsedC3 = c3 === "" ? 0 : Number(c3);
+
+    // Validate numeric and positive
+    if (!Number.isFinite(parsedC1) || parsedC1 < 0 ||
+        !Number.isFinite(parsedC2) || parsedC2 < 0 ||
+        !Number.isFinite(parsedC3) || parsedC3 < 0) {
+      Alert.alert("Invalid Input", "Please enter valid positive numbers for all containers.");
+      return;
+    }
+
+    // Check if all values are 0
+    if (parsedC1 === 0 && parsedC2 === 0 && parsedC3 === 0) {
+      Alert.alert("Invalid Input", "At least one container value must be greater than 0.");
+      return;
+    }
+
+    setIsSending(true);
+
+    try {
+      const commandRef = doc(db, "deviceCommands", "liquid-system-01");
+      await setDoc(
+        commandRef,
+        {
+          commandId: `cmd_${Date.now()}`,
+          type: "dispense_all",
+          c1ml: parsedC1,
+          c2ml: parsedC2,
+          c3ml: parsedC3,
+          status: "PENDING",
+          requestedAt: new Date().toISOString(),
+          lastUpdatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+
+      Alert.alert("Success", "Dispense command sent");
+      setC1Value("");
+      setC2Value("");
+      setC3Value("");
+    } catch (error) {
+      console.error("Failed to send command:", error);
+      Alert.alert("Error", "Failed to send dispense command");
+    } finally {
+      setIsSending(false);
+    }
+  };
+
 
   return (
     <ScrollView contentContainerStyle={styles.container}>
 
-      {/* 1. AI Header */}
-      <LinearGradient
-        colors={['#43A047', '#2E7D32']}
-        style={styles.aiCard}
-        start={{ x: 0, y: 0 }}
-        end={{ x: 1, y: 1 }}
-      >
-        <View style={styles.aiHeader}>
-          <View style={styles.aiIconBox}>
-            <Ionicons name="sparkles" size={24} color="#C8E6C9" />
+          {/* Manual Dispense Section */}
+      <View style={styles.manualDispenseCard}>
+        <View style={styles.manualDispenseHeader}>
+          <View style={styles.manualDispenseIcon}>
+            <Ionicons name="flask" size={18} color="#2E7D32" />
           </View>
-          <View>
-            <Text style={styles.aiTitle}>AI Dosing Agent</Text>
-            <Text style={styles.aiSubtitle}>Optimizing nutrient mix for {stages[stage - 1].title}</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.manualDispenseTitle}>Manual Dispense</Text>
+            <Text style={styles.manualDispenseSubtitle}>Send dispense values to the device</Text>
           </View>
         </View>
-      </LinearGradient>
+
+        {/* Device Status Row */}
+        <View style={styles.statusRow}>
+          <View style={[styles.statusChip, deviceStatus.online ? styles.statusOnline : styles.statusOffline]}>
+            <View style={[styles.statusDot, { backgroundColor: deviceStatus.online ? "#4CAF50" : "#9E9E9E" }]} />
+            <Text style={styles.statusChipText}>{deviceStatus.online ? "Online" : "Offline"}</Text>
+          </View>
+
+          <View style={[styles.statusChip, deviceStatus.busy ? styles.statusBusy : styles.statusIdle]}>
+            <Ionicons 
+              name={deviceStatus.busy ? "hourglass-outline" : "checkmark-circle-outline"} 
+              size={12} 
+              color={deviceStatus.busy ? "#FF9800" : "#4CAF50"} 
+            />
+            <Text style={styles.statusChipText}>{deviceStatus.busy ? "Busy" : "Idle"}</Text>
+          </View>
+
+          <View style={styles.statusChip}>
+            <Text style={styles.statusStateText}>{deviceStatus.state}</Text>
+          </View>
+        </View>
+
+        <View style={styles.inputRow}>
+          <View style={styles.inputWrapper}>
+            <Text style={styles.inputLabel}>Nitrogen</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="C1 mL"
+              keyboardType="numeric"
+              value={c1Value}
+              onChangeText={setC1Value}
+              editable={!isSending}
+            />
+          </View>
+
+          <View style={styles.inputWrapper}>
+            <Text style={styles.inputLabel}>Phosphorus</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="C2 mL"
+              keyboardType="numeric"
+              value={c2Value}
+              onChangeText={setC2Value}
+              editable={!isSending}
+            />
+          </View>
+
+          <View style={styles.inputWrapper}>
+            <Text style={styles.inputLabel}>Potassium</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="C3 mL"
+              keyboardType="numeric"
+              value={c3Value}
+              onChangeText={setC3Value}
+              editable={!isSending}
+            />
+          </View>
+        </View>
+
+        <TouchableOpacity
+          style={[styles.sendButton, (isSending || deviceStatus.busy) && styles.sendButtonDisabled]}
+          onPress={handleSendCommand}
+          disabled={isSending || deviceStatus.busy}
+          activeOpacity={0.8}
+        >
+          <LinearGradient
+            colors={(isSending || deviceStatus.busy) ? ['#A5D6A7', '#A5D6A7'] : ['#2E7D32', '#1B5E20']}
+            start={{ x: 0, y: 0 }}
+            end={{ x: 1, y: 0 }}
+            style={styles.sendButtonGradient}
+          >
+            {isSending ? (
+              <Text style={styles.sendButtonText}>Sending...</Text>
+            ) : deviceStatus.busy ? (
+              <Text style={styles.sendButtonText}>Device Busy...</Text>
+            ) : (
+              <>
+                <Ionicons name="paper-plane" size={18} color="#fff" />
+                <Text style={styles.sendButtonText}>Send to Device</Text>
+              </>
+            )}
+          </LinearGradient>
+        </TouchableOpacity>
+      </View>
 
       {/* 2. Configure Mix Section (Inline) */}
       <SectionTitle title="Configure Mix" />
@@ -143,6 +333,8 @@ export default function FertigationScreen({ navigation }: any) {
         <Text style={styles.applyText}>Apply Configuration</Text>
       </TouchableOpacity>
 
+
+
       <View style={{ height: 40 }} />
     </ScrollView>
   );
@@ -187,7 +379,121 @@ const styles = StyleSheet.create({
   buttons: { flexDirection: "row", justifyContent: "flex-end", gap: 12 },
   adjBtn: { width: 36, height: 36, borderRadius: 18, backgroundColor: "#F1F3F4", alignItems: "center", justifyContent: "center" },
 
-  applyBtn: { backgroundColor: "#2E7D32", paddingVertical: 18, borderRadius: 16, alignItems: "center" },
+  applyBtn: { backgroundColor: "#2E7D32", paddingVertical: 18, borderRadius: 16, alignItems: "center", marginBottom: 16 },
   applyText: { color: "#fff", fontWeight: "800", fontSize: 16 },
+
+  // Manual Dispense Section
+  manualDispenseCard: {
+    backgroundColor: "#fff",
+    borderRadius: 20,
+    padding: 18,
+    marginBottom: 16,
+    elevation: 1,
+    shadowColor: "#000",
+    shadowOpacity: 0.03,
+    shadowRadius: 5,
+  },
+  manualDispenseHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    marginBottom: 16,
+  },
+  manualDispenseIcon: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: "#E8F5E9",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  manualDispenseTitle: { fontSize: 15, fontWeight: "700", color: "#333" },
+  manualDispenseSubtitle: { fontSize: 12, color: "#757575", marginTop: 2 },
+  statusRow: {
+    flexDirection: "row",
+    gap: 8,
+    marginBottom: 16,
+    flexWrap: "wrap",
+  },
+  statusChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 12,
+    backgroundColor: "#F5F5F5",
+  },
+  statusOnline: {
+    backgroundColor: "#E8F5E9",
+  },
+  statusOffline: {
+    backgroundColor: "#EEEEEE",
+  },
+  statusBusy: {
+    backgroundColor: "#FFF3E0",
+  },
+  statusIdle: {
+    backgroundColor: "#E8F5E9",
+  },
+  statusDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+  },
+  statusChipText: {
+    fontSize: 11,
+    fontWeight: "600",
+    color: "#555",
+  },
+  statusStateText: {
+    fontSize: 11,
+    fontWeight: "600",
+    color: "#757575",
+    textTransform: "capitalize",
+  },
+  inputRow: {
+    flexDirection: "row",
+    gap: 10,
+    marginBottom: 16,
+  },
+  inputWrapper: {
+    flex: 1,
+  },
+  inputLabel: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#757575",
+    marginBottom: 6,
+  },
+  input: {
+    backgroundColor: "#F5F5F5",
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 14,
+    color: "#333",
+    borderWidth: 1,
+    borderColor: "#E0E0E0",
+  },
+  sendButton: {
+    borderRadius: 12,
+    overflow: "hidden",
+  },
+  sendButtonDisabled: {
+    opacity: 0.6,
+  },
+  sendButtonGradient: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 14,
+    gap: 8,
+  },
+  sendButtonText: {
+    color: "#fff",
+    fontSize: 15,
+    fontWeight: "700",
+  },
 
 });
