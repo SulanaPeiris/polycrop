@@ -98,7 +98,7 @@ AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
 // ================= SERVO =================
 #define SERVO_PIN 27
 Servo nozzleServo;
-const int SERVO_ANGLE_A = 45;
+const int SERVO_ANGLE_A = 40;
 const int SERVO_ANGLE_B = 90;
 
 // ================= STEPPER SETTINGS =================
@@ -407,6 +407,7 @@ void moveForwardToClearMarker() {
 }
 
 void startStepperScanSequence() {
+  Serial.println(">>> ENTERED startStepperScanSequence()");
   movingForward = true;
   nextStop = STEPS_PER_STOP;
   stepperPauseActive = false;
@@ -415,6 +416,9 @@ void startStepperScanSequence() {
 
   stepper.setCurrentPosition(0);
   stepper.moveTo(nextStop);
+
+  Serial.print(">>> Stepper target set to: ");
+  Serial.println(nextStop);
 
   mode = STEPPER_SCAN;
   modeStr = "STEPPER_SCAN";
@@ -479,46 +483,51 @@ void runActuationSequence() {
   logScanEvent("PUMP2_OFF", currentPositionLabel + " pump2 OFF");
 
   // Servo
-// Servo
-actuatorStatus = "SERVO_MOVING";
-pushDataToFirebase();
-logScanEvent("SERVO_START", currentPositionLabel + " servo 45->90 wait2s ->45");
+  actuatorStatus = "SERVO_MOVING";
+  pushDataToFirebase();
+  logScanEvent("SERVO_START", currentPositionLabel + " servo 40deg 5s -> 90deg 5s");
 
-stopMotors();
-delay(100);
+  stopMotors();
+  delay(100);
 
-nozzleServo.attach(SERVO_PIN, 500, 2400);
-delay(100);
+  nozzleServo.attach(SERVO_PIN, 500, 2400);
+  delay(100);
 
-nozzleServo.write(SERVO_ANGLE_A);
-delay(500);
-nozzleServo.write(SERVO_ANGLE_B);
-delay(2000);
-nozzleServo.write(SERVO_ANGLE_A);
-delay(700);
+  nozzleServo.write(SERVO_ANGLE_A);   // 40 deg
+  delay(5000);
 
-nozzleServo.detach();
-delay(100);
+  nozzleServo.write(SERVO_ANGLE_B);   // 90 deg
+  delay(5000);
 
-actuatorStatus = "OFF";
-pushDataToFirebase();
-logScanEvent("SERVO_DONE", currentPositionLabel + " servo done");
+  nozzleServo.detach();
+  delay(100);
+
+  actuatorStatus = "OFF";
+  pushDataToFirebase();
+  logScanEvent("SERVO_DONE", currentPositionLabel + " servo sequence done");
 
   updatePlantDocAfterAll();
   logScanEvent("POSITION_DONE", currentPositionLabel + " complete");
 
   if (plantStopCount >= 3) {
-    Serial.println(">>> [FINISH] POSITION C COMPLETE. Robot stopped.");
-    enterFinishedMode();
-    return;
+    Serial.println(">>> Plant cycle complete. Resuming line follow for next plant...");
+    logScanEvent("PLANT_CYCLE_DONE", "A/B/C complete. Resuming line follow for next plant");
+
+    plantStopCount = 0;
+    currentPositionLabel = "NONE";
+    currentRFID = "NONE";
+    currentPlantDocId = "";
+    rfidDetected = false;
+    bothBlackLatched = false;
   }
 
-  // Resume line following for next position
+  // Resume line following
   robotMovingStatus = "MOVING";
   scanningStatus = "IDLE";
   actuatorStatus = "OFF";
   mode = LINE_FOLLOW;
   modeStr = "LINE_FOLLOW";
+  bothBlackLatched = false;
   pushDataToFirebase();
   logScanEvent("RESUME", "Resuming line follow after " + currentPositionLabel);
 
@@ -527,6 +536,7 @@ logScanEvent("SERVO_DONE", currentPositionLabel + " servo done");
 }
 
 void handleStepperScanMode() {
+  
   modeStr = "STEPPER_SCAN";
   stopMotors();
 
@@ -671,7 +681,7 @@ void setup() {
   pump2Off();
 
   // Servo
-nozzleServo.setPeriodHertz(50);
+  nozzleServo.setPeriodHertz(50);
 
   // Motor Enable Pins (only if actually controlled by ESP32)
   if (USE_GPIO_EN_PINS) {
@@ -709,6 +719,7 @@ nozzleServo.setPeriodHertz(50);
   // Stepper enable
   pinMode(EN_PIN, OUTPUT);
   digitalWrite(EN_PIN, LOW);
+  delay(100);
 
   stepper.setMaxSpeed(STEPPER_MAX_SPEED);
   stepper.setAcceleration(STEPPER_ACCEL);
@@ -761,6 +772,18 @@ void loop() {
 
     bool bothBlack = (leftIR == HIGH && rightIR == HIGH);
 
+    // Debug IR states
+    static unsigned long lastIrPrint = 0;
+    if (millis() - lastIrPrint > 500) {
+      Serial.print("IR Left: ");
+      Serial.print(leftIR);
+      Serial.print(" | IR Right: ");
+      Serial.print(rightIR);
+      Serial.print(" | bothBlack: ");
+      Serial.println(bothBlack ? "YES" : "NO");
+      lastIrPrint = millis();
+    }
+
     // ===== RFID DETECTION =====
     if (!rfidDetected) {
       if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
@@ -798,6 +821,7 @@ void loop() {
     // ===== POSITION DETECTION AFTER RFID =====
     if (rfidDetected) {
       if (bothBlack && !bothBlackLatched) {
+        Serial.println(">>> bothBlack edge detected after RFID. Stopping for position.");
         bothBlackLatched = true;
         handlePositionStop();
         return;
