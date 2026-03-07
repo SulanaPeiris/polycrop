@@ -1,0 +1,829 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <AccelStepper.h>
+
+// === FIREBASE ADDITION: LIBRARIES ===
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <time.h>  // required for TLS (NTP time)
+
+// SERVO
+#include <ESP32Servo.h>
+
+// Provide the token generation process info.
+#include "addons/TokenHelper.h"
+// Provide the RTDB payload printing info and other helper functions.
+#include "addons/RTDBHelper.h"
+
+// === FIREBASE ADDITION: CREDENTIALS ===
+#define WIFI_SSID "Janith"
+#define WIFI_PASSWORD "11223344"
+#define API_KEY "AIzaSyA7mJ-uud7w7DDM94LGA4z-G8HJa2Q2qFA"
+
+// ====== FIRESTORE ======
+#define FIREBASE_PROJECT_ID "polycrop"
+#define ROBOT_ID "ROBOT_01"
+
+// Collections
+#define ROBOTS_COLLECTION "robots"
+#define TUNNELS_COLLECTION "tunnels"
+#define RFIDMAP_SUBCOLLECTION "rfidMap"
+#define PLANTS_SUBCOLLECTION "plants"
+#define SCANS_SUBCOLLECTION  "scanEvents"
+
+// === FIREBASE OBJECTS ===
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// === STATE ===
+String currentRFID = "NONE";
+String robotMovingStatus = "MOVING";
+String scanningStatus = "IDLE";
+String actuatorStatus = "OFF"; // OFF | PUMP1_ON | PUMP2_ON | SERVO_MOVING
+String modeStr = "LINE_FOLLOW";
+String currentPositionLabel = "NONE";
+
+// tunnel assignment + resolved plant doc id
+String assignedTunnelId = "";
+String currentPlantDocId = "";
+unsigned long lastTunnelFetchMs = 0;
+const unsigned long TUNNEL_REFRESH_MS = 30000; // refresh assignment every 30s
+
+// ================= MOTOR + IR PINS =================
+// Left Motor Driver
+#define L_RPWM 25
+#define L_LPWM 26
+#define L_REN  27
+#define L_LEN  14
+
+// Right Motor Driver
+#define R_RPWM 33
+#define R_LPWM 32
+#define R_REN  15
+#define R_LEN  4
+
+// EN pins are wired to 5V, so ESP32 should NOT drive them
+const bool USE_GPIO_EN_PINS = false;
+
+// IR Sensors
+#define IR_LEFT  34
+#define IR_RIGHT 35
+
+// PWM Channels
+#define CH_L_RPWM 4
+#define CH_L_LPWM 5
+#define CH_R_RPWM 6
+#define CH_R_LPWM 7
+
+#define PWM_FREQ 1000
+#define PWM_RES 8
+#define SPEED 110
+
+// ================= RFID (RC522) =================
+#define SS_PIN  5
+#define RST_PIN 22
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+
+// ================= A4988 STEPPER =================
+#define STEP_PIN 16
+#define DIR_PIN  17
+#define EN_PIN   21
+AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
+
+// ================= L298N PUMPS (ON/OFF ONLY) =================
+#define PUMP1_CTRL 13
+#define PUMP2_CTRL 12
+
+// ================= SERVO =================
+#define SERVO_PIN 27
+Servo nozzleServo;
+const int SERVO_ANGLE_A = 45;
+const int SERVO_ANGLE_B = 90;
+
+// ================= STEPPER SETTINGS =================
+const int MOTOR_STEPS_PER_REV = 200;
+const int INCREMENT_ROUNDS = 10;
+const int TOTAL_MAX_ROUNDS = 50;
+
+const long STEPS_PER_STOP = INCREMENT_ROUNDS * MOTOR_STEPS_PER_REV; // 2000
+const long FINAL_TARGET = TOTAL_MAX_ROUNDS * MOTOR_STEPS_PER_REV;   // 10000
+
+const float STEPPER_MAX_SPEED = 2000;
+const float STEPPER_ACCEL     = 1500;
+
+// Incremental stepper state
+bool movingForward = true;
+long nextStop = 0;
+bool stepperPauseActive = false;
+unsigned long stepperPauseUntil = 0;
+const unsigned long STEPPER_STOP_PAUSE_MS = 2000;
+int stepperStopIndex = 0;
+
+// ================= RFID DEBOUNCE =================
+String lastRFID = "NONE";
+unsigned long lastRFIDTimeMs = 0;
+const unsigned long RFID_COOLDOWN_MS = 4000;
+
+// ================= POSITION TRACKING =================
+bool rfidDetected = false;       // after first RFID, next both-black = A
+int plantStopCount = 0;          // 0=none yet, 1=A done, 2=B done, 3=C done
+bool bothBlackLatched = false;   // detect new both-black edge only
+
+// ================= STATE MACHINE =================
+enum Mode {
+  LINE_FOLLOW,
+  STEPPER_SCAN,
+  ACTUATION,
+  FINISHED
+};
+Mode mode = LINE_FOLLOW;
+
+// ================= MOTOR FUNCTIONS =================
+void forward() {
+  ledcWrite(CH_L_RPWM, SPEED);
+  ledcWrite(CH_L_LPWM, 0);
+  ledcWrite(CH_R_RPWM, SPEED);
+  ledcWrite(CH_R_LPWM, 0);
+}
+
+void leftTurn() {
+  ledcWrite(CH_L_RPWM, 0);
+  ledcWrite(CH_L_LPWM, SPEED);
+  ledcWrite(CH_R_RPWM, SPEED);
+  ledcWrite(CH_R_LPWM, 0);
+}
+
+void rightTurn() {
+  ledcWrite(CH_L_RPWM, SPEED);
+  ledcWrite(CH_L_LPWM, 0);
+  ledcWrite(CH_R_RPWM, 0);
+  ledcWrite(CH_R_LPWM, SPEED);
+}
+
+void stopMotors() {
+  ledcWrite(CH_L_RPWM, 0);
+  ledcWrite(CH_L_LPWM, 0);
+  ledcWrite(CH_R_RPWM, 0);
+  ledcWrite(CH_R_LPWM, 0);
+}
+
+// ================= TIME SYNC (TLS) =================
+void initTime() {
+  configTime(19800, 0, "pool.ntp.org", "time.nist.gov"); // Sri Lanka UTC+5:30
+  Serial.print("Syncing time");
+  time_t now = time(nullptr);
+  int retry = 0;
+  while (now < 1700000000 && retry < 60) {
+    Serial.print(".");
+    delay(500);
+    now = time(nullptr);
+    retry++;
+  }
+  Serial.println();
+  if (now < 1700000000) Serial.println("Time sync failed. TLS may fail.");
+}
+
+String nowRFC3339Z() {
+  time_t now = time(nullptr);
+  if (now < 1700000000) return "1970-01-01T00:00:00Z";
+
+  struct tm tm_utc;
+  gmtime_r(&now, &tm_utc);
+
+  char buf[25];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+  return String(buf);
+}
+
+// ================= RFID =================
+String getRFIDTag() {
+  String tagID = "";
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    tagID += String(mfrc522.uid.uidByte[i] < 0x10 ? "0" : "");
+    tagID += String(mfrc522.uid.uidByte[i], HEX);
+  }
+  tagID.toUpperCase();
+  return tagID;
+}
+
+String makeEventDocId() {
+  uint32_t r = (uint32_t)esp_random();
+  return String(millis()) + "_" + String(r, HEX);
+}
+
+// ================= PUMPS (ON/OFF ONLY) =================
+void pump1On()  { digitalWrite(PUMP1_CTRL, HIGH); }
+void pump1Off() { digitalWrite(PUMP1_CTRL, LOW);  }
+
+void pump2On()  { digitalWrite(PUMP2_CTRL, HIGH); }
+void pump2Off() { digitalWrite(PUMP2_CTRL, LOW);  }
+
+// ------------------------- FIRESTORE HELPERS -------------------------
+void fetchAssignedTunnelId() {
+  if (!Firebase.ready()) return;
+
+  String path = String(ROBOTS_COLLECTION) + "/" + String(ROBOT_ID);
+
+  if (!Firebase.Firestore.getDocument(&fbdo, FIREBASE_PROJECT_ID, "", path.c_str())) {
+    Serial.print("fetchAssignedTunnelId getDocument FAILED: ");
+    Serial.println(fbdo.errorReason());
+    return;
+  }
+
+  FirebaseJson json;
+  json.setJsonData(fbdo.payload().c_str());
+
+  FirebaseJsonData data;
+  json.get(data, "fields/assignedTunnelId/stringValue");
+
+  if (data.success) {
+    String v = data.to<String>();
+    if (v != assignedTunnelId) {
+      assignedTunnelId = v;
+      Serial.print("Assigned tunnel updated: ");
+      Serial.println(assignedTunnelId);
+    }
+  }
+}
+
+// Reads: tunnels/{assignedTunnelId}/rfidMap/{RFID} -> fields/plantId/stringValue
+void resolvePlantDocIdFromRFID() {
+  currentPlantDocId = currentRFID; // fallback
+
+  if (!Firebase.ready()) return;
+  if (assignedTunnelId.length() == 0) return;
+  if (currentRFID == "NONE") return;
+
+  String mapPath = String(TUNNELS_COLLECTION) + "/" + assignedTunnelId + "/" +
+                   String(RFIDMAP_SUBCOLLECTION) + "/" + currentRFID;
+
+  if (!Firebase.Firestore.getDocument(&fbdo, FIREBASE_PROJECT_ID, "", mapPath.c_str())) {
+    return;
+  }
+
+  FirebaseJson json;
+  json.setJsonData(fbdo.payload().c_str());
+  FirebaseJsonData data;
+  json.get(data, "fields/plantId/stringValue");
+
+  if (data.success) {
+    currentPlantDocId = data.to<String>();
+  }
+}
+
+String buildScanEventPath(const String& eventId) {
+  if (assignedTunnelId.length() > 0) {
+    return String(TUNNELS_COLLECTION) + "/" + assignedTunnelId + "/" +
+           String(SCANS_SUBCOLLECTION) + "/" + eventId;
+  }
+  return String("scanEvents") + "/" + eventId;
+}
+
+String buildPlantPath() {
+  if (assignedTunnelId.length() > 0) {
+    return String(TUNNELS_COLLECTION) + "/" + assignedTunnelId + "/" +
+           String(PLANTS_SUBCOLLECTION) + "/" + currentPlantDocId;
+  }
+  return String("plants") + "/" + currentRFID;
+}
+
+// ------------------------- FIRESTORE WRITE FUNCTIONS -------------------------
+void updateRobotDoc() {
+  if (!Firebase.ready()) return;
+
+  String documentPath = String(ROBOTS_COLLECTION) + "/" + String(ROBOT_ID);
+
+  FirebaseJson content;
+  content.set("fields/robotId/stringValue", String(ROBOT_ID));
+  content.set("fields/assignedTunnelId/stringValue", assignedTunnelId);
+  content.set("fields/rfid/stringValue", currentRFID);
+  content.set("fields/currentPosition/stringValue", currentPositionLabel);
+  content.set("fields/moving/stringValue", robotMovingStatus);
+  content.set("fields/scanning/stringValue", scanningStatus);
+  content.set("fields/actuator/stringValue", actuatorStatus);
+  content.set("fields/mode/stringValue", modeStr);
+  content.set("fields/rssi/integerValue", (int)WiFi.RSSI());
+  content.set("fields/updatedAt/timestampValue", nowRFC3339Z());
+
+  String mask = "robotId,assignedTunnelId,rfid,currentPosition,moving,scanning,actuator,mode,rssi,updatedAt";
+
+  if (!Firebase.Firestore.patchDocument(&fbdo, FIREBASE_PROJECT_ID, "",
+                                        documentPath.c_str(), content.raw(), mask.c_str())) {
+    Serial.print("Robot doc update FAILED: ");
+    Serial.println(fbdo.errorReason());
+  }
+}
+
+void updatePlantDocOnRFID() {
+  if (!Firebase.ready()) return;
+  if (currentRFID == "NONE") return;
+
+  resolvePlantDocIdFromRFID();
+
+  String documentPath = buildPlantPath();
+
+  FirebaseJson content;
+  content.set("fields/rfid/stringValue", currentRFID);
+  content.set("fields/lastSeenRobotId/stringValue", String(ROBOT_ID));
+  content.set("fields/scanStatus/stringValue", "SCANNING");
+  content.set("fields/lastScanAt/timestampValue", nowRFC3339Z());
+  content.set("fields/diseaseDetected/booleanValue", false);
+  content.set("fields/imageUrl/stringValue", "");
+  content.set("fields/notes/stringValue", "");
+
+  String mask = "rfid,lastSeenRobotId,scanStatus,lastScanAt,diseaseDetected,imageUrl,notes";
+
+  if (!Firebase.Firestore.patchDocument(&fbdo, FIREBASE_PROJECT_ID, "",
+                                        documentPath.c_str(), content.raw(), mask.c_str())) {
+    Serial.print("Plant doc update on RFID FAILED: ");
+    Serial.println(fbdo.errorReason());
+  }
+}
+
+void updatePlantDocAfterAll() {
+  if (!Firebase.ready()) return;
+  if (currentRFID == "NONE") return;
+
+  String documentPath = buildPlantPath();
+
+  FirebaseJson content;
+  content.set("fields/scanStatus/stringValue", "DONE");
+  content.set("fields/lastActuationAt/timestampValue", nowRFC3339Z());
+
+  String mask = "scanStatus,lastActuationAt";
+
+  if (!Firebase.Firestore.patchDocument(&fbdo, FIREBASE_PROJECT_ID, "",
+                                        documentPath.c_str(), content.raw(), mask.c_str())) {
+    Serial.print("Plant doc final update FAILED: ");
+    Serial.println(fbdo.errorReason());
+  }
+}
+
+void logScanEvent(String eventType, String eventNote) {
+  if (!Firebase.ready()) return;
+
+  String eventId = makeEventDocId();
+  String documentPath = buildScanEventPath(eventId);
+
+  FirebaseJson content;
+  content.set("fields/eventType/stringValue", eventType);
+  content.set("fields/robotId/stringValue", String(ROBOT_ID));
+  content.set("fields/assignedTunnelId/stringValue", assignedTunnelId);
+  content.set("fields/rfid/stringValue", currentRFID);
+  content.set("fields/position/stringValue", currentPositionLabel);
+  content.set("fields/mode/stringValue", modeStr);
+  content.set("fields/moving/stringValue", robotMovingStatus);
+  content.set("fields/scanning/stringValue", scanningStatus);
+  content.set("fields/actuator/stringValue", actuatorStatus);
+  content.set("fields/rssi/integerValue", (int)WiFi.RSSI());
+  content.set("fields/note/stringValue", eventNote);
+  content.set("fields/ts/timestampValue", nowRFC3339Z());
+
+  if (!Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "",
+                                         documentPath.c_str(), content.raw())) {
+    Serial.print("Scan event log FAILED: ");
+    Serial.println(fbdo.errorReason());
+  }
+}
+
+void pushDataToFirebase() {
+  updateRobotDoc();
+}
+
+// ================= HELPER FUNCTIONS =================
+String getPositionLabelFromCount(int count) {
+  if (count == 1) return "A";
+  if (count == 2) return "B";
+  if (count == 3) return "C";
+  return "NONE";
+}
+
+void moveForwardToClearMarker() {
+  forward();
+  delay(500);   // move forward to leave the black marker
+  stopMotors();
+  delay(100);
+}
+
+void startStepperScanSequence() {
+  movingForward = true;
+  nextStop = STEPS_PER_STOP;
+  stepperPauseActive = false;
+  stepperPauseUntil = 0;
+  stepperStopIndex = 0;
+
+  stepper.setCurrentPosition(0);
+  stepper.moveTo(nextStop);
+
+  mode = STEPPER_SCAN;
+  modeStr = "STEPPER_SCAN";
+  scanningStatus = "SCANNING";
+  robotMovingStatus = "STOPPED";
+
+  Serial.println("Stepper scan started");
+  Serial.print("Position: ");
+  Serial.println(currentPositionLabel);
+  Serial.print("First target: ");
+  Serial.print(nextStop / MOTOR_STEPS_PER_REV);
+  Serial.println(" rounds");
+
+  pushDataToFirebase();
+  logScanEvent("STEPPER_SCAN_START", currentPositionLabel + " scan started");
+}
+
+void enterFinishedMode() {
+  mode = FINISHED;
+  modeStr = "FINISHED";
+  robotMovingStatus = "STOPPED";
+  scanningStatus = "DONE";
+  actuatorStatus = "OFF";
+  pushDataToFirebase();
+  logScanEvent("FINISHED", "Position C complete. Robot stopped permanently");
+  stopMotors();
+}
+
+void runActuationSequence() {
+  mode = ACTUATION;
+  modeStr = "ACTUATION";
+  scanningStatus = "DONE";
+  robotMovingStatus = "STOPPED";
+  pushDataToFirebase();
+
+  logScanEvent("STEPPER_SCAN_DONE", currentPositionLabel + " stepper returned to 0, starting actuation");
+
+  // Pump1: 5s
+  actuatorStatus = "PUMP1_ON";
+  pushDataToFirebase();
+  logScanEvent("PUMP1_ON", currentPositionLabel + " pump1 ON for 5s");
+
+  pump1On();
+  delay(5000);
+  pump1Off();
+
+  actuatorStatus = "OFF";
+  pushDataToFirebase();
+  logScanEvent("PUMP1_OFF", currentPositionLabel + " pump1 OFF");
+
+  // Pump2: 5s
+  actuatorStatus = "PUMP2_ON";
+  pushDataToFirebase();
+  logScanEvent("PUMP2_ON", currentPositionLabel + " pump2 ON for 5s");
+
+  pump2On();
+  delay(5000);
+  pump2Off();
+
+  actuatorStatus = "OFF";
+  pushDataToFirebase();
+  logScanEvent("PUMP2_OFF", currentPositionLabel + " pump2 OFF");
+
+  // Servo
+// Servo
+actuatorStatus = "SERVO_MOVING";
+pushDataToFirebase();
+logScanEvent("SERVO_START", currentPositionLabel + " servo 45->90 wait2s ->45");
+
+stopMotors();
+delay(100);
+
+nozzleServo.attach(SERVO_PIN, 500, 2400);
+delay(100);
+
+nozzleServo.write(SERVO_ANGLE_A);
+delay(500);
+nozzleServo.write(SERVO_ANGLE_B);
+delay(2000);
+nozzleServo.write(SERVO_ANGLE_A);
+delay(700);
+
+nozzleServo.detach();
+delay(100);
+
+actuatorStatus = "OFF";
+pushDataToFirebase();
+logScanEvent("SERVO_DONE", currentPositionLabel + " servo done");
+
+  updatePlantDocAfterAll();
+  logScanEvent("POSITION_DONE", currentPositionLabel + " complete");
+
+  if (plantStopCount >= 3) {
+    Serial.println(">>> [FINISH] POSITION C COMPLETE. Robot stopped.");
+    enterFinishedMode();
+    return;
+  }
+
+  // Resume line following for next position
+  robotMovingStatus = "MOVING";
+  scanningStatus = "IDLE";
+  actuatorStatus = "OFF";
+  mode = LINE_FOLLOW;
+  modeStr = "LINE_FOLLOW";
+  pushDataToFirebase();
+  logScanEvent("RESUME", "Resuming line follow after " + currentPositionLabel);
+
+  Serial.println(">>> Moving to next position...");
+  moveForwardToClearMarker();
+}
+
+void handleStepperScanMode() {
+  modeStr = "STEPPER_SCAN";
+  stopMotors();
+
+  if (!stepperPauseActive) {
+    stepper.run();
+
+    if (stepper.distanceToGo() == 0) {
+      stepperPauseActive = true;
+      stepperPauseUntil = millis() + STEPPER_STOP_PAUSE_MS;
+
+      stepperStopIndex++;
+
+      long rounds = stepper.currentPosition() / MOTOR_STEPS_PER_REV;
+      String stepTag = currentPositionLabel + String(stepperStopIndex) + " Done";
+
+      Serial.print("Stop reached at ");
+      Serial.print(rounds);
+      Serial.print(" rounds. Tag: ");
+      Serial.println(stepTag);
+
+      String note = stepTag + " - reached " + String(rounds) + " rounds, pause 2s";
+      logScanEvent("STEPPER_STOP", note);
+    }
+    return;
+  }
+
+  if (millis() < stepperPauseUntil) {
+    return;
+  }
+
+  stepperPauseActive = false;
+
+  if (movingForward) {
+    if (nextStop < FINAL_TARGET) {
+      nextStop += STEPS_PER_STOP;
+
+      Serial.print("Next forward target: ");
+      Serial.print(nextStop / MOTOR_STEPS_PER_REV);
+      Serial.println(" rounds");
+
+      String note = currentPositionLabel + " next forward target " +
+                    String(nextStop / MOTOR_STEPS_PER_REV) + " rounds";
+      logScanEvent("STEPPER_NEXT_FORWARD", note);
+
+      stepper.moveTo(nextStop);
+      return;
+    } else {
+      movingForward = false;
+      nextStop -= STEPS_PER_STOP;
+
+      Serial.println("50 rounds reached. Switching to CCW.");
+      logScanEvent("STEPPER_SWITCH_CCW", currentPositionLabel + " reached 50 rounds, switching to CCW");
+
+      stepper.moveTo(nextStop);
+      return;
+    }
+  } else {
+    if (nextStop > 0) {
+      nextStop -= STEPS_PER_STOP;
+
+      Serial.print("Next backward target: ");
+      Serial.print(nextStop / MOTOR_STEPS_PER_REV);
+      Serial.println(" rounds");
+
+      String note = currentPositionLabel + " next backward target " +
+                    String(nextStop / MOTOR_STEPS_PER_REV) + " rounds";
+      logScanEvent("STEPPER_NEXT_BACKWARD", note);
+
+      stepper.moveTo(nextStop);
+      return;
+    } else {
+      Serial.println("Stepper back at 0. Scan complete.");
+      logScanEvent("STEPPER_BACK_AT_ZERO", currentPositionLabel + " stepper returned to 0");
+
+      runActuationSequence();
+      return;
+    }
+  }
+}
+
+void handlePositionStop() {
+  plantStopCount++;
+  currentPositionLabel = getPositionLabelFromCount(plantStopCount);
+
+  stopMotors();
+  robotMovingStatus = "STOPPED";
+  scanningStatus = "WAITING";
+  modeStr = "LINE_FOLLOW";
+  pushDataToFirebase();
+
+  Serial.println(">>> [STOP] POSITION " + currentPositionLabel + " DETECTED");
+  Serial.println(">>> Waiting 5 seconds...");
+  logScanEvent("POSITION_DETECTED", "Position " + currentPositionLabel + " detected, waiting 5s");
+
+  delay(5000);
+
+  robotMovingStatus = "STOPPED";
+  scanningStatus = "SCANNING";
+  pushDataToFirebase();
+
+  startStepperScanSequence();
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+
+  // === WIFI ===
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println("\nConnected to WiFi!");
+  WiFi.setSleep(false);
+
+  // TLS time
+  initTime();
+
+  // === FIREBASE INIT ===
+  config.api_key = API_KEY;
+  config.token_status_callback = tokenStatusCallback;
+
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    Serial.println("Firebase Auth Ready");
+  } else {
+    Serial.print("Signup error: ");
+    Serial.println(config.signer.signupError.message.c_str());
+  }
+
+  fbdo.setBSSLBufferSize(4096, 1024);
+  fbdo.setResponseSize(4096);
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // Pumps control pins
+  pinMode(PUMP1_CTRL, OUTPUT);
+  pinMode(PUMP2_CTRL, OUTPUT);
+  pump1Off();
+  pump2Off();
+
+  // Servo
+nozzleServo.setPeriodHertz(50);
+
+  // Motor Enable Pins (only if actually controlled by ESP32)
+  if (USE_GPIO_EN_PINS) {
+    pinMode(L_REN, OUTPUT);
+    pinMode(L_LEN, OUTPUT);
+    pinMode(R_REN, OUTPUT);
+    pinMode(R_LEN, OUTPUT);
+
+    digitalWrite(L_REN, HIGH);
+    digitalWrite(L_LEN, HIGH);
+    digitalWrite(R_REN, HIGH);
+    digitalWrite(R_LEN, HIGH);
+  }
+
+  // PWM Setup
+  ledcSetup(CH_L_RPWM, PWM_FREQ, PWM_RES);
+  ledcSetup(CH_L_LPWM, PWM_FREQ, PWM_RES);
+  ledcSetup(CH_R_RPWM, PWM_FREQ, PWM_RES);
+  ledcSetup(CH_R_LPWM, PWM_FREQ, PWM_RES);
+
+  ledcAttachPin(L_RPWM, CH_L_RPWM);
+  ledcAttachPin(L_LPWM, CH_L_LPWM);
+  ledcAttachPin(R_RPWM, CH_R_RPWM);
+  ledcAttachPin(R_LPWM, CH_R_LPWM);
+
+  // IR Sensors
+  pinMode(IR_LEFT, INPUT);
+  pinMode(IR_RIGHT, INPUT);
+
+  // RFID
+  SPI.begin();
+  mfrc522.PCD_Init();
+  Serial.println("RFID Ready");
+
+  // Stepper enable
+  pinMode(EN_PIN, OUTPUT);
+  digitalWrite(EN_PIN, LOW);
+
+  stepper.setMaxSpeed(STEPPER_MAX_SPEED);
+  stepper.setAcceleration(STEPPER_ACCEL);
+  stepper.setCurrentPosition(0);
+
+  stopMotors();
+
+  // Load assigned tunnel once on boot
+  fetchAssignedTunnelId();
+  lastTunnelFetchMs = millis();
+
+  pushDataToFirebase();
+  logScanEvent("BOOT", "Robot booted and connected to WiFi/Firebase");
+
+  Serial.println(">>> SYSTEM READY");
+  Serial.println(">>> Robot starts with line following");
+  Serial.println(">>> After RFID detected, next both-black = A, then B, then C");
+}
+
+// ================= LOOP =================
+void loop() {
+  if (Firebase.ready()) {
+    unsigned long nowMs = millis();
+    if (nowMs - lastTunnelFetchMs > TUNNEL_REFRESH_MS) {
+      fetchAssignedTunnelId();
+      lastTunnelFetchMs = nowMs;
+    }
+  }
+
+  if (mode == FINISHED) {
+    stopMotors();
+    return;
+  }
+
+  if (mode == STEPPER_SCAN) {
+    handleStepperScanMode();
+    return;
+  }
+
+  if (mode == ACTUATION) {
+    return;
+  }
+
+  // --------- MODE: LINE FOLLOW ---------
+  if (mode == LINE_FOLLOW) {
+    modeStr = "LINE_FOLLOW";
+
+    int leftIR = digitalRead(IR_LEFT);
+    int rightIR = digitalRead(IR_RIGHT);
+
+    bool bothBlack = (leftIR == HIGH && rightIR == HIGH);
+
+    // ===== RFID DETECTION =====
+    if (!rfidDetected) {
+      if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+        String readRFID = getRFIDTag();
+        unsigned long nowMs = millis();
+
+        if ((nowMs - lastRFIDTimeMs) >= RFID_COOLDOWN_MS || readRFID != lastRFID) {
+          lastRFID = readRFID;
+          lastRFIDTimeMs = nowMs;
+
+          rfidDetected = true;
+          plantStopCount = 0;
+          currentPositionLabel = "RFID";
+          currentRFID = readRFID;
+          robotMovingStatus = "STOPPED";
+          scanningStatus = "RFID_DETECTED";
+          actuatorStatus = "OFF";
+
+          stopMotors();
+          pushDataToFirebase();
+          updatePlantDocOnRFID();
+          logScanEvent("RFID_DETECTED", "RFID detected. Next both-black will be position A");
+
+          Serial.println(">>> [RFID] TAG DETECTED");
+          Serial.println(">>> Next both-black will be POSITION A");
+
+          delay(1000);
+        }
+
+        mfrc522.PICC_HaltA();
+        mfrc522.PCD_StopCrypto1();
+      }
+    }
+
+    // ===== POSITION DETECTION AFTER RFID =====
+    if (rfidDetected) {
+      if (bothBlack && !bothBlackLatched) {
+        bothBlackLatched = true;
+        handlePositionStop();
+        return;
+      }
+
+      if (!bothBlack) {
+        bothBlackLatched = false;
+      }
+    }
+
+    // ===== NORMAL LINE FOLLOWING =====
+    if (leftIR == LOW && rightIR == HIGH) {
+      leftTurn();
+    }
+    else if (leftIR == HIGH && rightIR == LOW) {
+      rightTurn();
+    }
+    else {
+      forward();
+    }
+
+    robotMovingStatus = "MOVING";
+    scanningStatus = "IDLE";
+    actuatorStatus = "OFF";
+
+    delay(10);
+    return;
+  }
+}
