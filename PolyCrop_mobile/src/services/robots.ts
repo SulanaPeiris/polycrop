@@ -1,31 +1,43 @@
-import { doc, serverTimestamp, setDoc } from "firebase/firestore";
+import { doc, serverTimestamp, setDoc, updateDoc } from "firebase/firestore";
 import { db } from "../firebase/firebase";
 
 /**
- * Ensure robot doc exists and bind to tunnel so robot can fetch assignedTunnelId.
+ * Bind robot -> tunnel so robot can fetch assignedTunnelId.
+ * Also writes tunnel.robotId so the security rules allow robot to create scanEvents.
  */
 export async function bindRobotToTunnel(robotId: string, tunnelId: string) {
-  const robotRef = doc(db, "robots", robotId);
+  const rid = robotId.trim();
+  if (!rid) throw new Error("Robot ID is empty");
+
+  const robotRef = doc(db, "robots", rid);
+
+  // robot side assignment
   await setDoc(
     robotRef,
     {
-      robotId,
+      robotId: rid,
       assignedTunnelId: tunnelId,
       updatedAt: serverTimestamp(),
     },
     { merge: true }
   );
+
+  // tunnel side assignment (so /tunnels/{tunnelId}.robotId matches robotId)
+  await updateDoc(doc(db, "tunnels", tunnelId), {
+    robotId: rid,
+    updatedAt: serverTimestamp(),
+  });
 }
 
-/**
- * If you ever want to unbind robot from tunnel.
- */
 export async function unbindRobot(robotId: string) {
-  const robotRef = doc(db, "robots", robotId);
+  const rid = robotId.trim();
+  if (!rid) return;
+
+  const robotRef = doc(db, "robots", rid);
   await setDoc(
     robotRef,
     {
-      robotId,
+      robotId: rid,
       assignedTunnelId: null,
       updatedAt: serverTimestamp(),
     },

@@ -1,4 +1,4 @@
-import { addDoc, collection, doc, serverTimestamp, updateDoc } from "firebase/firestore";
+import { addDoc, collection, doc, serverTimestamp, setDoc, updateDoc } from "firebase/firestore";
 import { getDownloadURL, ref, uploadBytes } from "firebase/storage";
 import { auth, db, storage } from "../firebase/firebase";
 
@@ -15,43 +15,72 @@ function uriToBlob(uri: string): Promise<Blob> {
   });
 }
 
+/**
+ * Upload photo -> create /captures/{captureId} -> call backend -> backend updates outputs.
+ * Also mirrors capture under: /tunnels/{tunnelId}/plants/{plantId}/captures/{captureId} when tunnelId+plantId provided.
+ */
 export async function captureUploadAndProcess(params: {
-  photoUri: string; // already normalized (vertical correct)
+  photoUri: string;
+
   tunnelId?: string | null;
   plantId?: string | null;
-  position?: number | null;
-  step?: number | null;
+
+  robotId?: string | null;
+  requestId?: string | null;
+
+  rfid?: string | null;
+  side?: string | null; // "A" | "B"
+  positionLabel?: string | null; // A/B/C
+  stopIndex?: number | null;
+  rounds?: number | null;
+  direction?: string | null; // FWD/BWD
 }) {
   if (!INFER_URL) throw new Error("Missing EXPO_PUBLIC_INFER_URL in .env");
 
   const user = auth.currentUser;
   if (!user) throw new Error("Not logged in");
 
+  const tunnelId = params.tunnelId ?? null;
+  const plantId = params.plantId ?? null;
+
   // 1) Upload ORIGINAL image to Firebase Storage
   const blob = await uriToBlob(params.photoUri);
-  const storagePath = `users/${user.uid}/captures/${Date.now()}.jpg`;
+
+  const basePath =
+    tunnelId && plantId
+      ? `tunnels/${tunnelId}/plants/${plantId}/captures`
+      : `users/${user.uid}/captures`;
+
+  const fileKey = params.requestId ? params.requestId : String(Date.now());
+  const storagePath = `${basePath}/${fileKey}.jpg`;
+
   const storageRef = ref(storage, storagePath);
 
   await uploadBytes(storageRef, blob, { contentType: "image/jpeg" });
   const imageUrl = await getDownloadURL(storageRef);
 
-  // 2) Create Firestore doc FIRST (so scans page has a record immediately)
+  // 2) Create Firestore doc FIRST
   const capRef = await addDoc(collection(db, "captures"), {
     ownerId: user.uid,
     status: "UPLOADED",
     imageUrl,
     storagePath,
 
-    // backend will fill these
     annotatedUrl: null,
     annotatedStoragePath: null,
     outputs: null,
 
     meta: {
-      tunnelId: params.tunnelId ?? null,
-      plantId: params.plantId ?? null,
-      position: params.position ?? null,
-      step: params.step ?? null,
+      tunnelId,
+      plantId,
+      robotId: params.robotId ?? null,
+      requestId: params.requestId ?? null,
+      rfid: params.rfid ?? null,
+      side: params.side ?? null,
+      positionLabel: params.positionLabel ?? null,
+      stopIndex: params.stopIndex ?? null,
+      rounds: params.rounds ?? null,
+      direction: params.direction ?? null,
     },
 
     createdAt: serverTimestamp(),
@@ -60,12 +89,44 @@ export async function captureUploadAndProcess(params: {
 
   const captureId = capRef.id;
 
+  // mirror under plant
+  if (tunnelId && plantId) {
+    await setDoc(
+      doc(db, "tunnels", tunnelId, "plants", plantId, "captures", captureId),
+      {
+        captureId,
+        imageUrl,
+        status: "UPLOADED",
+        meta: {
+          robotId: params.robotId ?? null,
+          requestId: params.requestId ?? null,
+          rfid: params.rfid ?? null,
+          side: params.side ?? null,
+          positionLabel: params.positionLabel ?? null,
+          stopIndex: params.stopIndex ?? null,
+          rounds: params.rounds ?? null,
+          direction: params.direction ?? null,
+        },
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      },
+      { merge: true }
+    );
+  }
+
   // 3) Ask backend to process THIS captureId
   try {
     await updateDoc(doc(db, "captures", captureId), {
       status: "PROCESSING",
       updatedAt: serverTimestamp(),
     });
+
+    if (tunnelId && plantId) {
+      await updateDoc(doc(db, "tunnels", tunnelId, "plants", plantId, "captures", captureId), {
+        status: "PROCESSING",
+        updatedAt: serverTimestamp(),
+      });
+    }
 
     const res = await fetch(`${INFER_URL}/process`, {
       method: "POST",
@@ -79,7 +140,6 @@ export async function captureUploadAndProcess(params: {
     }
 
     const payload = await res.json();
-    // payload: { captureId, annotatedUrl, outputs, ... }
     return { captureId, imageUrl, storagePath, ...payload };
   } catch (e: any) {
     await updateDoc(doc(db, "captures", captureId), {
@@ -87,6 +147,15 @@ export async function captureUploadAndProcess(params: {
       error: e?.message ?? "Unknown error",
       updatedAt: serverTimestamp(),
     });
+
+    if (tunnelId && plantId) {
+      await updateDoc(doc(db, "tunnels", tunnelId, "plants", plantId, "captures", captureId), {
+        status: "FAILED",
+        error: e?.message ?? "Unknown error",
+        updatedAt: serverTimestamp(),
+      });
+    }
+
     throw e;
   }
 }

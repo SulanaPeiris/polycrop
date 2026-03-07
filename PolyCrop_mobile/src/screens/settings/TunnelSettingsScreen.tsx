@@ -10,7 +10,8 @@ import { deleteTunnelCascade } from "../../services/tunnels";
 
 type TunnelItem = {
   id: string;
-  tunnelName: string;
+  name?: string;
+  tunnelName?: string;
   cropType: string;
   rows: number;
   columns: number;
@@ -28,35 +29,38 @@ export default function TunnelSettingsScreen({ navigation }: any) {
   useEffect(() => {
     if (!user) return;
 
-    const q = query(collection(db, "tunnels"), where("ownerId", "==", user.uid));
-    const unsub = onSnapshot(q, (snap) => {
-      const list = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) })) as TunnelItem[];
-      list.sort((a: any, b: any) => (b?.createdAt?.seconds ?? 0) - (a?.createdAt?.seconds ?? 0));
-      setTunnels(list);
-    });
+    const qy = query(collection(db, "tunnels"), where("ownerId", "==", user.uid));
+    const unsub = onSnapshot(
+      qy,
+      (snap) => {
+        const list = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) })) as TunnelItem[];
+        // sort client-side by createdAt desc (no index)
+        list.sort((a: any, b: any) => (b?.createdAt?.seconds ?? 0) - (a?.createdAt?.seconds ?? 0));
+        setTunnels(list);
+      },
+      (err) => console.log("tunnel settings snapshot err:", err)
+    );
 
     return () => unsub();
   }, [user]);
 
   const confirmDelete = (t: TunnelItem) => {
-    Alert.alert(
-      "Delete Tunnel",
-      `Delete "${t.tunnelName}"?\nThis will also delete all plants in this tunnel.`,
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Delete",
-          style: "destructive",
-          onPress: async () => {
-            try {
-              await deleteTunnelCascade(t.id);
-            } catch (e: any) {
-              Alert.alert("Error", e?.message ?? "Failed to delete tunnel");
-            }
-          },
+    const title = t.name ?? t.tunnelName ?? "Tunnel";
+    Alert.alert("Delete Tunnel", `Delete "${title}"?
+This will also delete all plants and RFID map in this tunnel.`, [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Delete",
+        style: "destructive",
+        onPress: async () => {
+          try {
+            await deleteTunnelCascade(t.id);
+          } catch (e: any) {
+            Alert.alert("Error", e?.message ?? "Failed to delete tunnel");
+          }
         },
-      ]
-    );
+      },
+    ]);
   };
 
   return (
@@ -69,15 +73,17 @@ export default function TunnelSettingsScreen({ navigation }: any) {
       {tunnels.length === 0 ? <Text style={styles.helper}>No tunnels yet. Add one to start.</Text> : null}
 
       {tunnels.map((t) => {
-        const statusColor = t.status === "GOOD" ? "#2E7D32" : "#FB8C00";
+        const status = t.status ?? "GOOD";
+        const statusColor = status === "GOOD" ? "#2E7D32" : "#FB8C00";
+        const title = t.name ?? t.tunnelName ?? "Tunnel";
 
         return (
           <View key={t.id} style={styles.card}>
             <View style={{ flex: 1 }}>
               <View style={styles.titleRow}>
-                <Text style={styles.title}>{t.tunnelName}</Text>
+                <Text style={styles.title}>{title}</Text>
                 <View style={[styles.badge, { backgroundColor: statusColor }]}>
-                  <Text style={styles.badgeText}>{t.status ?? "GOOD"}</Text>
+                  <Text style={styles.badgeText}>{status}</Text>
                 </View>
               </View>
 
@@ -92,26 +98,17 @@ export default function TunnelSettingsScreen({ navigation }: any) {
               )}
 
               <View style={styles.actions}>
-                <TouchableOpacity
-                  style={[styles.actionBtn, { backgroundColor: "#E8F5E9" }]}
-                  onPress={() => navigation.navigate("EditTunnel", { tunnelId: t.id })}
-                >
+                <TouchableOpacity style={[styles.actionBtn, { backgroundColor: "#E8F5E9" }]} onPress={() => navigation.navigate("EditTunnel", { tunnelId: t.id })}>
                   <Ionicons name="create-outline" size={16} color="#2E7D32" />
                   <Text style={[styles.actionText, { color: "#2E7D32" }]}>Edit</Text>
                 </TouchableOpacity>
 
-                <TouchableOpacity
-                  style={[styles.actionBtn, { backgroundColor: "#E3F2FD" }]}
-                  onPress={() => navigation.navigate("TunnelSetup", { tunnelId: t.id })}
-                >
+                <TouchableOpacity style={[styles.actionBtn, { backgroundColor: "#E3F2FD" }]} onPress={() => navigation.navigate("TunnelSetup", { tunnelId: t.id })}>
                   <Ionicons name="grid-outline" size={16} color="#1565C0" />
                   <Text style={[styles.actionText, { color: "#1565C0" }]}>Setup Plants</Text>
                 </TouchableOpacity>
 
-                <TouchableOpacity
-                  style={[styles.actionBtn, { backgroundColor: "#FFEBEE" }]}
-                  onPress={() => confirmDelete(t)}
-                >
+                <TouchableOpacity style={[styles.actionBtn, { backgroundColor: "#FFEBEE" }]} onPress={() => confirmDelete(t)}>
                   <Ionicons name="trash-outline" size={16} color="#D32F2F" />
                   <Text style={[styles.actionText, { color: "#D32F2F" }]}>Delete</Text>
                 </TouchableOpacity>
