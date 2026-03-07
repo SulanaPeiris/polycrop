@@ -6,14 +6,15 @@ import { collection, doc, getDoc, onSnapshot } from "firebase/firestore";
 import { db } from "../../firebase/firebase";
 import { useTunnelHeader } from "../../hooks/useTunnelHeader";
 import { updateTunnel } from "../../services/tunnels";
-import { bindRFIDToPlant, unbindRFID, updatePlant } from "../../services/plants";
+import { bindRFIDToPlantSide, unbindRFIDSide, updatePlant } from "../../services/plants";
 
 type PlantDoc = {
   plantUid: string;
   plantName: string;
   row: number;
   column: number;
-  rfidTag?: string | null;
+  rfidA?: string | null;
+  rfidB?: string | null;
 };
 
 export default function TunnelSetupScreen({ route }: any) {
@@ -28,7 +29,8 @@ export default function TunnelSetupScreen({ route }: any) {
   const [open, setOpen] = useState(false);
   const [activePlant, setActivePlant] = useState<{ id: string } & PlantDoc | null>(null);
   const [plantName, setPlantName] = useState("");
-  const [rfidTag, setRfidTag] = useState("");
+  const [rfidA, setRfidA] = useState("");
+  const [rfidB, setRfidB] = useState("");
 
   useEffect(() => {
     let unsubPlants: any = null;
@@ -42,7 +44,6 @@ export default function TunnelSetupScreen({ route }: any) {
         plantsRef,
         (snap) => {
           const list = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) })) as Array<{ id: string } & PlantDoc>;
-          // sort by row/column for stable grid
           list.sort((a, b) => (a.row - b.row) || (a.column - b.column));
           setPlants(list);
           setLoading(false);
@@ -60,81 +61,95 @@ export default function TunnelSetupScreen({ route }: any) {
   const rows = tunnel?.rows ?? 0;
   const cols = tunnel?.columns ?? 0;
 
-  const plantsById = useMemo(() => {
-    const map: Record<string, { id: string } & PlantDoc> = {};
-    for (const p of plants) map[p.id] = p;
-    return map;
-  }, [plants]);
-
   const plantsByCoord = useMemo(() => {
     const map: Record<string, { id: string } & PlantDoc> = {};
     for (const p of plants) map[`r${p.row}_c${p.column}`] = p;
     return map;
   }, [plants]);
 
-  const assignedCount = useMemo(() => plants.filter((p) => !!p.rfidTag).length, [plants]);
+  // ✅ setup complete if every plant has at least 1 RFID (A or B)
+  const assignedCount = useMemo(() => plants.filter((p) => !!p.rfidA || !!p.rfidB).length, [plants]);
   const totalPlants = rows * cols;
 
   const openPlant = (p: { id: string } & PlantDoc) => {
     setActivePlant(p);
     setPlantName(p.plantName ?? "");
-    setRfidTag(p.rfidTag ?? "");
+    setRfidA((p.rfidA ?? "") as string);
+    setRfidB((p.rfidB ?? "") as string);
     setOpen(true);
   };
 
   const savePlant = async () => {
-  if (!activePlant) return;
+    if (!activePlant) return;
 
-  const nextName = plantName.trim();
-  const nextRFID = rfidTag.trim().toUpperCase();
-  const prevRFID = (activePlant.rfidTag ?? "").trim().toUpperCase();
+    const nextName = plantName.trim();
+    const nextA = rfidA.trim().toUpperCase();
+    const nextB = rfidB.trim().toUpperCase();
 
-  if (nextName.length < 2) {
-    Alert.alert("Invalid name", "Plant name is too short.");
-    return;
-  }
+    const prevA = (activePlant.rfidA ?? "").trim().toUpperCase();
+    const prevB = (activePlant.rfidB ?? "").trim().toUpperCase();
 
-  // prevent duplicate RFID inside same tunnel
-  if (nextRFID) {
-    const dup = plants.find(
-      (p) => p.id !== activePlant.id && ((p.rfidTag ?? "").trim().toUpperCase() === nextRFID)
-    );
-    if (dup) {
-      Alert.alert("Duplicate RFID", `This RFID is already used by ${dup.plantUid}.`);
+    if (nextName.length < 2) {
+      Alert.alert("Invalid name", "Plant name is too short.");
       return;
     }
-  }
 
-  // 1) update name always
-  await updatePlant(tunnelId, activePlant.id, { plantName: nextName });
+    if (nextA && nextB && nextA === nextB) {
+      Alert.alert("Invalid RFID", "RFID A and RFID B must be different.");
+      return;
+    }
 
-  // 2) RFID mapping logic
-  if (prevRFID && prevRFID !== nextRFID) {
-    await unbindRFID(tunnelId, activePlant.id, prevRFID);
-  }
+    const usedByOtherPlant = (rfid: string) =>
+      plants.some((p) => {
+        if (p.id === activePlant.id) return false;
+        const a = (p.rfidA ?? "").trim().toUpperCase();
+        const b = (p.rfidB ?? "").trim().toUpperCase();
+        return rfid === a || rfid === b;
+      });
 
-  if (nextRFID) {
-    await bindRFIDToPlant(tunnelId, activePlant.id, nextRFID);
-  } else if (prevRFID && !nextRFID) {
-    await unbindRFID(tunnelId, activePlant.id, prevRFID);
-  }
+    if (nextA && usedByOtherPlant(nextA)) {
+      Alert.alert("Duplicate RFID", `RFID A (${nextA}) is already used in another plant.`);
+      return;
+    }
+    if (nextB && usedByOtherPlant(nextB)) {
+      Alert.alert("Duplicate RFID", `RFID B (${nextB}) is already used in another plant.`);
+      return;
+    }
 
-  setOpen(false);
-  setActivePlant(null);
-};
+    try {
+      // 1) update name always
+      await updatePlant(tunnelId, activePlant.id, { plantName: nextName });
+
+      // 2) Side A mapping updates
+      if (prevA && prevA !== nextA) await unbindRFIDSide(tunnelId, activePlant.id, prevA, "A");
+      if (nextA && prevA !== nextA) await bindRFIDToPlantSide(tunnelId, activePlant.id, nextA, "A");
+      if (!nextA && prevA) await unbindRFIDSide(tunnelId, activePlant.id, prevA, "A");
+
+      // 3) Side B mapping updates
+      if (prevB && prevB !== nextB) await unbindRFIDSide(tunnelId, activePlant.id, prevB, "B");
+      if (nextB && prevB !== nextB) await bindRFIDToPlantSide(tunnelId, activePlant.id, nextB, "B");
+      if (!nextB && prevB) await unbindRFIDSide(tunnelId, activePlant.id, prevB, "B");
+
+      setOpen(false);
+      setActivePlant(null);
+    } catch (e: any) {
+      Alert.alert("Save failed", e?.message ?? "Failed to save plant");
+    }
+  };
 
   const markSetupComplete = async () => {
     await updateTunnel(tunnelId, { setupCompleted: true });
     Alert.alert("Done", "Tunnel setup marked as complete.");
   };
 
-  const nodeBg = (p?: PlantDoc) => (!p?.rfidTag ? "#FFF3E0" : "#E8F5E9");
-  const dotColor = (p?: PlantDoc) => (!p?.rfidTag ? "#FB8C00" : "#2E7D32");
+  const tagCount = (p?: PlantDoc) => (p?.rfidA ? 1 : 0) + (p?.rfidB ? 1 : 0);
+  const nodeBg = (p?: PlantDoc) => (tagCount(p) === 0 ? "#FFF3E0" : tagCount(p) === 1 ? "#FFFDE7" : "#E8F5E9");
+  const dotColor = (p?: PlantDoc) => (tagCount(p) === 0 ? "#FB8C00" : tagCount(p) === 1 ? "#FBC02D" : "#2E7D32");
 
   return (
     <ScrollView contentContainerStyle={styles.container} showsVerticalScrollIndicator={false}>
       <View style={styles.headerCard}>
-        <Text style={styles.headerTitle}>{tunnel?.tunnelName ?? "Tunnel"}</Text>
+        <Text style={styles.headerTitle}>{tunnel?.name ?? tunnel?.tunnelName ?? "Tunnel"}</Text>
         <Text style={styles.headerSub}>
           {rows} rows × {cols} columns • RFID assigned {assignedCount}/{totalPlants || 0}
         </Text>
@@ -145,7 +160,7 @@ export default function TunnelSetupScreen({ route }: any) {
             <Text style={styles.completeText}>Mark Setup Complete</Text>
           </TouchableOpacity>
         ) : (
-          <Text style={styles.tip}>Tip: tap a plant and enter RFID.</Text>
+          <Text style={styles.tip}>Tip: tap a plant and enter RFID A/B (1 or 2 tags).</Text>
         )}
       </View>
 
@@ -171,7 +186,7 @@ export default function TunnelSetupScreen({ route }: any) {
                     activeOpacity={0.8}
                   >
                     <View style={[styles.dot, { backgroundColor: dotColor(plant) }]} />
-                    {!!plant.rfidTag && <Ionicons name="radio" size={14} color="#2E7D32" style={{ marginTop: 6 }} />}
+                    {tagCount(plant) > 0 ? <Ionicons name="radio" size={14} color="#2E7D32" style={{ marginTop: 6 }} /> : null}
                   </TouchableOpacity>
                 );
               })}
@@ -182,11 +197,15 @@ export default function TunnelSetupScreen({ route }: any) {
         <View style={styles.legendRow}>
           <View style={styles.legendItem}>
             <View style={[styles.dot, { backgroundColor: "#FB8C00" }]} />
-            <Text style={styles.legendText}>RFID missing</Text>
+            <Text style={styles.legendText}>No RFID</Text>
+          </View>
+          <View style={styles.legendItem}>
+            <View style={[styles.dot, { backgroundColor: "#FBC02D" }]} />
+            <Text style={styles.legendText}>One side</Text>
           </View>
           <View style={styles.legendItem}>
             <View style={[styles.dot, { backgroundColor: "#2E7D32" }]} />
-            <Text style={styles.legendText}>RFID assigned</Text>
+            <Text style={styles.legendText}>Both sides</Text>
           </View>
         </View>
       </View>
@@ -205,19 +224,16 @@ export default function TunnelSetupScreen({ route }: any) {
             <Text style={styles.modalLabel}>Plant Name</Text>
             <TextInput value={plantName} onChangeText={setPlantName} style={styles.input} placeholder="Plant name" />
 
-            <Text style={styles.modalLabel}>RFID Tag</Text>
-            <TextInput
-              value={rfidTag}
-              onChangeText={setRfidTag}
-              style={styles.input}
-              placeholder="Enter RFID (e.g., 04A3F9...)"
-              autoCapitalize="characters"
-            />
+            <Text style={styles.modalLabel}>RFID Tag A (Side A)</Text>
+            <TextInput value={rfidA} onChangeText={setRfidA} style={styles.input} placeholder="Enter RFID A" autoCapitalize="characters" />
+
+            <Text style={styles.modalLabel}>RFID Tag B (Side B)</Text>
+            <TextInput value={rfidB} onChangeText={setRfidB} style={styles.input} placeholder="Enter RFID B" autoCapitalize="characters" />
 
             <View style={styles.modalBtns}>
               <TouchableOpacity
                 style={[styles.smallBtn, { backgroundColor: "#fff", borderWidth: 1, borderColor: "#E0E0E0" }]}
-                onPress={() => setRfidTag("")}
+                onPress={() => { setRfidA(""); setRfidB(""); }}
               >
                 <Text style={[styles.smallBtnText, { color: "#757575" }]}>Clear RFID</Text>
               </TouchableOpacity>
@@ -227,9 +243,7 @@ export default function TunnelSetupScreen({ route }: any) {
               </TouchableOpacity>
             </View>
 
-            <Text style={styles.modalHint}>
-              You can edit RFID anytime later from Settings → Setup Tunnel.
-            </Text>
+            <Text style={styles.modalHint}>You can edit RFID anytime later from Settings → Tunnel Settings → Setup Plants.</Text>
           </View>
         </View>
       </Modal>

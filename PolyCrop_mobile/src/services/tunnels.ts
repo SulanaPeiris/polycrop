@@ -11,7 +11,6 @@ import {
   writeBatch,
 } from "firebase/firestore";
 import { db } from "../firebase/firebase";
-import { bindRobotToTunnel } from "./robots";
 
 export type TunnelStatus = "GOOD" | "NEED_ATTENTION";
 
@@ -19,7 +18,10 @@ export type Tunnel = {
   id: string;
   ownerId: string;
 
-  name: string; // ✅ use "name" everywhere
+  // We store both for backward compatibility
+  name: string;
+  tunnelName?: string;
+
   cropType: string;
   size?: string;
 
@@ -37,18 +39,29 @@ export type Tunnel = {
 export type CreateTunnelInput = Omit<Tunnel, "id">;
 
 export async function createTunnelWithPlants(input: CreateTunnelInput) {
+  const tunnelName = (input.name || input.tunnelName || "").trim();
+
   const tunnelRef = await addDoc(collection(db, "tunnels"), {
-    ...input,
-    status: input.status ?? "GOOD",
-    setupCompleted: input.setupCompleted ?? false,
+    ownerId: input.ownerId,
+    name: tunnelName,
+    tunnelName, // keep legacy field
+
+    cropType: input.cropType,
+    size: input.size ?? null,
+
+    rows: input.rows,
+    columns: input.columns,
+
+    sensorCount: input.sensorCount ?? null,
+    robotId: input.robotId ?? null,
+    fertigationUnitId: input.fertigationUnitId ?? null,
+
+    status: (input.status ?? "GOOD") as TunnelStatus,
+    setupCompleted: !!input.setupCompleted,
+
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   });
-
-  // ✅ bind robot -> tunnel (so robot can read assignedTunnelId)
-  if (input.robotId && input.robotId.trim().length > 0) {
-    await bindRobotToTunnel(input.robotId.trim(), tunnelRef.id);
-  }
 
   // create plants grid
   let batch = writeBatch(db);
@@ -65,7 +78,11 @@ export async function createTunnelWithPlants(input: CreateTunnelInput) {
         plantName: `Plant ${plantUid}`,
         row: r,
         column: c,
-        rfidTag: null,
+
+        // ✅ two RFIDs per plant
+        rfidA: null,
+        rfidB: null,
+
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
@@ -84,31 +101,35 @@ export async function createTunnelWithPlants(input: CreateTunnelInput) {
 }
 
 export async function getMyTunnels(ownerId: string) {
-  // ✅ no orderBy to avoid composite index requirement
+  // ✅ no orderBy => no composite index needed
   const q = query(collection(db, "tunnels"), where("ownerId", "==", ownerId));
   const snap = await getDocs(q);
-
-  const items = snap.docs.map((d) => {
-    const data: any = d.data();
-    const createdAtMs = typeof data?.createdAt?.toMillis === "function" ? data.createdAt.toMillis() : 0;
-    return { id: d.id, ...data, __createdAtMs: createdAtMs };
-  });
-
-  items.sort((a: any, b: any) => (b.__createdAtMs ?? 0) - (a.__createdAtMs ?? 0));
-  return items.map(({ __createdAtMs, ...rest }: any) => rest) as Tunnel[];
+  return snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) })) as Tunnel[];
 }
 
 export async function updateTunnel(
   tunnelId: string,
   patch: Partial<Omit<Tunnel, "id" | "ownerId">>
 ) {
-  await updateDoc(doc(db, "tunnels", tunnelId), { ...patch, updatedAt: serverTimestamp() });
+  // keep both name + tunnelName in sync if provided
+  const next: any = { ...patch, updatedAt: serverTimestamp() };
+
+  if (typeof (patch as any).name === "string") {
+    next.tunnelName = (patch as any).name;
+  }
+  if (typeof (patch as any).tunnelName === "string") {
+    next.name = (patch as any).tunnelName;
+  }
+
+  await updateDoc(doc(db, "tunnels", tunnelId), next);
 }
 
 /**
- * ✅ Deletes plants subcollection first (real delete).
+ * Deletes plants subcollection first.
+ * Note: Firestore cannot delete nested subcollections automatically.
  */
 export async function deleteTunnelCascade(tunnelId: string) {
+  // delete plants in batches
   const plantsSnap = await getDocs(collection(db, "tunnels", tunnelId, "plants"));
   let batch = writeBatch(db);
   let ops = 0;
@@ -124,5 +145,36 @@ export async function deleteTunnelCascade(tunnelId: string) {
   }
   if (ops > 0) await batch.commit();
 
+  // delete rfidMap docs
+  const rfidSnap = await getDocs(collection(db, "tunnels", tunnelId, "rfidMap"));
+  batch = writeBatch(db);
+  ops = 0;
+  for (const d of rfidSnap.docs) {
+    batch.delete(d.ref);
+    ops++;
+    if (ops >= 450) {
+      await batch.commit();
+      batch = writeBatch(db);
+      ops = 0;
+    }
+  }
+  if (ops > 0) await batch.commit();
+
+  // delete scanEvents docs (optional but clean)
+  const scanSnap = await getDocs(collection(db, "tunnels", tunnelId, "scanEvents"));
+  batch = writeBatch(db);
+  ops = 0;
+  for (const d of scanSnap.docs) {
+    batch.delete(d.ref);
+    ops++;
+    if (ops >= 450) {
+      await batch.commit();
+      batch = writeBatch(db);
+      ops = 0;
+    }
+  }
+  if (ops > 0) await batch.commit();
+
+  // delete tunnel doc
   await deleteDoc(doc(db, "tunnels", tunnelId));
 }
