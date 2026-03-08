@@ -4,7 +4,7 @@ import { Ionicons } from "@expo/vector-icons";
 import { useTunnelHeader } from "../../hooks/useTunnelHeader";
 import SectionTitle from "../components/SectionTitle";
 import { LinearGradient } from "expo-linear-gradient";
-import { collection, documentId, limit, onSnapshot, orderBy, query } from "firebase/firestore";
+import { collection, documentId, limit, onSnapshot, orderBy, query, doc } from "firebase/firestore";
 import { db } from "../../firebase/firebase";
 
 const { width } = Dimensions.get("window");
@@ -119,7 +119,7 @@ export default function SchedulesScreen() {
     <ScrollView contentContainerStyle={styles.container}>
 
       {/* 1. Next Active Fertigation - Enhanced Design */}
-      <LinearGradient
+      {/* <LinearGradient
         colors={['#ffffff', '#F1F8E9']}
         start={{ x: 0, y: 0 }}
         end={{ x: 1, y: 1 }}
@@ -154,7 +154,7 @@ export default function SchedulesScreen() {
             <Text style={styles.metaText}>Mix: Vegitative</Text>
           </View>
         </View>
-      </LinearGradient>
+      </LinearGradient> */}
 
       {/* Current NPK Levels */}
       <View style={styles.currentNpkCard}>
