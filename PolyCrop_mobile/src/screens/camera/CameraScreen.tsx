@@ -3,46 +3,26 @@ import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, Alert } fr
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { Ionicons } from "@expo/vector-icons";
 import * as ImageManipulator from "expo-image-manipulator";
+import { doc, onSnapshot, serverTimestamp, updateDoc } from "firebase/firestore";
 
+import { db } from "../../firebase/firebase";
 import { captureUploadAndProcess } from "../../services/capturePipeline";
 import { useTunnel } from "../../context/TunnelContext";
 
-type ScanSummary = {
-  counts?: { cucumber?: number; leaf?: number; flower?: number };
-  sprayRecommended?: boolean;
-  diseases?: string[];
-};
-
-function exifOrientationToDegrees(o?: number) {
-  // EXIF Orientation:
-  // 1 = normal
-  // 3 = 180
-  // 6 = 90 CW
-  // 8 = 90 CCW
-  if (o === 3) return 180;
-  if (o === 6) return 90;
-  if (o === 8) return -90;
-  return 0;
-}
-
 async function normalizeToPortraitJpeg(photo: any) {
-  // 1) Re-encode to JPEG to remove EXIF orientation (NO rotate)
-  let out = await ImageManipulator.manipulateAsync(
-    photo.uri,
-    [],
-    { compress: 0.9, format: ImageManipulator.SaveFormat.JPEG }
-  );
+  // Remove EXIF orientation by re-encoding
+  let out = await ImageManipulator.manipulateAsync(photo.uri, [], {
+    compress: 0.9,
+    format: ImageManipulator.SaveFormat.JPEG,
+  });
 
-  // 2) If still landscape, force portrait by rotating ONCE
+  // Force portrait if still landscape
   if (out.width > out.height) {
-    // choose -90 (if your device needs the other direction, change to +90)
-    out = await ImageManipulator.manipulateAsync(
-      out.uri,
-      [{ rotate: -90 }],
-      { compress: 0.9, format: ImageManipulator.SaveFormat.JPEG }
-    );
+    out = await ImageManipulator.manipulateAsync(out.uri, [{ rotate: -90 }], {
+      compress: 0.9,
+      format: ImageManipulator.SaveFormat.JPEG,
+    });
   }
-
   return out.uri;
 }
 
@@ -52,24 +32,105 @@ export default function CameraScreen({ navigation }: any) {
   const [isReady, setIsReady] = useState(false);
 
   const [processing, setProcessing] = useState(false);
-  const [lastSummary, setLastSummary] = useState<ScanSummary | null>(null);
-  const [lastStatus, setLastStatus] = useState<"IDLE" | "DONE" | "FAILED">("IDLE");
+  const [lastHandledRequestId, setLastHandledRequestId] = useState<string>("");
 
   const { selectedTunnel } = useTunnel();
+  const tunnelId = selectedTunnel?.id ?? null;
+  const robotId = selectedTunnel?.robotId ?? "ROBOT_01";
 
   useEffect(() => {
     if (!permission) return;
     if (!permission.granted) requestPermission();
   }, [permission]);
 
-  const handleCapture = async () => {
+  // ✅ Auto capture when robot requests it
+  useEffect(() => {
+    if (!robotId) return;
+
+    const rref = doc(db, "robots", robotId);
+    const unsub = onSnapshot(
+      rref,
+      async (snap) => {
+        if (!snap.exists()) return;
+        const r: any = snap.data();
+
+        const status = r.captureStatus ?? "";
+        const requestId = r.captureRequestId ?? "";
+
+        if (status !== "REQUESTED") return;
+        if (!requestId) return;
+
+        if (requestId === lastHandledRequestId) return;
+        if (processing) return;
+        if (!isReady) return;
+
+        const plantId = r.capturePlantId ?? null;
+
+        try {
+          setProcessing(true);
+          setLastHandledRequestId(requestId);
+
+          // Take photo
+          // @ts-ignore
+          const photo = await cameraRef.current?.takePictureAsync?.({
+            quality: 0.8,
+            exif: false,
+            skipProcessing: false,
+          });
+
+          if (!photo?.uri) throw new Error("No photo captured");
+          const normalizedUri = await normalizeToPortraitJpeg(photo);
+
+          const payload = await captureUploadAndProcess({
+            photoUri: normalizedUri,
+            tunnelId,
+            plantId,
+
+            robotId,
+            requestId,
+
+            rfid: r.captureRFID ?? null,
+            side: r.captureSide ?? null,
+            positionLabel: r.capturePosition ?? null,
+            stopIndex: typeof r.captureStopIndex === "number" ? r.captureStopIndex : null,
+            rounds: typeof r.captureRounds === "number" ? r.captureRounds : null,
+            direction: r.captureDirection ?? null,
+          });
+
+          // ACK robot: capture is ready (backend will later set DECIDED)
+          await updateDoc(rref, {
+            captureStatus: "CAPTURED",
+            captureId: payload.captureId,
+            captureImageUrl: payload.imageUrl ?? null,
+            updatedAt: serverTimestamp(),
+          });
+        } catch (e: any) {
+          console.log("AUTO CAPTURE ERROR:", e?.message, e);
+          Alert.alert("Auto capture failed", e?.message ?? "Unknown error");
+
+          // Ensure robot doesn't wait forever
+          try {
+            await updateDoc(rref, {
+              captureStatus: "DECIDED",
+              captureDecision: "NO_SPRAY",
+              sprayDurationMs: 0,
+              updatedAt: serverTimestamp(),
+            });
+          } catch {}
+        } finally {
+          setProcessing(false);
+        }
+      },
+      (err) => console.log("robot listener error:", err)
+    );
+
+    return () => unsub();
+  }, [robotId, tunnelId, isReady, processing, lastHandledRequestId]);
+
+  const handleManualCapture = async () => {
     try {
       setProcessing(true);
-      setLastSummary(null);
-      setLastStatus("IDLE");
 
-      // ✅ Capture with EXIF so we can fix orientation
-      // ✅ skipProcessing: false is important on Android (keeps correct rotation processing)
       // @ts-ignore
       const photo = await cameraRef.current?.takePictureAsync?.({
         quality: 0.8,
@@ -78,24 +139,25 @@ export default function CameraScreen({ navigation }: any) {
       });
 
       if (!photo?.uri) throw new Error("No photo captured");
-
-      // ✅ FIX ORIENTATION BEFORE UPLOAD (makes Firebase Storage image stay vertical)
       const normalizedUri = await normalizeToPortraitJpeg(photo);
 
-      // Upload -> Firestore doc -> backend draws boxes -> backend updates Firestore
-      const payload = await captureUploadAndProcess({
+      await captureUploadAndProcess({
         photoUri: normalizedUri,
-        tunnelId: selectedTunnel?.id ?? null,
+        tunnelId,
+        plantId: null,
+        robotId: null,
+        requestId: null,
+        rfid: null,
+        side: null,
+        positionLabel: null,
+        stopIndex: null,
+        rounds: null,
+        direction: null,
       });
 
-      const summary = payload?.outputs?.summary ?? null;
-
-      setLastSummary(summary);
-      setLastStatus("DONE");
+      Alert.alert("Done", "Manual capture processed.");
     } catch (e: any) {
-      console.log("CAPTURE ERROR:", e?.message, e);
-      setLastStatus("FAILED");
-      Alert.alert("Scan failed", e?.message ?? "Unknown error");
+      Alert.alert("Capture failed", e?.message ?? "Unknown error");
     } finally {
       setProcessing(false);
     }
@@ -120,11 +182,6 @@ export default function CameraScreen({ navigation }: any) {
     );
   }
 
-  const c = lastSummary?.counts ?? {};
-  const cuc = c.cucumber ?? 0;
-  const leaf = c.leaf ?? 0;
-  const flower = c.flower ?? 0;
-
   return (
     <View style={styles.container}>
       <CameraView
@@ -134,37 +191,28 @@ export default function CameraScreen({ navigation }: any) {
         onCameraReady={() => setIsReady(true)}
       />
 
-      {/* Status info only (NO image preview) */}
       <View style={styles.infoCard}>
-        <Text style={styles.infoTitle}>Scan Status</Text>
+        <Text style={styles.infoTitle}>Robot Auto Capture</Text>
+        <Text style={styles.infoText}>Tunnel: {selectedTunnel?.name ?? selectedTunnel?.tunnelName ?? "N/A"}</Text>
+        <Text style={styles.infoText}>Robot: {robotId}</Text>
 
         {processing ? (
-          <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 10, marginTop: 8 }}>
             <ActivityIndicator color="#fff" />
-            <Text style={styles.infoText}>Uploading + Detecting…</Text>
+            <Text style={styles.infoText}>Capturing + Uploading + Detecting…</Text>
           </View>
-        ) : lastStatus === "DONE" ? (
-          <>
-            <Text style={styles.good}>✅ Scan Complete</Text>
-            <Text style={styles.infoText}>Cucumber: {cuc}</Text>
-            <Text style={styles.infoText}>Leaf: {leaf}</Text>
-            <Text style={styles.infoText}>Flower: {flower}</Text>
-          </>
-        ) : lastStatus === "FAILED" ? (
-          <Text style={styles.bad}>❌ Scan Failed</Text>
         ) : (
-          <Text style={styles.infoText}>Press capture to scan.</Text>
+          <Text style={styles.good}>Waiting for robot stop…</Text>
         )}
       </View>
 
-      {/* Controls */}
       <View style={styles.controls}>
         <TouchableOpacity onPress={() => navigation.goBack()} style={styles.controlBtn} disabled={processing}>
           <Ionicons name="close" size={28} color="#fff" />
         </TouchableOpacity>
 
         <TouchableOpacity
-          onPress={handleCapture}
+          onPress={handleManualCapture}
           disabled={!isReady || processing}
           style={[styles.shutter, (!isReady || processing) && { opacity: 0.5 }]}
         />
@@ -192,8 +240,7 @@ const styles = StyleSheet.create({
   },
   infoTitle: { color: "#fff", fontWeight: "900", marginBottom: 8 },
   infoText: { color: "#fff", fontWeight: "700", marginTop: 4 },
-  good: { color: "#00E676", fontWeight: "900", marginTop: 6 },
-  bad: { color: "#FF5252", fontWeight: "900", marginTop: 6 },
+  good: { color: "#00E676", fontWeight: "900", marginTop: 10 },
 
   controls: {
     position: "absolute",

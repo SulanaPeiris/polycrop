@@ -1,51 +1,71 @@
-import { deleteDoc, doc, serverTimestamp, setDoc, updateDoc } from "firebase/firestore";
+import { deleteDoc, doc, getDoc, serverTimestamp, setDoc, updateDoc } from "firebase/firestore";
 import { db } from "../firebase/firebase";
 
-/**
- * Update plant fields (name / rfidTag)
- */
+export type Side = "A" | "B";
+
+function cleanRFID(rfid: string) {
+  return rfid.trim().toUpperCase();
+}
+
 export async function updatePlant(
   tunnelId: string,
   plantId: string,
-  patch: { plantName?: string; rfidTag?: string | null }
+  patch: { plantName?: string; rfidA?: string | null; rfidB?: string | null }
 ) {
   const ref = doc(db, "tunnels", tunnelId, "plants", plantId);
   await updateDoc(ref, { ...patch, updatedAt: serverTimestamp() });
 }
 
 /**
- * ✅ Bind RFID to a plant
- * 1) set plants/{plantId}.rfidTag
- * 2) set rfidMap/{rfid} -> { plantId }
+ * Bind an RFID tag to plant Side A or B
+ * Writes:
+ *  - tunnels/{tunnelId}/plants/{plantId}.rfidA or rfidB
+ *  - tunnels/{tunnelId}/rfidMap/{RFID} = {plantId, side}
  */
-export async function bindRFIDToPlant(tunnelId: string, plantId: string, rfid: string) {
-  const clean = rfid.trim().toUpperCase();
+export async function bindRFIDToPlantSide(
+  tunnelId: string,
+  plantId: string,
+  rfid: string,
+  side: Side
+) {
+  const clean = cleanRFID(rfid);
   if (!clean) throw new Error("RFID is empty");
 
-  // update plant
-  await updatePlant(tunnelId, plantId, { rfidTag: clean });
-
-  // create mapping doc used by robot
+  // prevent duplicates across plants by checking rfidMap/{rfid}
   const mapRef = doc(db, "tunnels", tunnelId, "rfidMap", clean);
+  const existing = await getDoc(mapRef);
+
+  if (existing.exists()) {
+    const data: any = existing.data();
+    if (data.plantId && data.plantId !== plantId) {
+      throw new Error(`RFID ${clean} is already assigned to another plant (${data.plantId}).`);
+    }
+  }
+
+  // update plant field
+  await updatePlant(tunnelId, plantId, side === "A" ? { rfidA: clean } : { rfidB: clean });
+
+  // write mapping doc for robot
   await setDoc(
     mapRef,
-    {
-      plantId,
-      updatedAt: serverTimestamp(),
-    },
+    { plantId, side, updatedAt: serverTimestamp() },
     { merge: true }
   );
 }
 
-/**
- * ✅ Unbind RFID from plant
- */
-export async function unbindRFID(tunnelId: string, plantId: string, rfid: string) {
-  const clean = rfid.trim().toUpperCase();
+export async function unbindRFIDSide(
+  tunnelId: string,
+  plantId: string,
+  rfid: string,
+  side: Side
+) {
+  const clean = cleanRFID(rfid);
   if (!clean) return;
 
-  await updatePlant(tunnelId, plantId, { rfidTag: null });
+  // clear plant field
+  await updatePlant(tunnelId, plantId, side === "A" ? { rfidA: null } : { rfidB: null });
 
+  // delete mapping doc
   const mapRef = doc(db, "tunnels", tunnelId, "rfidMap", clean);
   await deleteDoc(mapRef);
 }

@@ -5,6 +5,7 @@ import { doc, getDoc } from "firebase/firestore";
 import { db } from "../../firebase/firebase";
 import { useTunnelHeader } from "../../hooks/useTunnelHeader";
 import { deleteTunnelCascade, updateTunnel } from "../../services/tunnels";
+import { bindRobotToTunnel } from "../../services/robots";
 
 export default function EditTunnelScreen({ navigation, route }: any) {
   const { tunnelId } = route.params as { tunnelId: string };
@@ -12,6 +13,8 @@ export default function EditTunnelScreen({ navigation, route }: any) {
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+
+  const [origRobotId, setOrigRobotId] = useState<string>("");
 
   const [form, setForm] = useState({
     tunnelName: "",
@@ -37,8 +40,12 @@ export default function EditTunnelScreen({ navigation, route }: any) {
       }
 
       const t = snap.data() as any;
+      const name = t.name ?? t.tunnelName ?? "";
+
+      setOrigRobotId((t.robotId ?? "").trim());
+
       setForm({
-        tunnelName: t.tunnelName ?? "",
+        tunnelName: name,
         cropType: t.cropType ?? "",
         size: t.size ?? "",
         sensorCount: t.sensorCount ? String(t.sensorCount) : "",
@@ -65,17 +72,28 @@ export default function EditTunnelScreen({ navigation, route }: any) {
       return Alert.alert("Invalid", "Sensor count must be 0–200.");
     }
 
+    const nextRobotId = form.robotId.trim();
+
     try {
       setSaving(true);
+
       await updateTunnel(tunnelId, {
+        name,
         tunnelName: name,
         cropType: crop,
         size: form.size.trim() || undefined,
         sensorCount,
-        robotId: form.robotId.trim() || undefined,
+        robotId: nextRobotId || undefined,
         fertigationUnitId: form.fertigationUnitId.trim() || undefined,
         status: form.status,
-      });
+      } as any);
+
+      // If robotId changed and provided, bind robot to this tunnel (robot reads assignedTunnelId)
+      if (nextRobotId && nextRobotId !== origRobotId) {
+        await bindRobotToTunnel(nextRobotId, tunnelId);
+        setOrigRobotId(nextRobotId);
+      }
+
       Alert.alert("Saved", "Tunnel updated.");
     } catch (e: any) {
       Alert.alert("Error", e?.message ?? "Failed to update tunnel");
@@ -85,29 +103,25 @@ export default function EditTunnelScreen({ navigation, route }: any) {
   };
 
   const confirmDelete = () => {
-    Alert.alert(
-      "Delete Tunnel",
-      "This will delete the tunnel and ALL plants inside it. Continue?",
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Delete",
-          style: "destructive",
-          onPress: async () => {
-            try {
-              setSaving(true);
-              await deleteTunnelCascade(tunnelId);
-              Alert.alert("Deleted", "Tunnel deleted.");
-              navigation.popToTop();
-            } catch (e: any) {
-              Alert.alert("Error", e?.message ?? "Failed to delete");
-            } finally {
-              setSaving(false);
-            }
-          },
+    Alert.alert("Delete Tunnel", "This will delete the tunnel and ALL plants inside it. Continue?", [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Delete",
+        style: "destructive",
+        onPress: async () => {
+          try {
+            setSaving(true);
+            await deleteTunnelCascade(tunnelId);
+            Alert.alert("Deleted", "Tunnel deleted.");
+            navigation.popToTop();
+          } catch (e: any) {
+            Alert.alert("Error", e?.message ?? "Failed to delete");
+          } finally {
+            setSaving(false);
+          }
         },
-      ]
-    );
+      },
+    ]);
   };
 
   if (loading) {
@@ -166,7 +180,7 @@ export default function EditTunnelScreen({ navigation, route }: any) {
         />
 
         <Text style={styles.label}>Robot ID</Text>
-        <TextInput style={styles.input} value={form.robotId} onChangeText={(v) => update("robotId", v)} />
+        <TextInput style={styles.input} value={form.robotId} onChangeText={(v) => update("robotId", v)} autoCapitalize="characters" />
 
         <Text style={styles.label}>Fertigation Unit ID</Text>
         <TextInput style={styles.input} value={form.fertigationUnitId} onChangeText={(v) => update("fertigationUnitId", v)} />
