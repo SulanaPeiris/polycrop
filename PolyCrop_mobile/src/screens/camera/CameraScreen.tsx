@@ -1,3 +1,4 @@
+// src/screens/camera/CameraScreen.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   View,
@@ -12,6 +13,7 @@ import {
 } from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { Ionicons } from "@expo/vector-icons";
+import { useIsFocused } from "@react-navigation/native";
 import { collection, doc, onSnapshot, serverTimestamp, updateDoc } from "firebase/firestore";
 
 import { db } from "../../firebase/firebase";
@@ -33,13 +35,16 @@ type PlantListItem = {
 };
 
 export default function CameraScreen({ navigation }: any) {
+  const isFocused = useIsFocused();
   const cameraRef = useRef<CameraView>(null);
+
   const [permission, requestPermission] = useCameraPermissions();
   const [isReady, setIsReady] = useState(false);
 
   // shared processing lock
   const [processing, setProcessing] = useState(false);
   const processingRef = useRef(false);
+
   useEffect(() => {
     processingRef.current = processing;
   }, [processing]);
@@ -47,7 +52,7 @@ export default function CameraScreen({ navigation }: any) {
   // ✅ Auto capture ON by default
   const [autoEnabled, setAutoEnabled] = useState(true);
 
-  // prevent duplicate handling
+  // prevent duplicate handling (auto capture)
   const [lastHandledRequestId, setLastHandledRequestId] = useState<string>("");
   const lastHandledRequestIdRef = useRef("");
   useEffect(() => {
@@ -74,10 +79,12 @@ export default function CameraScreen({ navigation }: any) {
   const [showPlantModal, setShowPlantModal] = useState(false);
   const [plantSearch, setPlantSearch] = useState("");
 
+  // permissions
   useEffect(() => {
     if (!permission) return;
     if (!permission.granted) requestPermission();
-  }, [permission]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [permission?.granted]);
 
   // ✅ load plants for selected tunnel (manual mode)
   useEffect(() => {
@@ -135,6 +142,40 @@ export default function CameraScreen({ navigation }: any) {
     return `${p.plantUid ?? p.id} (${p.id})`;
   }, [plantId, plants]);
 
+  // ✅ Robust capture helper (prevents "Image could not be captured")
+  const takePhotoSafe = async (): Promise<string> => {
+    const cam: any = cameraRef.current;
+
+    if (!isFocused) throw new Error("Camera screen not focused");
+    if (!isReady) throw new Error("Camera not ready");
+
+    if (!cam?.takePictureAsync) throw new Error("Camera not ready");
+
+    // small delay helps a lot (Android warm-up)
+    await new Promise((r) => setTimeout(r, 250));
+
+    let lastErr: any = null;
+
+    for (let i = 0; i < 3; i++) {
+      try {
+        const photo = await cam.takePictureAsync({
+          quality: 0.75,
+          exif: false,
+          // ✅ more reliable than true on many Android devices
+          skipProcessing: false,
+        });
+
+        if (photo?.uri) return photo.uri;
+        lastErr = new Error("No photo uri");
+      } catch (e: any) {
+        lastErr = e;
+        await new Promise((r) => setTimeout(r, 300));
+      }
+    }
+
+    throw new Error(lastErr?.message ?? "Image could not be captured");
+  };
+
   // ✅ AUTO CAPTURE: listens to Firestore robots/{robotId}
   useEffect(() => {
     if (!robotId) return;
@@ -144,57 +185,54 @@ export default function CameraScreen({ navigation }: any) {
     const unsub = onSnapshot(
       rref,
       async (snap) => {
-        if (!snap.exists()) return;
-        if (!autoEnabled) return;
-
-        const r: any = snap.data();
-        const status = r.captureStatus ?? "";
-        const requestId = r.captureRequestId ?? "";
-
-        // We only act on REQUESTED
-        if (status !== "REQUESTED") return;
-        if (!requestId) return;
-
-        // prevent duplicates
-        if (requestId === lastHandledRequestIdRef.current) return;
-        if (processingRef.current) return;
-        if (!isReady) return;
-
-        // Use robot-provided tunnel/plant if available (better)
-        const reqTunnelId = r.captureTunnelId ?? tunnelId;
-        const reqPlantId = r.capturePlantId ?? null;
-
-        if (!reqTunnelId || !reqPlantId) {
-          // Don’t block robot forever
-          try {
-            await updateDoc(rref, {
-              captureStatus: "DECIDED",
-              captureDecision: "NO_SPRAY",
-              sprayDurationMs: 0,
-              updatedAt: serverTimestamp(),
-            });
-          } catch {}
-          return;
-        }
-
         try {
+          if (!snap.exists()) return;
+          if (!autoEnabled) return;
+          if (!isFocused) return;
+          if (!isReady) return;
+
+          const r: any = snap.data();
+          const status = r.captureStatus ?? "";
+          const requestId = r.captureRequestId ?? "";
+
+          if (status !== "REQUESTED") return;
+          if (!requestId) return;
+
+          // prevent duplicates
+          if (requestId === lastHandledRequestIdRef.current) return;
+
+          // ✅ immediate lock (before setState)
+          if (processingRef.current) return;
+          processingRef.current = true;
+
           setProcessing(true);
           setLastHandledRequestId(requestId);
 
-          // take photo (fast)
-          // @ts-ignore
-          const photo = await cameraRef.current?.takePictureAsync?.({
-            quality: 0.8,
-            exif: false,
-            skipProcessing: true,
-          });
+          // Prefer robot-provided ids
+          const reqTunnelId = r.captureTunnelId ?? tunnelId;
+          const reqPlantId = r.capturePlantId ?? null;
 
-          if (!photo?.uri) throw new Error("No photo captured");
+          if (!reqTunnelId || !reqPlantId) {
+            // don't keep robot waiting forever
+            try {
+              await updateDoc(rref, {
+                captureStatus: "DECIDED",
+                captureDecision: "NO_SPRAY",
+                sprayDurationMs: 0,
+                updatedAt: serverTimestamp(),
+              });
+            } catch {}
+            return;
+          }
+
+          // take photo
+          const uri = await takePhotoSafe();
 
           const payload = await captureUploadAndProcess({
-            photoUri: photo.uri, // ✅ capturePipeline will resize/compress to 768px 0.7
+            photoUri: uri, // ✅ capturePipeline will resize/compress (768px, 0.7)
             tunnelId: reqTunnelId,
             plantId: reqPlantId,
+
             robotId,
             requestId,
 
@@ -206,7 +244,7 @@ export default function CameraScreen({ navigation }: any) {
             direction: r.captureDirection ?? null,
           });
 
-          // ACK robot: capture uploaded (backend will set RTDB command and/or Firestore DECIDED)
+          // ACK robot: capture uploaded; backend will publish DECIDED to RTDB
           await updateDoc(rref, {
             captureStatus: "CAPTURED",
             captureId: payload.captureId,
@@ -219,7 +257,7 @@ export default function CameraScreen({ navigation }: any) {
 
           // ensure robot doesn't wait forever
           try {
-            await updateDoc(rref, {
+            await updateDoc(doc(db, "robots", robotId), {
               captureStatus: "DECIDED",
               captureDecision: "NO_SPRAY",
               sprayDurationMs: 0,
@@ -227,6 +265,7 @@ export default function CameraScreen({ navigation }: any) {
             });
           } catch {}
         } finally {
+          processingRef.current = false;
           setProcessing(false);
         }
       },
@@ -234,12 +273,14 @@ export default function CameraScreen({ navigation }: any) {
     );
 
     return () => unsub();
-  }, [robotId, tunnelId, isReady, autoEnabled]);
+  }, [robotId, tunnelId, isReady, autoEnabled, isFocused]);
 
   // ✅ MANUAL CAPTURE (uses selected tunnel/plant)
   const handleManualCapture = async () => {
     try {
       setProcessing(true);
+      processingRef.current = true;
+
       setLastSummary(null);
       setLastStatus("IDLE");
       setLastCaptureId("");
@@ -253,17 +294,10 @@ export default function CameraScreen({ navigation }: any) {
         return;
       }
 
-      // @ts-ignore
-      const photo = await cameraRef.current?.takePictureAsync?.({
-        quality: 0.8,
-        exif: false,
-        skipProcessing: true,
-      });
-
-      if (!photo?.uri) throw new Error("No photo captured");
+      const uri = await takePhotoSafe();
 
       const payload = await captureUploadAndProcess({
-        photoUri: photo.uri, // ✅ capturePipeline will resize/compress to 768px 0.7
+        photoUri: uri, // ✅ capturePipeline will resize/compress (768px, 0.7)
         tunnelId,
         plantId: plantId.trim(),
         robotId: null,
@@ -285,10 +319,12 @@ export default function CameraScreen({ navigation }: any) {
       setLastStatus("FAILED");
       Alert.alert("Scan failed", e?.message ?? "Unknown error");
     } finally {
+      processingRef.current = false;
       setProcessing(false);
     }
   };
 
+  // UI guards
   if (!permission) {
     return (
       <View style={styles.center}>
@@ -315,7 +351,14 @@ export default function CameraScreen({ navigation }: any) {
 
   return (
     <View style={styles.container}>
-      <CameraView ref={cameraRef} style={styles.camera} facing="back" onCameraReady={() => setIsReady(true)} />
+      <CameraView
+        ref={cameraRef}
+        style={styles.camera}
+        facing="back"
+        active={isFocused} // ✅ prevents capture when unfocused
+        mode="picture"
+        onCameraReady={() => setIsReady(true)}
+      />
 
       {/* Combined Info */}
       <View style={styles.infoCard}>
