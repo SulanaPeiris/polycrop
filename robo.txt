@@ -44,6 +44,28 @@ String actuatorStatus = "OFF"; // OFF | PUMP1_ON | PUMP2_ON | SERVO_MOVING
 String modeStr = "LINE_FOLLOW";
 String currentPositionLabel = "NONE";
 
+// ===== CAPTURE HANDSHAKE (robot -> phone -> backend -> robot) =====
+String currentRFIDSide = "";          // "A" or "B" (from rfidMap)
+String captureStatus = "IDLE";        // IDLE | REQUESTED | CAPTURED | DECIDED | DONE
+String captureRequestId = "";
+String captureDecision = "";          // SPRAY | NO_SPRAY
+int sprayDurationMs = 0;              // set by backend
+String captureId = "";
+String captureImageUrl = "";
+
+String captureTunnelId = "";          // assignedTunnelId
+String capturePlantId = "";           // currentPlantDocId
+String captureRFID = "";
+String captureSide = "";
+String capturePosition = "";          // A/B/C
+int captureStopIndex = 0;
+int captureRounds = 0;
+String captureDirection = "";         // FWD/BWD
+
+bool captureWaitActive = false;
+unsigned long captureWaitStartMs = 0;
+const unsigned long CAPTURE_WAIT_TIMEOUT_MS = 120000; // 2 minutes
+
 // tunnel assignment + resolved plant doc id
 String assignedTunnelId = "";
 String currentPlantDocId = "";
@@ -249,7 +271,8 @@ void fetchAssignedTunnelId() {
 
 // Reads: tunnels/{assignedTunnelId}/rfidMap/{RFID} -> fields/plantId/stringValue
 void resolvePlantDocIdFromRFID() {
-  currentPlantDocId = currentRFID; // fallback
+  currentPlantDocId = currentRFID; // fallback (old behavior)
+  currentRFIDSide = "";
 
   if (!Firebase.ready()) return;
   if (assignedTunnelId.length() == 0) return;
@@ -264,12 +287,14 @@ void resolvePlantDocIdFromRFID() {
 
   FirebaseJson json;
   json.setJsonData(fbdo.payload().c_str());
-  FirebaseJsonData data;
-  json.get(data, "fields/plantId/stringValue");
 
-  if (data.success) {
-    currentPlantDocId = data.to<String>();
-  }
+  FirebaseJsonData data;
+
+  json.get(data, "fields/plantId/stringValue");
+  if (data.success) currentPlantDocId = data.to<String>();
+
+  json.get(data, "fields/side/stringValue");
+  if (data.success) currentRFIDSide = data.to<String>();
 }
 
 String buildScanEventPath(const String& eventId) {
@@ -287,10 +312,119 @@ String buildPlantPath() {
   }
   return String("plants") + "/" + currentRFID;
 }
+// ------------------------- CAPTURE REQUEST / DECISION -------------------------
+String makeCaptureRequestId() {
+  uint32_t r = (uint32_t)esp_random();
+  return String(millis()) + "_" + String(r, HEX);
+}
+
+void requestCaptureAtStop(int rounds, const String& directionLabel) {
+  // Required fields for mobile + backend
+  captureRequestId = makeCaptureRequestId();
+  captureStatus = "REQUESTED";
+  captureDecision = "";
+  sprayDurationMs = 0;
+  captureId = "";
+  captureImageUrl = "";
+
+  captureStopIndex = stepperStopIndex;
+  captureRounds = rounds;
+  captureDirection = directionLabel;
+
+  // Ensure plant/tunnel resolved
+  captureTunnelId = assignedTunnelId;
+  capturePlantId = currentPlantDocId;
+  captureRFID = currentRFID;
+  captureSide = currentRFIDSide;
+  capturePosition = currentPositionLabel;
+
+  pushDataToFirebase();
+  logScanEvent("CAPTURE_REQUESTED", currentPositionLabel + " stop#" + String(stepperStopIndex) + " rounds=" + String(rounds));
+}
+
+bool fetchDecisionForRequest(const String& reqId, String& outDecision, int& outSprayMs) {
+  if (!Firebase.ready()) return false;
+
+  String path = String(ROBOTS_COLLECTION) + "/" + String(ROBOT_ID);
+
+  if (!Firebase.Firestore.getDocument(&fbdo, FIREBASE_PROJECT_ID, "", path.c_str())) {
+    return false;
+  }
+
+  FirebaseJson json;
+  json.setJsonData(fbdo.payload().c_str());
+
+  FirebaseJsonData data;
+
+  json.get(data, "fields/captureRequestId/stringValue");
+  if (!data.success) return false;
+  String gotReq = data.to<String>();
+  if (gotReq != reqId) return false;
+
+  json.get(data, "fields/captureStatus/stringValue");
+  if (!data.success) return false;
+  String st = data.to<String>();
+  if (st != "DECIDED") return false;
+
+  json.get(data, "fields/captureDecision/stringValue");
+  outDecision = data.success ? data.to<String>() : "NO_SPRAY";
+
+  json.get(data, "fields/sprayDurationMs/integerValue");
+  outSprayMs = data.success ? data.to<int>() : 0;
+
+  return true;
+}
+
+void markCaptureDoneOnRobotDoc() {
+  captureStatus = "DONE";
+  pushDataToFirebase();
+}
+
+void sprayNow(int ms) {
+  if (ms <= 0) return;
+
+  actuatorStatus = "SPRAYING";
+  pushDataToFirebase();
+  logScanEvent("SPRAY_START", currentPositionLabel + " stop#" + String(stepperStopIndex) + " ms=" + String(ms));
+
+  // Pump ON
+  pump1On();
+
+  // Optional nozzle wiggle
+  nozzleServo.attach(SERVO_PIN, 500, 2400);
+  delay(100);
+
+  nozzleServo.write(SERVO_ANGLE_A);
+  delay(200);
+
+  if (ms >= 2000) {
+    nozzleServo.write(SERVO_ANGLE_B);
+    delay(ms - 400);
+    nozzleServo.write(SERVO_ANGLE_A);
+    delay(200);
+  } else {
+    delay(ms);
+  }
+
+  nozzleServo.detach();
+  pump1Off();
+
+  actuatorStatus = "OFF";
+  pushDataToFirebase();
+  logScanEvent("SPRAY_DONE", currentPositionLabel + " stop#" + String(stepperStopIndex));
+}
+
 
 // ------------------------- FIRESTORE WRITE FUNCTIONS -------------------------
 void updateRobotDoc() {
   if (!Firebase.ready()) return;
+
+  // Keep capture meta aligned to current state
+  captureTunnelId = assignedTunnelId;
+  capturePlantId = currentPlantDocId;
+  captureRFID = currentRFID;
+  captureSide = currentRFIDSide;
+  capturePosition = currentPositionLabel;
 
   String documentPath = String(ROBOTS_COLLECTION) + "/" + String(ROBOT_ID);
 
@@ -304,9 +438,30 @@ void updateRobotDoc() {
   content.set("fields/actuator/stringValue", actuatorStatus);
   content.set("fields/mode/stringValue", modeStr);
   content.set("fields/rssi/integerValue", (int)WiFi.RSSI());
+
+  // ---- Capture handshake fields ----
+  content.set("fields/captureStatus/stringValue", captureStatus);
+  content.set("fields/captureRequestId/stringValue", captureRequestId);
+  content.set("fields/captureDecision/stringValue", captureDecision);
+  content.set("fields/sprayDurationMs/integerValue", (int)sprayDurationMs);
+  content.set("fields/captureId/stringValue", captureId);
+  content.set("fields/captureImageUrl/stringValue", captureImageUrl);
+
+  content.set("fields/captureTunnelId/stringValue", captureTunnelId);
+  content.set("fields/capturePlantId/stringValue", capturePlantId);
+  content.set("fields/captureRFID/stringValue", captureRFID);
+  content.set("fields/captureSide/stringValue", captureSide);
+  content.set("fields/capturePosition/stringValue", capturePosition);
+  content.set("fields/captureStopIndex/integerValue", (int)captureStopIndex);
+  content.set("fields/captureRounds/integerValue", (int)captureRounds);
+  content.set("fields/captureDirection/stringValue", captureDirection);
+
   content.set("fields/updatedAt/timestampValue", nowRFC3339Z());
 
-  String mask = "robotId,assignedTunnelId,rfid,currentPosition,moving,scanning,actuator,mode,rssi,updatedAt";
+  String mask = "robotId,assignedTunnelId,rfid,currentPosition,moving,scanning,actuator,mode,rssi,"
+                "captureStatus,captureRequestId,captureDecision,sprayDurationMs,captureId,captureImageUrl,"
+                "captureTunnelId,capturePlantId,captureRFID,captureSide,capturePosition,captureStopIndex,captureRounds,captureDirection,"
+                "updatedAt";
 
   if (!Firebase.Firestore.patchDocument(&fbdo, FIREBASE_PROJECT_ID, "",
                                         documentPath.c_str(), content.raw(), mask.c_str())) {
@@ -408,11 +563,20 @@ void moveForwardToClearMarker() {
 
 void startStepperScanSequence() {
   Serial.println(">>> ENTERED startStepperScanSequence()");
-  movingForward = true;
-  nextStop = STEPS_PER_STOP;
-  stepperPauseActive = false;
-  stepperPauseUntil = 0;
-  stepperStopIndex = 0;
+
+  // Servo to 90 before stepper starts
+  if (!nozzleServo.attached()) {
+    nozzleServo.attach(SERVO_PIN, 500, 2400);
+    delay(100);
+  }
+  nozzleServo.write(SERVO_ANGLE_B);   // 90 deg
+  delay(500);
+
+movingForward = true;
+nextStop = STEPS_PER_STOP;
+stepperPauseActive = false;
+captureWaitActive = false;
+stepperStopIndex = 0;
 
   stepper.setCurrentPosition(0);
   stepper.moveTo(nextStop);
@@ -433,7 +597,7 @@ void startStepperScanSequence() {
   Serial.println(" rounds");
 
   pushDataToFirebase();
-  logScanEvent("STEPPER_SCAN_START", currentPositionLabel + " scan started");
+  logScanEvent("STEPPER_SCAN_START", currentPositionLabel + " scan started, servo=90");
 }
 
 void enterFinishedMode() {
@@ -445,6 +609,63 @@ void enterFinishedMode() {
   pushDataToFirebase();
   logScanEvent("FINISHED", "Position C complete. Robot stopped permanently");
   stopMotors();
+}
+
+
+void finalizePositionAfterScan() {
+  String donePos = currentPositionLabel;
+
+  if (nozzleServo.attached()) {
+    nozzleServo.detach();
+    delay(100);
+  }
+
+  mode = ACTUATION;
+  modeStr = "ACTUATION";
+  scanningStatus = "DONE";
+  robotMovingStatus = "STOPPED";
+  actuatorStatus = "OFF";
+  pushDataToFirebase();
+
+  logScanEvent("STEPPER_SCAN_DONE", donePos + " stepper returned to 0 (position scan done)");
+  logScanEvent("POSITION_DONE", donePos + " complete (decision + spray handled per stop)");
+
+  // If A/B/C all complete -> mark plant done and reset plant state
+  if (plantStopCount >= 3) {
+    updatePlantDocAfterAll();
+    logScanEvent("PLANT_DONE", "A/B/C complete. Plant finished.");
+
+    plantStopCount = 0;
+    currentPositionLabel = "NONE";
+    currentRFID = "NONE";
+    currentPlantDocId = "";
+    currentRFIDSide = "";
+    rfidDetected = false;
+    bothBlackLatched = false;
+  }
+
+  // Clear capture state
+  captureStatus = "IDLE";
+  captureRequestId = "";
+  captureDecision = "";
+  sprayDurationMs = 0;
+  captureId = "";
+  captureImageUrl = "";
+
+  pushDataToFirebase();
+
+  // Resume line following
+  robotMovingStatus = "MOVING";
+  scanningStatus = "IDLE";
+  actuatorStatus = "OFF";
+  mode = LINE_FOLLOW;
+  modeStr = "LINE_FOLLOW";
+  bothBlackLatched = false;
+  pushDataToFirebase();
+
+  logScanEvent("RESUME", "Resuming line follow after " + donePos);
+  Serial.println(">>> Moving to next position...");
+  moveForwardToClearMarker();
 }
 
 void runActuationSequence() {
@@ -536,37 +757,77 @@ void runActuationSequence() {
 }
 
 void handleStepperScanMode() {
-  
   modeStr = "STEPPER_SCAN";
   stopMotors();
 
+  // -------- Running to next stop --------
   if (!stepperPauseActive) {
     stepper.run();
 
     if (stepper.distanceToGo() == 0) {
+      // If we are returning and already at 0 -> scan complete for this position
+      if (!movingForward && stepper.currentPosition() == 0 && nextStop == 0) {
+        Serial.println("Stepper back at 0. Scan complete.");
+        logScanEvent("STEPPER_BACK_AT_ZERO", currentPositionLabel + " stepper returned to 0");
+        finalizePositionAfterScan();
+        return;
+      }
+
       stepperPauseActive = true;
-      stepperPauseUntil = millis() + STEPPER_STOP_PAUSE_MS;
+      captureWaitActive = true;
+      captureWaitStartMs = millis();
 
       stepperStopIndex++;
 
       long rounds = stepper.currentPosition() / MOTOR_STEPS_PER_REV;
-      String stepTag = currentPositionLabel + String(stepperStopIndex) + " Done";
+      String directionLabel = movingForward ? "FWD" : "BWD";
 
       Serial.print("Stop reached at ");
       Serial.print(rounds);
-      Serial.print(" rounds. Tag: ");
-      Serial.println(stepTag);
+      Serial.print(" rounds. StopIndex=");
+      Serial.println(stepperStopIndex);
 
-      String note = stepTag + " - reached " + String(rounds) + " rounds, pause 2s";
-      logScanEvent("STEPPER_STOP", note);
+      logScanEvent("STEPPER_STOP", currentPositionLabel + " stop#" + String(stepperStopIndex) + " rounds=" + String(rounds));
+
+      requestCaptureAtStop((int)rounds, directionLabel);
     }
     return;
   }
 
-  if (millis() < stepperPauseUntil) {
-    return;
+  // -------- Paused: waiting for ML decision --------
+  if (captureWaitActive) {
+    String decision = "";
+    int ms = 0;
+
+    bool decided = fetchDecisionForRequest(captureRequestId, decision, ms);
+
+    if (!decided) {
+      if (millis() - captureWaitStartMs > CAPTURE_WAIT_TIMEOUT_MS) {
+        decision = "NO_SPRAY";
+        ms = 0;
+        logScanEvent("CAPTURE_TIMEOUT", currentPositionLabel + " stop#" + String(stepperStopIndex) + " timeout, continue without spray");
+      } else {
+        delay(250); // small yield
+        return;
+      }
+    }
+
+    captureDecision = decision;
+    sprayDurationMs = ms;
+
+    // Apply decision
+    if (captureDecision == "SPRAY" && sprayDurationMs > 0) {
+      sprayNow(sprayDurationMs);
+    } else {
+      logScanEvent("NO_SPRAY", currentPositionLabel + " stop#" + String(stepperStopIndex));
+    }
+
+    markCaptureDoneOnRobotDoc();
+
+    captureWaitActive = false;
   }
 
+  // Done waiting -> continue to next stop
   stepperPauseActive = false;
 
   if (movingForward) {
@@ -577,22 +838,28 @@ void handleStepperScanMode() {
       Serial.print(nextStop / MOTOR_STEPS_PER_REV);
       Serial.println(" rounds");
 
-      String note = currentPositionLabel + " next forward target " +
-                    String(nextStop / MOTOR_STEPS_PER_REV) + " rounds";
-      logScanEvent("STEPPER_NEXT_FORWARD", note);
+      logScanEvent("STEPPER_NEXT_FORWARD", currentPositionLabel + " next forward target " + String(nextStop / MOTOR_STEPS_PER_REV) + " rounds");
 
       stepper.moveTo(nextStop);
       return;
-    } else {
-      movingForward = false;
-      nextStop -= STEPS_PER_STOP;
+        } else {
+  // Reached top, set servo to 40 before going down
+  if (!nozzleServo.attached()) {
+    nozzleServo.attach(SERVO_PIN, 500, 2400);
+    delay(100);
+  }
+  nozzleServo.write(SERVO_ANGLE_A);   // 40 deg
+  delay(500);
 
-      Serial.println("50 rounds reached. Switching to CCW.");
-      logScanEvent("STEPPER_SWITCH_CCW", currentPositionLabel + " reached 50 rounds, switching to CCW");
+  movingForward = false;
+  nextStop -= STEPS_PER_STOP;
 
-      stepper.moveTo(nextStop);
-      return;
-    }
+  Serial.println("50 rounds reached. Servo set to 40. Switching to CCW.");
+  logScanEvent("STEPPER_SWITCH_CCW", currentPositionLabel + " reached 50 rounds, servo=40, switching to CCW");
+
+  stepper.moveTo(nextStop);
+  return;
+}
   } else {
     if (nextStop > 0) {
       nextStop -= STEPS_PER_STOP;
@@ -601,17 +868,14 @@ void handleStepperScanMode() {
       Serial.print(nextStop / MOTOR_STEPS_PER_REV);
       Serial.println(" rounds");
 
-      String note = currentPositionLabel + " next backward target " +
-                    String(nextStop / MOTOR_STEPS_PER_REV) + " rounds";
-      logScanEvent("STEPPER_NEXT_BACKWARD", note);
+      logScanEvent("STEPPER_NEXT_BACKWARD", currentPositionLabel + " next backward target " + String(nextStop / MOTOR_STEPS_PER_REV) + " rounds");
 
       stepper.moveTo(nextStop);
       return;
     } else {
       Serial.println("Stepper back at 0. Scan complete.");
       logScanEvent("STEPPER_BACK_AT_ZERO", currentPositionLabel + " stepper returned to 0");
-
-      runActuationSequence();
+      finalizePositionAfterScan();
       return;
     }
   }
