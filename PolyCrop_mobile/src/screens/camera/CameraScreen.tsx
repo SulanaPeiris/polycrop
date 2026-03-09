@@ -12,8 +12,7 @@ import {
 } from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { Ionicons } from "@expo/vector-icons";
-import * as ImageManipulator from "expo-image-manipulator";
-import { collection, onSnapshot } from "firebase/firestore";
+import { collection, doc, onSnapshot, serverTimestamp, updateDoc } from "firebase/firestore";
 
 import { db } from "../../firebase/firebase";
 import { captureUploadAndProcess } from "../../services/capturePipeline";
@@ -33,38 +32,39 @@ type PlantListItem = {
   column?: number;
 };
 
-async function normalizeToPortraitJpeg(photo: any) {
-  // re-encode to remove EXIF orientation
-  let out = await ImageManipulator.manipulateAsync(photo.uri, [], {
-    compress: 0.9,
-    format: ImageManipulator.SaveFormat.JPEG,
-  });
-
-  // force portrait if still landscape
-  if (out.width > out.height) {
-    out = await ImageManipulator.manipulateAsync(out.uri, [{ rotate: -90 }], {
-      compress: 0.9,
-      format: ImageManipulator.SaveFormat.JPEG,
-    });
-  }
-  return out.uri;
-}
-
 export default function CameraScreen({ navigation }: any) {
   const cameraRef = useRef<CameraView>(null);
   const [permission, requestPermission] = useCameraPermissions();
   const [isReady, setIsReady] = useState(false);
 
+  // shared processing lock
   const [processing, setProcessing] = useState(false);
+  const processingRef = useRef(false);
+  useEffect(() => {
+    processingRef.current = processing;
+  }, [processing]);
+
+  // ✅ Auto capture ON by default
+  const [autoEnabled, setAutoEnabled] = useState(true);
+
+  // prevent duplicate handling
+  const [lastHandledRequestId, setLastHandledRequestId] = useState<string>("");
+  const lastHandledRequestIdRef = useRef("");
+  useEffect(() => {
+    lastHandledRequestIdRef.current = lastHandledRequestId;
+  }, [lastHandledRequestId]);
+
+  // manual result
   const [lastSummary, setLastSummary] = useState<ScanSummary | null>(null);
   const [lastStatus, setLastStatus] = useState<"IDLE" | "DONE" | "FAILED">("IDLE");
   const [lastCaptureId, setLastCaptureId] = useState<string>("");
 
-  // ✅ tunnels from context
+  // tunnels from context
   const { tunnels, selectedTunnelId, setSelectedTunnelId, selectedTunnel } = useTunnel();
   const tunnelId = selectedTunnel?.id ?? null;
+  const robotId = selectedTunnel?.robotId ?? "ROBOT_01";
 
-  // ✅ plant selection
+  // manual plant selection
   const [plantId, setPlantId] = useState<string>(""); // doc id: r1_c2
   const [plants, setPlants] = useState<PlantListItem[]>([]);
   const [plantsLoading, setPlantsLoading] = useState(false);
@@ -79,9 +79,9 @@ export default function CameraScreen({ navigation }: any) {
     if (!permission.granted) requestPermission();
   }, [permission]);
 
-  // ✅ load plants for selected tunnel
+  // ✅ load plants for selected tunnel (manual mode)
   useEffect(() => {
-    setPlantId(""); // reset when tunnel changes
+    setPlantId("");
     setPlantSearch("");
     setPlants([]);
 
@@ -104,7 +104,6 @@ export default function CameraScreen({ navigation }: any) {
           } as PlantListItem;
         });
 
-        // stable sort by row/col
         list.sort((a, b) => ((a.row ?? 0) - (b.row ?? 0)) || ((a.column ?? 0) - (b.column ?? 0)));
         setPlants(list);
         setPlantsLoading(false);
@@ -136,7 +135,109 @@ export default function CameraScreen({ navigation }: any) {
     return `${p.plantUid ?? p.id} (${p.id})`;
   }, [plantId, plants]);
 
-  const handleCapture = async () => {
+  // ✅ AUTO CAPTURE: listens to Firestore robots/{robotId}
+  useEffect(() => {
+    if (!robotId) return;
+
+    const rref = doc(db, "robots", robotId);
+
+    const unsub = onSnapshot(
+      rref,
+      async (snap) => {
+        if (!snap.exists()) return;
+        if (!autoEnabled) return;
+
+        const r: any = snap.data();
+        const status = r.captureStatus ?? "";
+        const requestId = r.captureRequestId ?? "";
+
+        // We only act on REQUESTED
+        if (status !== "REQUESTED") return;
+        if (!requestId) return;
+
+        // prevent duplicates
+        if (requestId === lastHandledRequestIdRef.current) return;
+        if (processingRef.current) return;
+        if (!isReady) return;
+
+        // Use robot-provided tunnel/plant if available (better)
+        const reqTunnelId = r.captureTunnelId ?? tunnelId;
+        const reqPlantId = r.capturePlantId ?? null;
+
+        if (!reqTunnelId || !reqPlantId) {
+          // Don’t block robot forever
+          try {
+            await updateDoc(rref, {
+              captureStatus: "DECIDED",
+              captureDecision: "NO_SPRAY",
+              sprayDurationMs: 0,
+              updatedAt: serverTimestamp(),
+            });
+          } catch {}
+          return;
+        }
+
+        try {
+          setProcessing(true);
+          setLastHandledRequestId(requestId);
+
+          // take photo (fast)
+          // @ts-ignore
+          const photo = await cameraRef.current?.takePictureAsync?.({
+            quality: 0.8,
+            exif: false,
+            skipProcessing: true,
+          });
+
+          if (!photo?.uri) throw new Error("No photo captured");
+
+          const payload = await captureUploadAndProcess({
+            photoUri: photo.uri, // ✅ capturePipeline will resize/compress to 768px 0.7
+            tunnelId: reqTunnelId,
+            plantId: reqPlantId,
+            robotId,
+            requestId,
+
+            rfid: r.captureRFID ?? null,
+            side: r.captureSide ?? null,
+            positionLabel: r.capturePosition ?? null,
+            stopIndex: typeof r.captureStopIndex === "number" ? r.captureStopIndex : null,
+            rounds: typeof r.captureRounds === "number" ? r.captureRounds : null,
+            direction: r.captureDirection ?? null,
+          });
+
+          // ACK robot: capture uploaded (backend will set RTDB command and/or Firestore DECIDED)
+          await updateDoc(rref, {
+            captureStatus: "CAPTURED",
+            captureId: payload.captureId,
+            captureImageUrl: payload.imageUrl ?? null,
+            updatedAt: serverTimestamp(),
+          });
+        } catch (e: any) {
+          console.log("AUTO CAPTURE ERROR:", e?.message, e);
+          Alert.alert("Auto capture failed", e?.message ?? "Unknown error");
+
+          // ensure robot doesn't wait forever
+          try {
+            await updateDoc(rref, {
+              captureStatus: "DECIDED",
+              captureDecision: "NO_SPRAY",
+              sprayDurationMs: 0,
+              updatedAt: serverTimestamp(),
+            });
+          } catch {}
+        } finally {
+          setProcessing(false);
+        }
+      },
+      (err) => console.log("robot listener error:", err)
+    );
+
+    return () => unsub();
+  }, [robotId, tunnelId, isReady, autoEnabled]);
+
+  // ✅ MANUAL CAPTURE (uses selected tunnel/plant)
+  const handleManualCapture = async () => {
     try {
       setProcessing(true);
       setLastSummary(null);
@@ -148,7 +249,7 @@ export default function CameraScreen({ navigation }: any) {
         return;
       }
       if (!plantId.trim()) {
-        Alert.alert("Select plant", "Please select a plant (or type a plant id like r1_c2) for testing.");
+        Alert.alert("Select plant", "Please select a plant (or type a plant id like r1_c2).");
         return;
       }
 
@@ -156,16 +257,15 @@ export default function CameraScreen({ navigation }: any) {
       const photo = await cameraRef.current?.takePictureAsync?.({
         quality: 0.8,
         exif: false,
-        skipProcessing: false,
+        skipProcessing: true,
       });
 
       if (!photo?.uri) throw new Error("No photo captured");
-      const normalizedUri = await normalizeToPortraitJpeg(photo);
 
       const payload = await captureUploadAndProcess({
-        photoUri: normalizedUri,
+        photoUri: photo.uri, // ✅ capturePipeline will resize/compress to 768px 0.7
         tunnelId,
-        plantId: plantId.trim(), // ✅ assigned
+        plantId: plantId.trim(),
         robotId: null,
         requestId: null,
         rfid: null,
@@ -177,12 +277,11 @@ export default function CameraScreen({ navigation }: any) {
       });
 
       const summary = payload?.outputs?.summary ?? null;
-
       setLastSummary(summary);
       setLastCaptureId(payload.captureId);
       setLastStatus("DONE");
     } catch (e: any) {
-      console.log("CAPTURE ERROR:", e?.message, e);
+      console.log("MANUAL CAPTURE ERROR:", e?.message, e);
       setLastStatus("FAILED");
       Alert.alert("Scan failed", e?.message ?? "Unknown error");
     } finally {
@@ -218,61 +317,75 @@ export default function CameraScreen({ navigation }: any) {
     <View style={styles.container}>
       <CameraView ref={cameraRef} style={styles.camera} facing="back" onCameraReady={() => setIsReady(true)} />
 
-      {/* ✅ Testing assignment controls */}
+      {/* Combined Info */}
       <View style={styles.infoCard}>
-        <Text style={styles.infoTitle}>Manual Test Capture</Text>
+        <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+          <Text style={styles.infoTitle}>Camera</Text>
 
-        {/* Tunnel selector */}
-        <View style={styles.row}>
-          <Text style={styles.infoText}>
-            Tunnel: {selectedTunnel?.name ?? selectedTunnel?.tunnelName ?? "Not selected"}
-          </Text>
-          <TouchableOpacity onPress={() => setShowTunnelModal(true)} disabled={processing} style={styles.smallBtn}>
-            <Text style={styles.smallBtnText}>Change</Text>
-          </TouchableOpacity>
-        </View>
-
-        {/* Plant selector */}
-        <View style={[styles.row, { marginTop: 8 }]}>
-          <Text style={styles.infoText} numberOfLines={1}>
-            Plant: {selectedPlantLabel}
-          </Text>
           <TouchableOpacity
-            onPress={() => setShowPlantModal(true)}
-            disabled={processing || !tunnelId}
-            style={[styles.smallBtn, (!tunnelId || plantsLoading) && { opacity: 0.6 }]}
+            style={[styles.autoToggle, { backgroundColor: autoEnabled ? "#2E7D32" : "rgba(255,255,255,0.15)" }]}
+            onPress={() => setAutoEnabled((v) => !v)}
+            disabled={processing}
           >
-            <Text style={styles.smallBtnText}>{plantsLoading ? "Loading..." : "Pick"}</Text>
+            <Ionicons name={autoEnabled ? "radio" : "radio-outline"} size={16} color="#fff" />
+            <Text style={styles.autoToggleText}>{autoEnabled ? "AUTO ON" : "AUTO OFF"}</Text>
           </TouchableOpacity>
         </View>
 
-        <TextInput
-          value={plantId}
-          onChangeText={setPlantId}
-          placeholder="Or type plant id (e.g. r1_c2)"
-          placeholderTextColor="rgba(255,255,255,0.55)"
-          autoCapitalize="none"
-          style={styles.input}
-          editable={!processing}
-        />
+        <Text style={styles.infoText}>Tunnel: {selectedTunnel?.name ?? selectedTunnel?.tunnelName ?? "N/A"}</Text>
+        <Text style={styles.infoText}>Robot: {robotId}</Text>
 
-        {/* Status */}
-        <View style={{ marginTop: 10 }}>
-          <Text style={styles.infoText}>Status:</Text>
+        {processing ? (
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 10, marginTop: 8 }}>
+            <ActivityIndicator color="#fff" />
+            <Text style={styles.infoText}>Capturing + Uploading + Detecting…</Text>
+          </View>
+        ) : autoEnabled ? (
+          <Text style={styles.good}>Waiting for robot stop…</Text>
+        ) : (
+          <Text style={styles.infoText}>Auto capture is OFF (manual only)</Text>
+        )}
 
-          {processing ? (
-            <View style={{ flexDirection: "row", alignItems: "center", gap: 10, marginTop: 6 }}>
-              <ActivityIndicator color="#fff" />
-              <Text style={styles.infoText}>Uploading + Detecting…</Text>
-            </View>
-          ) : lastStatus === "DONE" ? (
+        {/* Manual assignment row */}
+        <View style={{ marginTop: 12, borderTopWidth: 1, borderTopColor: "rgba(255,255,255,0.15)", paddingTop: 10 }}>
+          <Text style={[styles.infoTitle, { fontSize: 13 }]}>Manual Test</Text>
+
+          <View style={styles.row}>
+            <Text style={styles.infoText} numberOfLines={1}>
+              Plant: {selectedPlantLabel}
+            </Text>
+
+            <TouchableOpacity onPress={() => setShowTunnelModal(true)} disabled={processing} style={styles.smallBtn}>
+              <Text style={styles.smallBtnText}>Tunnel</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              onPress={() => setShowPlantModal(true)}
+              disabled={processing || !tunnelId}
+              style={[styles.smallBtn, (!tunnelId || plantsLoading) && { opacity: 0.6 }]}
+            >
+              <Text style={styles.smallBtnText}>{plantsLoading ? "Loading" : "Plant"}</Text>
+            </TouchableOpacity>
+          </View>
+
+          <TextInput
+            value={plantId}
+            onChangeText={setPlantId}
+            placeholder="Or type plant id (e.g. r1_c2)"
+            placeholderTextColor="rgba(255,255,255,0.55)"
+            autoCapitalize="none"
+            style={styles.input}
+            editable={!processing}
+          />
+
+          {lastStatus === "DONE" ? (
             <>
-              <Text style={styles.good}>✅ Scan Complete</Text>
+              <Text style={styles.good}>✅ Manual Scan Complete</Text>
               <Text style={styles.infoText}>Cucumber: {cuc} • Leaf: {leaf} • Flower: {flower}</Text>
 
               {!!lastCaptureId && (
                 <TouchableOpacity
-                  style={[styles.resultBtn]}
+                  style={styles.resultBtn}
                   onPress={() => navigation.navigate("ScanPreview", { captureId: lastCaptureId })}
                 >
                   <Ionicons name="image-outline" size={16} color="#fff" />
@@ -281,10 +394,8 @@ export default function CameraScreen({ navigation }: any) {
               )}
             </>
           ) : lastStatus === "FAILED" ? (
-            <Text style={styles.bad}>❌ Scan Failed</Text>
-          ) : (
-            <Text style={styles.infoText}>Press capture to scan.</Text>
-          )}
+            <Text style={styles.bad}>❌ Manual Scan Failed</Text>
+          ) : null}
         </View>
       </View>
 
@@ -294,8 +405,9 @@ export default function CameraScreen({ navigation }: any) {
           <Ionicons name="close" size={28} color="#fff" />
         </TouchableOpacity>
 
+        {/* Shutter = manual capture */}
         <TouchableOpacity
-          onPress={handleCapture}
+          onPress={handleManualCapture}
           disabled={!isReady || processing}
           style={[styles.shutter, (!isReady || processing) && { opacity: 0.5 }]}
         />
@@ -316,8 +428,8 @@ export default function CameraScreen({ navigation }: any) {
 
             <FlatList
               data={tunnels}
-              keyExtractor={(t) => t.id}
-              renderItem={({ item }) => {
+              keyExtractor={(t: any) => t.id}
+              renderItem={({ item }: any) => {
                 const active = item.id === selectedTunnelId;
                 return (
                   <TouchableOpacity
@@ -382,7 +494,7 @@ export default function CameraScreen({ navigation }: any) {
             />
 
             <TouchableOpacity
-              style={[styles.clearBtn]}
+              style={styles.clearBtn}
               onPress={() => {
                 setPlantId("");
                 setShowPlantModal(false);
@@ -414,10 +526,23 @@ const styles = StyleSheet.create({
   },
   infoTitle: { color: "#fff", fontWeight: "900", marginBottom: 8, fontSize: 15 },
   infoText: { color: "#fff", fontWeight: "700", marginTop: 4, flex: 1 },
-  good: { color: "#00E676", fontWeight: "900", marginTop: 8 },
-  bad: { color: "#FF5252", fontWeight: "900", marginTop: 8 },
+  good: { color: "#00E676", fontWeight: "900", marginTop: 10 },
+  bad: { color: "#FF5252", fontWeight: "900", marginTop: 10 },
 
-  row: { flexDirection: "row", alignItems: "center", gap: 10 },
+  autoToggle: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.2)",
+  },
+  autoToggleText: { color: "#fff", fontWeight: "900", fontSize: 12 },
+
+  row: { flexDirection: "row", alignItems: "center", gap: 10, marginTop: 8 },
+
   smallBtn: {
     paddingHorizontal: 10,
     paddingVertical: 8,
