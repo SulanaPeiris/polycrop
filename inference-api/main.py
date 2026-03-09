@@ -3,6 +3,7 @@ from pydantic import BaseModel
 import io
 import urllib.parse
 import uuid
+import time
 from typing import Dict, List, Any, Optional
 
 import numpy as np
@@ -11,10 +12,15 @@ from PIL import Image, ImageOps
 from ultralytics import YOLO
 
 import firebase_admin
-from firebase_admin import credentials, firestore, storage
+from firebase_admin import credentials, firestore, storage, db as rtdb
 
 # ====== CONFIG ======
 BUCKET_NAME = "polycrop.firebasestorage.app"
+
+# ✅ IMPORTANT: put your Realtime Database URL here
+# Example:
+# DATABASE_URL = "https://polycrop-default-rtdb.asia-southeast1.firebasedatabase.app"
+DATABASE_URL = "https://polycrop-default-rtdb.asia-southeast1.firebasedatabase.app"
 
 # Per-model thresholds
 CONF_CUCUMBER = 0.35
@@ -25,7 +31,13 @@ CONF_DISEASE = 0.25  # disease seg model
 # Overlay alpha (0..1)
 DISEASE_ALPHA = 0.45
 
-# Disease class colors (BGR for OpenCV)
+# ====== CUCUMBER SIZE / RIPENESS CONFIG ======
+DEFAULT_BASE_DISTANCE_CM = 80.0
+RIPE_MIN_LENGTH_CM = 18.0
+RIPE_MAX_LENGTH_CM = 22.0
+RIPE_MIN_DIAMETER_CM = 3.0
+RIPE_MAX_DIAMETER_CM = 5.5
+
 DISEASE_COLORS_BGR = {
     "downy_mildew": (0, 255, 255),
     "powdery_mildew": (255, 0, 255),
@@ -35,13 +47,15 @@ DISEASE_COLORS_BGR = {
 # ====== Firebase Admin init ======
 if not firebase_admin._apps:
     cred = credentials.Certificate("serviceAccountKey.json")
-    firebase_admin.initialize_app(cred, {"storageBucket": BUCKET_NAME})
+    firebase_admin.initialize_app(cred, {
+        "storageBucket": BUCKET_NAME,
+        "databaseURL": DATABASE_URL
+    })
 
 db = firestore.client()
 bucket = storage.bucket()
 
-app = FastAPI(title="PolyCrop Processor (YOLO + Disease Seg + Robot Decision)")
-
+app = FastAPI(title="PolyCrop Processor (YOLO + Disease Seg + Annotated Upload + RTDB Decision)")
 
 # ====== Load YOLO models ======
 yolo_cucumber = YOLO("weights/best.pt")
@@ -52,6 +66,38 @@ yolo_disease = YOLO("weights/disease_detection_v2.pt")  # YOLOv8-seg
 
 class ProcessRequest(BaseModel):
     captureId: str
+
+
+def safe_float(x) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def load_camera_calibration(tunnel_id: Optional[str], meta: dict) -> dict:
+    calib = (meta.get("cameraCalib") or {}) if isinstance(meta, dict) else {}
+    if tunnel_id:
+        try:
+            t_snap = db.collection("tunnels").document(tunnel_id).get()
+            if t_snap.exists:
+                t = t_snap.to_dict() or {}
+                t_calib = t.get("cameraCalib") or t.get("cameraCalibration") or {}
+                if isinstance(t_calib, dict):
+                    for k, v in t_calib.items():
+                        calib.setdefault(k, v)
+        except Exception:
+            pass
+
+    base_distance = safe_float(calib.get("baseDistanceCm"))
+    cm_per_px = safe_float(calib.get("cmPerPxAtBaseDistance"))
+
+    return {
+        "baseDistanceCm": base_distance if base_distance is not None else DEFAULT_BASE_DISTANCE_CM,
+        "cmPerPxAtBaseDistance": cm_per_px,
+    }
 
 
 def run_yolo_boxes(model: YOLO, pil_img: Image.Image, conf=0.25):
@@ -83,6 +129,78 @@ def clamp_box(box, w, h):
     if y2 <= y1:
         y2 = min(h, y1 + 1)
     return x1, y1, x2, y2
+
+
+def pick_primary_det(dets: List[dict]) -> Optional[dict]:
+    if not dets:
+        return None
+
+    def score(d: dict) -> float:
+        x1, y1, x2, y2 = d.get("box", [0, 0, 0, 0])
+        area = max(0.0, (x2 - x1)) * max(0.0, (y2 - y1))
+        conf = float(d.get("conf", 0.0) or 0.0)
+        return area * (0.5 + conf)
+
+    return max(dets, key=score)
+
+
+def compute_cucumber_size_and_ripeness(cuc_dets, img_w, img_h, distance_cm, calib) -> dict:
+    primary = pick_primary_det(cuc_dets)
+    if not primary:
+        return {"available": False, "reason": "no_cucumber_detected", "distanceCm": distance_cm}
+
+    x1, y1, x2, y2 = clamp_box(primary["box"], img_w, img_h)
+    px_w = max(1, x2 - x1)
+    px_h = max(1, y2 - y1)
+    length_px = float(max(px_w, px_h))
+    diameter_px = float(min(px_w, px_h))
+
+    out = {
+        "available": True,
+        "distanceCm": distance_cm,
+        "primaryBox": [int(x1), int(y1), int(x2), int(y2)],
+        "primaryConf": float(primary.get("conf", 0.0) or 0.0),
+        "pixel": {"lengthPx": length_px, "diameterPx": diameter_px, "bboxW": int(px_w), "bboxH": int(px_h)},
+        "calibration": {
+            "baseDistanceCm": float(calib.get("baseDistanceCm") or DEFAULT_BASE_DISTANCE_CM),
+            "cmPerPxAtBaseDistance": calib.get("cmPerPxAtBaseDistance"),
+        },
+    }
+
+    cm_per_px_base = safe_float(calib.get("cmPerPxAtBaseDistance"))
+    if distance_cm is None:
+        out.update({"cm": None, "ripe": None, "reason": "missing_distanceCm"})
+        return out
+    if cm_per_px_base is None:
+        out.update({"cm": None, "ripe": None, "reason": "missing_camera_calibration"})
+        return out
+
+    base_distance = float(calib.get("baseDistanceCm") or DEFAULT_BASE_DISTANCE_CM)
+    cm_per_px = cm_per_px_base * (float(distance_cm) / base_distance)
+
+    length_cm = length_px * cm_per_px
+    diameter_cm = diameter_px * cm_per_px
+
+    ripe = (
+        RIPE_MIN_LENGTH_CM <= length_cm <= RIPE_MAX_LENGTH_CM
+        and RIPE_MIN_DIAMETER_CM <= diameter_cm <= RIPE_MAX_DIAMETER_CM
+    )
+
+    out.update({
+        "cm": {
+            "cmPerPx": round(cm_per_px, 6),
+            "lengthCm": round(length_cm, 2),
+            "diameterCm": round(diameter_cm, 2),
+        },
+        "ripe": bool(ripe),
+        "rules": {
+            "minLengthCm": RIPE_MIN_LENGTH_CM,
+            "maxLengthCm": RIPE_MAX_LENGTH_CM,
+            "minDiameterCm": RIPE_MIN_DIAMETER_CM,
+            "maxDiameterCm": RIPE_MAX_DIAMETER_CM,
+        },
+    })
+    return out
 
 
 def upload_with_permanent_url(path: str, jpg_bytes: bytes):
@@ -150,7 +268,6 @@ def run_disease_on_leaf_crops(pil_img: Image.Image, leaf_dets: List[dict], conf=
         leaf_area = float(leaf_w * leaf_h)
 
         crop = pil_img.crop((x1, y1, x2, y2))
-
         r = yolo_disease.predict(crop, conf=conf, verbose=False)[0]
 
         leaf_disease_area_by_name: Dict[str, float] = {}
@@ -199,6 +316,18 @@ def run_disease_on_leaf_crops(pil_img: Image.Image, leaf_dets: List[dict], conf=
     return per_leaf, overlay, diseases_found
 
 
+def write_robot_command(robot_id: str, request_id: str, decision: str, spray_ms: int):
+    ref = rtdb.reference(f"robots/{robot_id}/command")
+    ref.set({
+        "robotId": robot_id,
+        "requestId": request_id,
+        "decision": decision,               # SPRAY | NO_SPRAY
+        "sprayDurationMs": int(spray_ms),
+        "state": "DECIDED",
+        "updatedAtMs": int(time.time() * 1000),
+    })
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -222,6 +351,8 @@ def process(req: ProcessRequest):
     robot_id: Optional[str] = meta.get("robotId")
     request_id: Optional[str] = meta.get("requestId")
 
+    distance_cm = safe_float(meta.get("distanceCm"))
+
     # 1) Download original image bytes from Storage
     src_blob = bucket.blob(storage_path)
     img_bytes = src_blob.download_as_bytes()
@@ -244,7 +375,6 @@ def process(req: ProcessRequest):
     # 4) Compose annotated image
     img_bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
-    # ✅ SAFE BLEND (no crash when mask is empty)
     blended = img_bgr.copy()
     if disease_overlay is not None:
         mask_any = disease_overlay.sum(axis=2) > 0
@@ -278,11 +408,14 @@ def process(req: ProcessRequest):
     annotated_storage_path, annotated_url = upload_with_permanent_url(annotated_path, annotated_bytes)
 
     # 5) Build outputs + spray decision
-    SPRAY_SEVERITY_THRESHOLD = 3.0
+    SPRAY_SEVERITY_THRESHOLD = 0.5
     spray_recommended = any((x.get("totalSeverityPercent", 0.0) >= SPRAY_SEVERITY_THRESHOLD) for x in per_leaf)
 
     decision = "SPRAY" if spray_recommended else "NO_SPRAY"
-    spray_duration_ms = 3000 if spray_recommended else 0  # tune
+    spray_duration_ms = 3000 if spray_recommended else 0
+
+    calib = load_camera_calibration(tunnel_id, meta)
+    cucumber_size = compute_cucumber_size_and_ripeness(cuc, w, h, distance_cm, calib)
 
     outputs = {
         "image": {"width": w, "height": h},
@@ -292,6 +425,7 @@ def process(req: ProcessRequest):
             "legend": [{ "name": it["name"], "colorBGR": list(it["color_bgr"]) } for it in legend_items],
             "threshold": CONF_DISEASE
         },
+        "cucumber": cucumber_size,
         "summary": {
             "diseases": disease_names_sorted,
             "sprayRecommended": spray_recommended,
@@ -325,14 +459,13 @@ def process(req: ProcessRequest):
             "lastScanAt": firestore.SERVER_TIMESTAMP,
             "lastCaptureId": req.captureId,
             "lastAnnotatedUrl": annotated_url,
-            "diseaseDetected": spray_recommended,  # ✅ better signal
+            "diseaseDetected": spray_recommended,
             "lastDiseases": disease_names_sorted,
             "lastCounts": outputs["summary"]["counts"],
             "lastSprayRecommended": spray_recommended,
             "updatedAt": firestore.SERVER_TIMESTAMP,
         }, merge=True)
 
-        # mirror capture under plant subcollection (if exists, merge)
         plant_cap_ref = plant_ref.collection("captures").document(req.captureId)
         plant_cap_ref.set({
             "captureId": req.captureId,
@@ -343,10 +476,10 @@ def process(req: ProcessRequest):
             "updatedAt": firestore.SERVER_TIMESTAMP,
         }, merge=True)
 
-    # 8) Update robot decision so ESP32 can continue
+    # 8) Robot decision to Firestore (keep) + RTDB (NEW)
     if robot_id and request_id:
+        # Firestore (keep old behavior)
         robot_ref = db.collection("robots").document(robot_id)
-
         robot_ref.set({
             "robotId": robot_id,
             "captureStatus": "DECIDED",
@@ -355,6 +488,9 @@ def process(req: ProcessRequest):
             "sprayDurationMs": spray_duration_ms,
             "updatedAt": firestore.SERVER_TIMESTAMP,
         }, merge=True)
+
+        # ✅ RTDB fast lane (robot listens)
+        write_robot_command(robot_id, request_id, decision, spray_duration_ms)
 
     return {
         "captureId": req.captureId,

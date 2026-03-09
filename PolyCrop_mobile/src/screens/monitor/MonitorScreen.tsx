@@ -1,3 +1,4 @@
+// src/screens/monitor/MonitorScreen.tsx
 import React, { useEffect, useMemo, useState } from "react";
 import { ScrollView, Text, View, StyleSheet, TouchableOpacity, Dimensions } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
@@ -32,6 +33,8 @@ function fmtTime(ts: any) {
   return `${hh}:${mm}`;
 }
 
+type Level = "OK" | "WARN" | "FAULT";
+
 export default function MonitorScreen() {
   const { selectedTunnel } = useTunnel();
   useTunnelHeader("Monitor");
@@ -41,9 +44,9 @@ export default function MonitorScreen() {
 
   const [summary, setSummary] = useState<any>(null);
   const [readings, setReadings] = useState<any[]>([]);
-  const [fault, setFault] = useState<string | null>(null);
+  const [banner, setBanner] = useState<{ level: Level; msg: string } | null>(null);
 
-  // ✅ live summary (fast UI)
+  // live summary
   useEffect(() => {
     if (!tunnelId) {
       setSummary(null);
@@ -59,17 +62,13 @@ export default function MonitorScreen() {
     );
   }, [tunnelId]);
 
-  // ✅ last 24 readings for charts
+  // last 24 readings for charts
   useEffect(() => {
     if (!tunnelId) {
       setReadings([]);
       return;
     }
-    const q = query(
-      collection(db, "tunnels", tunnelId, "loraReadings"),
-      orderBy("ts", "desc"),
-      limit(24)
-    );
+    const q = query(collection(db, "tunnels", tunnelId, "loraReadings"), orderBy("ts", "desc"), limit(24));
     return onSnapshot(
       q,
       (snap) => setReadings(snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) })).reverse()),
@@ -80,29 +79,37 @@ export default function MonitorScreen() {
     );
   }, [tunnelId]);
 
-  // ✅ fault detection if no updates
+  // anomaly banner logic
   useEffect(() => {
-    const lastSeenMs = tsToMs(summary?.lastSeenAt);
     if (!tunnelId) {
-      setFault("No tunnel selected.");
+      setBanner({ level: "FAULT", msg: "No tunnel selected." });
       return;
     }
+
+    const lastSeenMs = tsToMs(summary?.lastSeenAt);
     if (!lastSeenMs) {
-      setFault("No LoRa data yet. Assign receiver gateway to this tunnel.");
+      setBanner({ level: "FAULT", msg: "No LoRa data yet. Assign gateway to this tunnel." });
       return;
     }
-    const diff = Date.now() - lastSeenMs;
-    setFault(diff > 60_000 ? "LoRa data timeout (no updates > 60s)" : null);
-  }, [summary?.lastSeenAt, tunnelId]);
+
+    const timeout = Date.now() - lastSeenMs > 60_000;
+    if (timeout) {
+      setBanner({ level: "FAULT", msg: "LoRa timeout: no updates > 60 seconds." });
+      return;
+    }
+
+    const anLevel: Level = (summary?.an_level as Level) || "OK";
+    const anMsg: string = summary?.an_message || "";
+
+    if (anLevel === "FAULT") setBanner({ level: "FAULT", msg: anMsg || "Sensor fault detected." });
+    else if (anLevel === "WARN") setBanner({ level: "WARN", msg: anMsg || "Sensor mismatch detected." });
+    else setBanner(null);
+  }, [summary?.lastSeenAt, summary?.an_level, summary?.an_message, tunnelId]);
 
   const avgTemp = summary?.avg_temp ?? null;
   const avgHum = summary?.avg_hum ?? null;
 
-  const labels = useMemo(() => {
-    if (!readings.length) return [];
-    return readings.map((r, idx) => (idx % 4 === 0 ? fmtTime(r.ts) : ""));
-  }, [readings]);
-
+  const labels = useMemo(() => readings.map((r, idx) => (idx % 4 === 0 ? fmtTime(r.ts) : "")), [readings]);
   const tempSeries = useMemo(() => readings.map((r) => Number(r.avg_temp ?? 0)), [readings]);
   const humSeries = useMemo(() => readings.map((r) => Number(r.avg_hum ?? 0)), [readings]);
 
@@ -120,44 +127,45 @@ export default function MonitorScreen() {
     navigation.navigate("SensorDetails", { title, sensorId });
   };
 
-  // simple status tag
-  const tempStatus = avgTemp == null ? "—" : avgTemp >= 18 && avgTemp <= 30 ? "Optimal" : "Attention";
-  const humStatus = avgHum == null ? "—" : avgHum >= 50 && avgHum <= 85 ? "Good" : "Attention";
+  const bannerColors =
+    banner?.level === "FAULT"
+      ? ["#FFEBEE", "#FFCDD2"]
+      : banner?.level === "WARN"
+      ? ["#FFF8E1", "#FFECB3"]
+      : ["#E8F5E9", "#C8E6C9"];
+
+  const bannerIconColor = banner?.level === "FAULT" ? "#D32F2F" : "#FB8C00";
 
   return (
     <ScrollView contentContainerStyle={styles.container}>
-      {/* 1. Sensor Fault Alert */}
-      {fault && (
+      {/* Anomaly Banner */}
+      {banner && (
         <View style={styles.anomalyBanner}>
-          <LinearGradient
-            colors={["#FFEBEE", "#FFCDD2"]}
-            style={styles.anomalyGradient}
-            start={{ x: 0, y: 0 }}
-            end={{ x: 1, y: 0 }}
-          >
+          <LinearGradient colors={bannerColors as any} style={styles.anomalyGradient} start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }}>
             <View style={styles.anomalyContent}>
               <View style={styles.anomalyIcon}>
-                <Ionicons name="warning" size={24} color="#D32F2F" />
+                <Ionicons name="warning" size={24} color={bannerIconColor} />
               </View>
               <View style={{ flex: 1 }}>
-                <Text style={styles.anomalyTitle}>Sensor Fault Detected!</Text>
-                <Text style={styles.anomalyText}>{fault}</Text>
+                <Text style={styles.anomalyTitle}>
+                  {banner.level === "FAULT" ? "Sensor Fault Detected!" : "Sensor Warning"}
+                </Text>
+                <Text style={styles.anomalyText}>{banner.msg}</Text>
                 <TouchableOpacity onPress={() => navigateToDetail("Sensor Fault", "fault-001")}>
                   <Text style={styles.actionText}>View Technical Details →</Text>
                 </TouchableOpacity>
               </View>
-              <TouchableOpacity onPress={() => setFault(null)}>
-                <Ionicons name="close" size={20} color="#D32F2F" />
+              <TouchableOpacity onPress={() => setBanner(null)}>
+                <Ionicons name="close" size={20} color={bannerIconColor} />
               </TouchableOpacity>
             </View>
           </LinearGradient>
         </View>
       )}
 
-      {/* 2. Live Sensors Grid */}
+      {/* Live Sensors */}
       <SectionTitle title="Live Sensors" />
       <View style={styles.grid}>
-        {/* Temperature */}
         <TouchableOpacity style={styles.sensorCard} activeOpacity={0.9} onPress={() => navigateToDetail("Temperature Sensor", "temp-001")}>
           <View style={[styles.iconCircle, { backgroundColor: "#FFF3E0" }]}>
             <Ionicons name="thermometer-outline" size={28} color="#EF6C00" />
@@ -166,12 +174,8 @@ export default function MonitorScreen() {
             <Text style={styles.sensorValue}>{avgTemp != null ? `${avgTemp.toFixed(1)}°C` : "—"}</Text>
             <Text style={styles.sensorLabel}>Temperature (Avg)</Text>
           </View>
-          <View style={styles.statusTag}>
-            <Text style={styles.statusText}>{tempStatus}</Text>
-          </View>
         </TouchableOpacity>
 
-        {/* Humidity */}
         <TouchableOpacity style={styles.sensorCard} activeOpacity={0.9} onPress={() => navigateToDetail("Humidity Sensor", "hum-001")}>
           <View style={[styles.iconCircle, { backgroundColor: "#E1F5FE" }]}>
             <Ionicons name="water-outline" size={28} color="#0288D1" />
@@ -180,13 +184,10 @@ export default function MonitorScreen() {
             <Text style={styles.sensorValue}>{avgHum != null ? `${avgHum.toFixed(1)}%` : "—"}</Text>
             <Text style={styles.sensorLabel}>Humidity (Avg)</Text>
           </View>
-          <View style={[styles.statusTag, { backgroundColor: "#E1F5FE" }]}>
-            <Text style={[styles.statusText, { color: "#0288D1" }]}>{humStatus}</Text>
-          </View>
         </TouchableOpacity>
       </View>
 
-      {/* 3. Analytics Charts */}
+      {/* Charts */}
       <SectionTitle title="24 readings Trends" />
 
       <Card>
@@ -212,20 +213,7 @@ export default function MonitorScreen() {
           style={styles.chart}
         />
       </Card>
-<SectionTitle title="LoRa / Gateways" />
 
-<TouchableOpacity
-  style={styles.zoneBtn}
-  onPress={() => navigation.navigate("ZoneNodes")}
-  activeOpacity={0.85}
->
-  <Ionicons name="git-network-outline" size={22} color="#2E7D32" />
-  <View style={{ flex: 1 }}>
-    <Text style={styles.zoneBtnTitle}>Zones / Nodes</Text>
-    <Text style={styles.zoneBtnSub}>Assign LoRa receiver gateway to this tunnel</Text>
-  </View>
-  <Ionicons name="chevron-forward" size={20} color="#BDBDBD" />
-</TouchableOpacity>
       <View style={{ height: 100 }} />
     </ScrollView>
   );
@@ -234,64 +222,20 @@ export default function MonitorScreen() {
 const styles = StyleSheet.create({
   container: { padding: 16, paddingTop: 10 },
 
-  anomalyBanner: {
-    marginBottom: 20,
-    borderRadius: 16,
-    overflow: "hidden",
-    elevation: 4,
-    shadowColor: "#D32F2F",
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.2,
-    shadowRadius: 8,
-  },
+  anomalyBanner: { marginBottom: 20, borderRadius: 16, overflow: "hidden", elevation: 4, shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.2, shadowRadius: 8 },
   anomalyGradient: { padding: 16 },
   anomalyContent: { flexDirection: "row", alignItems: "center", gap: 12 },
-  anomalyIcon: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: "rgba(255,255,255,0.6)",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  anomalyTitle: { fontSize: 16, fontWeight: "800", color: "#B71C1C" },
-  anomalyText: { fontSize: 14, color: "#C62828", marginTop: 2 },
-  actionText: { fontSize: 14, fontWeight: "700", color: "#B71C1C", marginTop: 8, textDecorationLine: "underline" },
+  anomalyIcon: { width: 40, height: 40, borderRadius: 20, backgroundColor: "rgba(255,255,255,0.6)", alignItems: "center", justifyContent: "center" },
+  anomalyTitle: { fontSize: 16, fontWeight: "800", color: "#333" },
+  anomalyText: { fontSize: 14, color: "#555", marginTop: 2 },
+  actionText: { fontSize: 14, fontWeight: "700", color: "#333", marginTop: 8, textDecorationLine: "underline" },
 
   grid: { flexDirection: "row", gap: 12, marginBottom: 24 },
-  sensorCard: {
-    flex: 1,
-    backgroundColor: "#fff",
-    borderRadius: 20,
-    padding: 16,
-    alignItems: "flex-start",
-    justifyContent: "space-between",
-    height: 160,
-    elevation: 2,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.05,
-    shadowRadius: 8,
-  },
+  sensorCard: { flex: 1, backgroundColor: "#fff", borderRadius: 20, padding: 16, height: 150, elevation: 2 },
   iconCircle: { width: 48, height: 48, borderRadius: 24, alignItems: "center", justifyContent: "center", marginBottom: 12 },
   sensorValue: { fontSize: 28, fontWeight: "800", color: "#212121" },
   sensorLabel: { fontSize: 14, color: "#757575", fontWeight: "600" },
-  statusTag: { position: "absolute", top: 16, right: 16, backgroundColor: "#FFF3E0", paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8 },
-  statusText: { fontSize: 12, fontWeight: "700", color: "#EF6C00" },
 
   chartTitle: { fontSize: 18, fontWeight: "700", color: "#37474F", marginBottom: 16 },
   chart: { marginVertical: 8, borderRadius: 16 },
-
-  zoneBtn: {
-  flexDirection: "row",
-  alignItems: "center",
-  gap: 12,
-  backgroundColor: "#fff",
-  padding: 16,
-  borderRadius: 18,
-  elevation: 1,
-  marginBottom: 20,
-},
-zoneBtnTitle: { fontSize: 15, fontWeight: "800", color: "#333" },
-zoneBtnSub: { fontSize: 12, color: "#757575", marginTop: 2, fontWeight: "600" },
 });

@@ -9,10 +9,10 @@ export type RootStackParamList = {
   SensorDetails: { sensorId: string; title: string };
   ZoneNodes: undefined;
 
-  // Disease
+  // Disease ✅ captureId not imageId
   DiseaseDashboard: undefined;
   DetectionFeed: undefined;
-  DetectionDetail: { imageId: string };
+  DetectionDetail: { tunnelId: string; plantId: string; captureId?: string };
 
   // Alerts
   AlertDetail: { alertId: string };

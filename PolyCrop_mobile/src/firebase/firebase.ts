@@ -4,6 +4,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { getAuth } from "firebase/auth";
 import { getStorage } from "firebase/storage";
 import { initializeFirestore } from "firebase/firestore";
+import { getDatabase } from "firebase/database";
 
 // ✅ runtime imports (avoid TS export issues)
 const { initializeAuth, getReactNativePersistence } = require("firebase/auth");
@@ -15,6 +16,8 @@ const firebaseConfig = {
   storageBucket: "polycrop.firebasestorage.app",
   messagingSenderId: "777956730981",
   appId: "1:777956730981:web:ed0a6e4f2d3b2d00d1fe8c",
+   // ✅ add this (RTDB URL from console)
+  databaseURL: "https://polycrop-default-rtdb.asia-southeast1.firebasedatabase.app"
 };
 
 const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
@@ -35,3 +38,6 @@ export const db = initializeFirestore(app, {
 
 // ✅ For profile photo uploads
 export const storage = getStorage(app);
+
+// ✅ RTDB
+export const rtdb = getDatabase(app);

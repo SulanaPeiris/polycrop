@@ -1,22 +1,46 @@
-import React, { useEffect, useRef, useState } from "react";
-import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, Alert } from "react-native";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View,
+  Text,
+  TouchableOpacity,
+  StyleSheet,
+  ActivityIndicator,
+  Alert,
+  Modal,
+  TextInput,
+  FlatList,
+} from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { Ionicons } from "@expo/vector-icons";
 import * as ImageManipulator from "expo-image-manipulator";
-import { doc, onSnapshot, serverTimestamp, updateDoc } from "firebase/firestore";
+import { collection, onSnapshot } from "firebase/firestore";
 
 import { db } from "../../firebase/firebase";
 import { captureUploadAndProcess } from "../../services/capturePipeline";
 import { useTunnel } from "../../context/TunnelContext";
 
+type ScanSummary = {
+  counts?: { cucumber?: number; leaf?: number; flower?: number };
+  sprayRecommended?: boolean;
+  diseases?: string[];
+};
+
+type PlantListItem = {
+  id: string; // doc id (e.g. r1_c2)
+  plantUid?: string;
+  plantName?: string;
+  row?: number;
+  column?: number;
+};
+
 async function normalizeToPortraitJpeg(photo: any) {
-  // Remove EXIF orientation by re-encoding
+  // re-encode to remove EXIF orientation
   let out = await ImageManipulator.manipulateAsync(photo.uri, [], {
     compress: 0.9,
     format: ImageManipulator.SaveFormat.JPEG,
   });
 
-  // Force portrait if still landscape
+  // force portrait if still landscape
   if (out.width > out.height) {
     out = await ImageManipulator.manipulateAsync(out.uri, [{ rotate: -90 }], {
       compress: 0.9,
@@ -32,104 +56,101 @@ export default function CameraScreen({ navigation }: any) {
   const [isReady, setIsReady] = useState(false);
 
   const [processing, setProcessing] = useState(false);
-  const [lastHandledRequestId, setLastHandledRequestId] = useState<string>("");
+  const [lastSummary, setLastSummary] = useState<ScanSummary | null>(null);
+  const [lastStatus, setLastStatus] = useState<"IDLE" | "DONE" | "FAILED">("IDLE");
+  const [lastCaptureId, setLastCaptureId] = useState<string>("");
 
-  const { selectedTunnel } = useTunnel();
+  // ✅ tunnels from context
+  const { tunnels, selectedTunnelId, setSelectedTunnelId, selectedTunnel } = useTunnel();
   const tunnelId = selectedTunnel?.id ?? null;
-  const robotId = selectedTunnel?.robotId ?? "ROBOT_01";
+
+  // ✅ plant selection
+  const [plantId, setPlantId] = useState<string>(""); // doc id: r1_c2
+  const [plants, setPlants] = useState<PlantListItem[]>([]);
+  const [plantsLoading, setPlantsLoading] = useState(false);
+
+  // pickers
+  const [showTunnelModal, setShowTunnelModal] = useState(false);
+  const [showPlantModal, setShowPlantModal] = useState(false);
+  const [plantSearch, setPlantSearch] = useState("");
 
   useEffect(() => {
     if (!permission) return;
     if (!permission.granted) requestPermission();
   }, [permission]);
 
-  // ✅ Auto capture when robot requests it
+  // ✅ load plants for selected tunnel
   useEffect(() => {
-    if (!robotId) return;
+    setPlantId(""); // reset when tunnel changes
+    setPlantSearch("");
+    setPlants([]);
 
-    const rref = doc(db, "robots", robotId);
+    if (!tunnelId) return;
+
+    setPlantsLoading(true);
+    const ref = collection(db, "tunnels", tunnelId, "plants");
+
     const unsub = onSnapshot(
-      rref,
-      async (snap) => {
-        if (!snap.exists()) return;
-        const r: any = snap.data();
+      ref,
+      (snap) => {
+        const list = snap.docs.map((d) => {
+          const data: any = d.data();
+          return {
+            id: d.id,
+            plantUid: data.plantUid,
+            plantName: data.plantName,
+            row: data.row,
+            column: data.column,
+          } as PlantListItem;
+        });
 
-        const status = r.captureStatus ?? "";
-        const requestId = r.captureRequestId ?? "";
-
-        if (status !== "REQUESTED") return;
-        if (!requestId) return;
-
-        if (requestId === lastHandledRequestId) return;
-        if (processing) return;
-        if (!isReady) return;
-
-        const plantId = r.capturePlantId ?? null;
-
-        try {
-          setProcessing(true);
-          setLastHandledRequestId(requestId);
-
-          // Take photo
-          // @ts-ignore
-          const photo = await cameraRef.current?.takePictureAsync?.({
-            quality: 0.8,
-            exif: false,
-            skipProcessing: false,
-          });
-
-          if (!photo?.uri) throw new Error("No photo captured");
-          const normalizedUri = await normalizeToPortraitJpeg(photo);
-
-          const payload = await captureUploadAndProcess({
-            photoUri: normalizedUri,
-            tunnelId,
-            plantId,
-
-            robotId,
-            requestId,
-
-            rfid: r.captureRFID ?? null,
-            side: r.captureSide ?? null,
-            positionLabel: r.capturePosition ?? null,
-            stopIndex: typeof r.captureStopIndex === "number" ? r.captureStopIndex : null,
-            rounds: typeof r.captureRounds === "number" ? r.captureRounds : null,
-            direction: r.captureDirection ?? null,
-          });
-
-          // ACK robot: capture is ready (backend will later set DECIDED)
-          await updateDoc(rref, {
-            captureStatus: "CAPTURED",
-            captureId: payload.captureId,
-            captureImageUrl: payload.imageUrl ?? null,
-            updatedAt: serverTimestamp(),
-          });
-        } catch (e: any) {
-          console.log("AUTO CAPTURE ERROR:", e?.message, e);
-          Alert.alert("Auto capture failed", e?.message ?? "Unknown error");
-
-          // Ensure robot doesn't wait forever
-          try {
-            await updateDoc(rref, {
-              captureStatus: "DECIDED",
-              captureDecision: "NO_SPRAY",
-              sprayDurationMs: 0,
-              updatedAt: serverTimestamp(),
-            });
-          } catch {}
-        } finally {
-          setProcessing(false);
-        }
+        // stable sort by row/col
+        list.sort((a, b) => ((a.row ?? 0) - (b.row ?? 0)) || ((a.column ?? 0) - (b.column ?? 0)));
+        setPlants(list);
+        setPlantsLoading(false);
       },
-      (err) => console.log("robot listener error:", err)
+      (err) => {
+        console.log("plants snapshot error:", err?.code, err?.message);
+        setPlantsLoading(false);
+      }
     );
 
     return () => unsub();
-  }, [robotId, tunnelId, isReady, processing, lastHandledRequestId]);
+  }, [tunnelId]);
 
-  const handleManualCapture = async () => {
+  const filteredPlants = useMemo(() => {
+    const q = plantSearch.trim().toLowerCase();
+    if (!q) return plants;
+    return plants.filter((p) => {
+      const a = (p.id ?? "").toLowerCase();
+      const b = (p.plantUid ?? "").toLowerCase();
+      const c = (p.plantName ?? "").toLowerCase();
+      return a.includes(q) || b.includes(q) || c.includes(q);
+    });
+  }, [plants, plantSearch]);
+
+  const selectedPlantLabel = useMemo(() => {
+    if (!plantId) return "Not selected";
+    const p = plants.find((x) => x.id === plantId);
+    if (!p) return plantId;
+    return `${p.plantUid ?? p.id} (${p.id})`;
+  }, [plantId, plants]);
+
+  const handleCapture = async () => {
     try {
       setProcessing(true);
+      setLastSummary(null);
+      setLastStatus("IDLE");
+      setLastCaptureId("");
+
+      if (!tunnelId) {
+        Alert.alert("Select tunnel", "Please select a tunnel first.");
+        return;
+      }
+      if (!plantId.trim()) {
+        Alert.alert("Select plant", "Please select a plant (or type a plant id like r1_c2) for testing.");
+        return;
+      }
 
       // @ts-ignore
       const photo = await cameraRef.current?.takePictureAsync?.({
@@ -141,23 +162,29 @@ export default function CameraScreen({ navigation }: any) {
       if (!photo?.uri) throw new Error("No photo captured");
       const normalizedUri = await normalizeToPortraitJpeg(photo);
 
-      await captureUploadAndProcess({
+      const payload = await captureUploadAndProcess({
         photoUri: normalizedUri,
         tunnelId,
-        plantId: null,
+        plantId: plantId.trim(), // ✅ assigned
         robotId: null,
         requestId: null,
         rfid: null,
         side: null,
-        positionLabel: null,
+        positionLabel: "MANUAL",
         stopIndex: null,
         rounds: null,
         direction: null,
       });
 
-      Alert.alert("Done", "Manual capture processed.");
+      const summary = payload?.outputs?.summary ?? null;
+
+      setLastSummary(summary);
+      setLastCaptureId(payload.captureId);
+      setLastStatus("DONE");
     } catch (e: any) {
-      Alert.alert("Capture failed", e?.message ?? "Unknown error");
+      console.log("CAPTURE ERROR:", e?.message, e);
+      setLastStatus("FAILED");
+      Alert.alert("Scan failed", e?.message ?? "Unknown error");
     } finally {
       setProcessing(false);
     }
@@ -182,43 +209,190 @@ export default function CameraScreen({ navigation }: any) {
     );
   }
 
+  const c = lastSummary?.counts ?? {};
+  const cuc = c.cucumber ?? 0;
+  const leaf = c.leaf ?? 0;
+  const flower = c.flower ?? 0;
+
   return (
     <View style={styles.container}>
-      <CameraView
-        ref={cameraRef}
-        style={styles.camera}
-        facing="back"
-        onCameraReady={() => setIsReady(true)}
-      />
+      <CameraView ref={cameraRef} style={styles.camera} facing="back" onCameraReady={() => setIsReady(true)} />
 
+      {/* ✅ Testing assignment controls */}
       <View style={styles.infoCard}>
-        <Text style={styles.infoTitle}>Robot Auto Capture</Text>
-        <Text style={styles.infoText}>Tunnel: {selectedTunnel?.name ?? selectedTunnel?.tunnelName ?? "N/A"}</Text>
-        <Text style={styles.infoText}>Robot: {robotId}</Text>
+        <Text style={styles.infoTitle}>Manual Test Capture</Text>
 
-        {processing ? (
-          <View style={{ flexDirection: "row", alignItems: "center", gap: 10, marginTop: 8 }}>
-            <ActivityIndicator color="#fff" />
-            <Text style={styles.infoText}>Capturing + Uploading + Detecting…</Text>
-          </View>
-        ) : (
-          <Text style={styles.good}>Waiting for robot stop…</Text>
-        )}
+        {/* Tunnel selector */}
+        <View style={styles.row}>
+          <Text style={styles.infoText}>
+            Tunnel: {selectedTunnel?.name ?? selectedTunnel?.tunnelName ?? "Not selected"}
+          </Text>
+          <TouchableOpacity onPress={() => setShowTunnelModal(true)} disabled={processing} style={styles.smallBtn}>
+            <Text style={styles.smallBtnText}>Change</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* Plant selector */}
+        <View style={[styles.row, { marginTop: 8 }]}>
+          <Text style={styles.infoText} numberOfLines={1}>
+            Plant: {selectedPlantLabel}
+          </Text>
+          <TouchableOpacity
+            onPress={() => setShowPlantModal(true)}
+            disabled={processing || !tunnelId}
+            style={[styles.smallBtn, (!tunnelId || plantsLoading) && { opacity: 0.6 }]}
+          >
+            <Text style={styles.smallBtnText}>{plantsLoading ? "Loading..." : "Pick"}</Text>
+          </TouchableOpacity>
+        </View>
+
+        <TextInput
+          value={plantId}
+          onChangeText={setPlantId}
+          placeholder="Or type plant id (e.g. r1_c2)"
+          placeholderTextColor="rgba(255,255,255,0.55)"
+          autoCapitalize="none"
+          style={styles.input}
+          editable={!processing}
+        />
+
+        {/* Status */}
+        <View style={{ marginTop: 10 }}>
+          <Text style={styles.infoText}>Status:</Text>
+
+          {processing ? (
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 10, marginTop: 6 }}>
+              <ActivityIndicator color="#fff" />
+              <Text style={styles.infoText}>Uploading + Detecting…</Text>
+            </View>
+          ) : lastStatus === "DONE" ? (
+            <>
+              <Text style={styles.good}>✅ Scan Complete</Text>
+              <Text style={styles.infoText}>Cucumber: {cuc} • Leaf: {leaf} • Flower: {flower}</Text>
+
+              {!!lastCaptureId && (
+                <TouchableOpacity
+                  style={[styles.resultBtn]}
+                  onPress={() => navigation.navigate("ScanPreview", { captureId: lastCaptureId })}
+                >
+                  <Ionicons name="image-outline" size={16} color="#fff" />
+                  <Text style={styles.resultBtnText}>View Result</Text>
+                </TouchableOpacity>
+              )}
+            </>
+          ) : lastStatus === "FAILED" ? (
+            <Text style={styles.bad}>❌ Scan Failed</Text>
+          ) : (
+            <Text style={styles.infoText}>Press capture to scan.</Text>
+          )}
+        </View>
       </View>
 
+      {/* Controls */}
       <View style={styles.controls}>
         <TouchableOpacity onPress={() => navigation.goBack()} style={styles.controlBtn} disabled={processing}>
           <Ionicons name="close" size={28} color="#fff" />
         </TouchableOpacity>
 
         <TouchableOpacity
-          onPress={handleManualCapture}
+          onPress={handleCapture}
           disabled={!isReady || processing}
           style={[styles.shutter, (!isReady || processing) && { opacity: 0.5 }]}
         />
 
         <View style={{ width: 56 }} />
       </View>
+
+      {/* Tunnel picker modal */}
+      <Modal visible={showTunnelModal} transparent animationType="slide" onRequestClose={() => setShowTunnelModal(false)}>
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Select Tunnel</Text>
+              <TouchableOpacity onPress={() => setShowTunnelModal(false)}>
+                <Ionicons name="close-circle" size={28} color="#9E9E9E" />
+              </TouchableOpacity>
+            </View>
+
+            <FlatList
+              data={tunnels}
+              keyExtractor={(t) => t.id}
+              renderItem={({ item }) => {
+                const active = item.id === selectedTunnelId;
+                return (
+                  <TouchableOpacity
+                    style={[styles.modalItem, active && styles.modalItemActive]}
+                    onPress={() => {
+                      setSelectedTunnelId(item.id);
+                      setShowTunnelModal(false);
+                    }}
+                  >
+                    <Text style={[styles.modalItemText, active && { color: "#fff" }]}>
+                      {item.name ?? item.tunnelName ?? "Tunnel"}
+                    </Text>
+                    {active ? <Ionicons name="checkmark" size={18} color="#fff" /> : null}
+                  </TouchableOpacity>
+                );
+              }}
+            />
+          </View>
+        </View>
+      </Modal>
+
+      {/* Plant picker modal */}
+      <Modal visible={showPlantModal} transparent animationType="slide" onRequestClose={() => setShowPlantModal(false)}>
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Select Plant</Text>
+              <TouchableOpacity onPress={() => setShowPlantModal(false)}>
+                <Ionicons name="close-circle" size={28} color="#9E9E9E" />
+              </TouchableOpacity>
+            </View>
+
+            <TextInput
+              value={plantSearch}
+              onChangeText={setPlantSearch}
+              placeholder="Search (r1_c2, Plant name, UID)"
+              style={styles.search}
+              editable={!processing}
+            />
+
+            <FlatList
+              data={filteredPlants}
+              keyExtractor={(p) => p.id}
+              renderItem={({ item }) => {
+                const active = item.id === plantId;
+                return (
+                  <TouchableOpacity
+                    style={[styles.modalItem, active && styles.modalItemActive]}
+                    onPress={() => {
+                      setPlantId(item.id);
+                      setShowPlantModal(false);
+                    }}
+                  >
+                    <Text style={[styles.modalItemText, active && { color: "#fff" }]}>
+                      {item.plantUid ?? item.id} • {item.id}
+                    </Text>
+                    {active ? <Ionicons name="checkmark" size={18} color="#fff" /> : null}
+                  </TouchableOpacity>
+                );
+              }}
+              ListEmptyComponent={<Text style={{ color: "#757575", padding: 12 }}>No plants found.</Text>}
+            />
+
+            <TouchableOpacity
+              style={[styles.clearBtn]}
+              onPress={() => {
+                setPlantId("");
+                setShowPlantModal(false);
+              }}
+            >
+              <Text style={{ fontWeight: "900", color: "#757575" }}>Clear Plant</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -238,9 +412,45 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "rgba(255,255,255,0.15)",
   },
-  infoTitle: { color: "#fff", fontWeight: "900", marginBottom: 8 },
-  infoText: { color: "#fff", fontWeight: "700", marginTop: 4 },
-  good: { color: "#00E676", fontWeight: "900", marginTop: 10 },
+  infoTitle: { color: "#fff", fontWeight: "900", marginBottom: 8, fontSize: 15 },
+  infoText: { color: "#fff", fontWeight: "700", marginTop: 4, flex: 1 },
+  good: { color: "#00E676", fontWeight: "900", marginTop: 8 },
+  bad: { color: "#FF5252", fontWeight: "900", marginTop: 8 },
+
+  row: { flexDirection: "row", alignItems: "center", gap: 10 },
+  smallBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 12,
+    backgroundColor: "rgba(255,255,255,0.15)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.2)",
+  },
+  smallBtnText: { color: "#fff", fontWeight: "900", fontSize: 12 },
+
+  input: {
+    marginTop: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: "rgba(255,255,255,0.12)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.18)",
+    color: "#fff",
+    fontWeight: "800",
+  },
+
+  resultBtn: {
+    marginTop: 10,
+    backgroundColor: "#2E7D32",
+    borderRadius: 14,
+    paddingVertical: 10,
+    flexDirection: "row",
+    gap: 8,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  resultBtnText: { color: "#fff", fontWeight: "900" },
 
   controls: {
     position: "absolute",
@@ -271,4 +481,49 @@ const styles = StyleSheet.create({
 
   center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 18 },
   btn: { backgroundColor: "#1E88E5", paddingHorizontal: 16, paddingVertical: 12, borderRadius: 12 },
+
+  // modals
+  modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.45)", justifyContent: "flex-end" },
+  modalCard: {
+    backgroundColor: "#fff",
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    padding: 16,
+    maxHeight: "75%",
+  },
+  modalHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 10 },
+  modalTitle: { fontSize: 16, fontWeight: "900", color: "#1B5E20" },
+
+  modalItem: {
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    borderRadius: 14,
+    backgroundColor: "#F5F5F5",
+    marginBottom: 10,
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  modalItemActive: { backgroundColor: "#2E7D32" },
+  modalItemText: { fontWeight: "900", color: "#333" },
+
+  search: {
+    backgroundColor: "#F5F5F5",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#E0E0E0",
+    padding: 12,
+    marginBottom: 12,
+    fontWeight: "800",
+  },
+
+  clearBtn: {
+    marginTop: 8,
+    paddingVertical: 12,
+    borderRadius: 14,
+    backgroundColor: "#FAFAFA",
+    borderWidth: 1,
+    borderColor: "#EEE",
+    alignItems: "center",
+  },
 });
