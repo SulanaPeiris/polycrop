@@ -1,9 +1,6 @@
 import { addDoc, collection, doc, getDoc, serverTimestamp, setDoc, updateDoc } from "firebase/firestore";
 import { getDownloadURL, ref, uploadBytes } from "firebase/storage";
-import { get, ref as rtdbRef } from "firebase/database";
-import * as ImageManipulator from "expo-image-manipulator";
-
-import { auth, db, storage, rtdb } from "../firebase/firebase";
+import { auth, db, storage } from "../firebase/firebase";
 
 const INFER_URL = process.env.EXPO_PUBLIC_INFER_URL;
 
@@ -22,41 +19,9 @@ function makeRequestId() {
   return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
-// ✅ Resize/compress BEFORE upload (768px JPEG 0.7)
-async function compressForUpload(uri: string): Promise<string> {
-  // resize to width=768 (keeps aspect ratio)
-  const out = await ImageManipulator.manipulateAsync(
-    uri,
-    [{ resize: { width: 768 } }],
-    { compress: 0.7, format: ImageManipulator.SaveFormat.JPEG }
-  );
-
-  // optional: force portrait if needed
-  if (out.width > out.height) {
-    const rotated = await ImageManipulator.manipulateAsync(
-      out.uri,
-      [{ rotate: -90 }],
-      { compress: 0.7, format: ImageManipulator.SaveFormat.JPEG }
-    );
-    return rotated.uri;
-  }
-
-  return out.uri;
-}
-
-// ✅ read robot requestId from RTDB (so phone + backend + robot match)
-async function readRobotRequestIdFromRTDB(robotId: string): Promise<string | null> {
-  try {
-    const snap = await get(rtdbRef(rtdb, `robots/${robotId}/status/captureRequestId`));
-    if (snap.exists()) return String(snap.val());
-    return null;
-  } catch (e: any) {
-    console.log("RTDB requestId read failed:", e?.message);
-    return null;
-  }
-}
-
 async function waitUltrasonicDistanceCm(requestId?: string | null, timeoutMs = 900): Promise<number | null> {
+  // 1) Prefer a per-request doc if you later create it:
+  // ultrasonicReadingsByRequest/{requestId} { distanceCm }
   const start = Date.now();
 
   if (requestId) {
@@ -67,18 +32,24 @@ async function waitUltrasonicDistanceCm(requestId?: string | null, timeoutMs = 9
           const d: any = snap.data();
           if (typeof d?.distanceCm === "number") return d.distanceCm;
         }
-      } catch {}
+      } catch {
+        // ignore
+      }
       await new Promise((r) => setTimeout(r, 150));
     }
   }
 
+  // 2) Fallback to latest always-updated doc:
+  // ultrasonicReadings/reading_latest { distanceCm }
   try {
     const latest = await getDoc(doc(db, "ultrasonicReadings", "reading_latest"));
     if (latest.exists()) {
       const d: any = latest.data();
       if (typeof d?.distanceCm === "number") return d.distanceCm;
     }
-  } catch {}
+  } catch {
+    // ignore
+  }
 
   return null;
 }
@@ -111,33 +82,21 @@ export async function captureUploadAndProcess(params: {
   const tunnelId = params.tunnelId ?? null;
   const plantId = params.plantId ?? null;
 
-  // ✅ requestId priority:
-  // 1) use params.requestId if passed (robot provided)
-  // 2) else if robotId exists, read from RTDB status
-  // 3) else generate new
-  let requestId = params.requestId ?? null;
+  // ✅ Ensure requestId exists (important for linking sensor readings)
+  const requestId = (params.requestId ?? makeRequestId()).toString();
 
-  if (!requestId && params.robotId) {
-    const fromRTDB = await readRobotRequestIdFromRTDB(params.robotId);
-    if (fromRTDB) requestId = fromRTDB;
-  }
-
-  if (!requestId) requestId = makeRequestId();
-  requestId = requestId.toString();
-
-  // ✅ read ultrasonic using requestId (optional)
+  // ✅ Read ultrasonic distance at capture time
   const distanceCm = await waitUltrasonicDistanceCm(requestId);
 
-  // ✅ compress BEFORE upload
-  const compressedUri = await compressForUpload(params.photoUri);
-  const blob = await uriToBlob(compressedUri);
+  // 1) Upload ORIGINAL image to Firebase Storage
+  const blob = await uriToBlob(params.photoUri);
 
   const basePath =
     tunnelId && plantId
       ? `tunnels/${tunnelId}/plants/${plantId}/captures`
       : `users/${user.uid}/captures`;
 
-  // file name uses requestId for traceability
+  // file key: use requestId for traceability
   const storagePath = `${basePath}/${requestId}.jpg`;
   const storageRef = ref(storage, storagePath);
 
@@ -151,6 +110,7 @@ export async function captureUploadAndProcess(params: {
     imageUrl,
     storagePath,
 
+    // optional convenience field (still keep it in meta too)
     distanceCm: distanceCm ?? null,
 
     annotatedUrl: null,
@@ -171,6 +131,7 @@ export async function captureUploadAndProcess(params: {
       rounds: params.rounds ?? null,
       direction: params.direction ?? null,
 
+      // ✅ main.py reads this
       distanceCm: distanceCm ?? null,
     },
 
