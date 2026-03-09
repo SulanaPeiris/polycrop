@@ -1,6 +1,9 @@
-import { addDoc, collection, doc, serverTimestamp, setDoc, updateDoc } from "firebase/firestore";
+import { addDoc, collection, doc, getDoc, serverTimestamp, setDoc, updateDoc } from "firebase/firestore";
 import { getDownloadURL, ref, uploadBytes } from "firebase/storage";
-import { auth, db, storage } from "../firebase/firebase";
+import { get, ref as rtdbRef } from "firebase/database";
+import * as ImageManipulator from "expo-image-manipulator";
+
+import { auth, db, storage, rtdb } from "../firebase/firebase";
 
 const INFER_URL = process.env.EXPO_PUBLIC_INFER_URL;
 
@@ -13,6 +16,71 @@ function uriToBlob(uri: string): Promise<Blob> {
     xhr.open("GET", uri, true);
     xhr.send(null);
   });
+}
+
+function makeRequestId() {
+  return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+// ✅ Resize/compress BEFORE upload (768px JPEG 0.7)
+async function compressForUpload(uri: string): Promise<string> {
+  // resize to width=768 (keeps aspect ratio)
+  const out = await ImageManipulator.manipulateAsync(
+    uri,
+    [{ resize: { width: 768 } }],
+    { compress: 0.7, format: ImageManipulator.SaveFormat.JPEG }
+  );
+
+  // optional: force portrait if needed
+  if (out.width > out.height) {
+    const rotated = await ImageManipulator.manipulateAsync(
+      out.uri,
+      [{ rotate: -90 }],
+      { compress: 0.7, format: ImageManipulator.SaveFormat.JPEG }
+    );
+    return rotated.uri;
+  }
+
+  return out.uri;
+}
+
+// ✅ read robot requestId from RTDB (so phone + backend + robot match)
+async function readRobotRequestIdFromRTDB(robotId: string): Promise<string | null> {
+  try {
+    const snap = await get(rtdbRef(rtdb, `robots/${robotId}/status/captureRequestId`));
+    if (snap.exists()) return String(snap.val());
+    return null;
+  } catch (e: any) {
+    console.log("RTDB requestId read failed:", e?.message);
+    return null;
+  }
+}
+
+async function waitUltrasonicDistanceCm(requestId?: string | null, timeoutMs = 900): Promise<number | null> {
+  const start = Date.now();
+
+  if (requestId) {
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const snap = await getDoc(doc(db, "ultrasonicReadingsByRequest", requestId));
+        if (snap.exists()) {
+          const d: any = snap.data();
+          if (typeof d?.distanceCm === "number") return d.distanceCm;
+        }
+      } catch {}
+      await new Promise((r) => setTimeout(r, 150));
+    }
+  }
+
+  try {
+    const latest = await getDoc(doc(db, "ultrasonicReadings", "reading_latest"));
+    if (latest.exists()) {
+      const d: any = latest.data();
+      if (typeof d?.distanceCm === "number") return d.distanceCm;
+    }
+  } catch {}
+
+  return null;
 }
 
 /**
@@ -30,7 +98,7 @@ export async function captureUploadAndProcess(params: {
 
   rfid?: string | null;
   side?: string | null; // "A" | "B"
-  positionLabel?: string | null; // A/B/C
+  positionLabel?: string | null; // A/B/C or MANUAL
   stopIndex?: number | null;
   rounds?: number | null;
   direction?: string | null; // FWD/BWD
@@ -43,28 +111,47 @@ export async function captureUploadAndProcess(params: {
   const tunnelId = params.tunnelId ?? null;
   const plantId = params.plantId ?? null;
 
-  // 1) Upload ORIGINAL image to Firebase Storage
-  const blob = await uriToBlob(params.photoUri);
+  // ✅ requestId priority:
+  // 1) use params.requestId if passed (robot provided)
+  // 2) else if robotId exists, read from RTDB status
+  // 3) else generate new
+  let requestId = params.requestId ?? null;
+
+  if (!requestId && params.robotId) {
+    const fromRTDB = await readRobotRequestIdFromRTDB(params.robotId);
+    if (fromRTDB) requestId = fromRTDB;
+  }
+
+  if (!requestId) requestId = makeRequestId();
+  requestId = requestId.toString();
+
+  // ✅ read ultrasonic using requestId (optional)
+  const distanceCm = await waitUltrasonicDistanceCm(requestId);
+
+  // ✅ compress BEFORE upload
+  const compressedUri = await compressForUpload(params.photoUri);
+  const blob = await uriToBlob(compressedUri);
 
   const basePath =
     tunnelId && plantId
       ? `tunnels/${tunnelId}/plants/${plantId}/captures`
       : `users/${user.uid}/captures`;
 
-  const fileKey = params.requestId ? params.requestId : String(Date.now());
-  const storagePath = `${basePath}/${fileKey}.jpg`;
-
+  // file name uses requestId for traceability
+  const storagePath = `${basePath}/${requestId}.jpg`;
   const storageRef = ref(storage, storagePath);
 
   await uploadBytes(storageRef, blob, { contentType: "image/jpeg" });
   const imageUrl = await getDownloadURL(storageRef);
 
-  // 2) Create Firestore doc FIRST
+  // 2) Create Firestore capture doc FIRST
   const capRef = await addDoc(collection(db, "captures"), {
     ownerId: user.uid,
     status: "UPLOADED",
     imageUrl,
     storagePath,
+
+    distanceCm: distanceCm ?? null,
 
     annotatedUrl: null,
     annotatedStoragePath: null,
@@ -73,14 +160,18 @@ export async function captureUploadAndProcess(params: {
     meta: {
       tunnelId,
       plantId,
+
       robotId: params.robotId ?? null,
-      requestId: params.requestId ?? null,
+      requestId,
+
       rfid: params.rfid ?? null,
       side: params.side ?? null,
       positionLabel: params.positionLabel ?? null,
       stopIndex: params.stopIndex ?? null,
       rounds: params.rounds ?? null,
       direction: params.direction ?? null,
+
+      distanceCm: distanceCm ?? null,
     },
 
     createdAt: serverTimestamp(),
@@ -96,17 +187,25 @@ export async function captureUploadAndProcess(params: {
       {
         captureId,
         imageUrl,
+        storagePath,
         status: "UPLOADED",
+
+        distanceCm: distanceCm ?? null,
+
         meta: {
           robotId: params.robotId ?? null,
-          requestId: params.requestId ?? null,
+          requestId,
+
           rfid: params.rfid ?? null,
           side: params.side ?? null,
           positionLabel: params.positionLabel ?? null,
           stopIndex: params.stopIndex ?? null,
           rounds: params.rounds ?? null,
           direction: params.direction ?? null,
+
+          distanceCm: distanceCm ?? null,
         },
+
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       },
@@ -140,7 +239,7 @@ export async function captureUploadAndProcess(params: {
     }
 
     const payload = await res.json();
-    return { captureId, imageUrl, storagePath, ...payload };
+    return { captureId, imageUrl, storagePath, requestId, distanceCm, ...payload };
   } catch (e: any) {
     await updateDoc(doc(db, "captures", captureId), {
       status: "FAILED",
