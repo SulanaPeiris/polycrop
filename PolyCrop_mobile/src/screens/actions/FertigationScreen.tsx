@@ -5,15 +5,13 @@ import {
   StyleSheet,
   ScrollView,
   TouchableOpacity,
-  Switch,
   TextInput,
   Alert,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useTunnelHeader } from "../../hooks/useTunnelHeader";
-import SectionTitle from "../components/SectionTitle";
 import { LinearGradient } from "expo-linear-gradient";
-import { setDoc, doc, onSnapshot } from "firebase/firestore";
+import { setDoc, doc, onSnapshot, collection, documentId, limit, orderBy, query } from "firebase/firestore";
 import { db } from "../../firebase/firebase";
 
 type DeviceStatusDoc = {
@@ -44,6 +42,14 @@ type DeviceCommand = {
   lastLogId: string;
 };
 
+type ExecutionLog = {
+  id: string;
+  date: string;
+  n: number | null;
+  p: number | null;
+  k: number | null;
+};
+
 function safeFormatTimestamp(ts: any): string {
   if (!ts) return "—";
   if (typeof ts?.toDate === "function") return ts.toDate().toLocaleString();
@@ -58,83 +64,17 @@ function safeFormatTimestamp(ts: any): string {
   return "—";
 }
 
-const MockSlider = ({
-  label,
-  value,
-  color,
-  onChange,
-}: {
-  label: string;
-  value: number;
-  color: string;
-  onChange: (value: number) => void;
-}) => {
-  const [sliderWidth, setSliderWidth] = useState(0);
+function parseLogDateFromId(id: string): string {
+  const m = /^log_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/.exec(id);
+  if (!m) return id;
 
-  const handleTouch = (e: any) => {
-    if (sliderWidth === 0) return;
-    const x = e.nativeEvent.locationX;
-    const ratio = Math.max(0, Math.min(1, x / sliderWidth));
-    const newValue = Math.round(ratio * 10 * 10) / 10;
-    onChange(newValue);
-  };
-
-  return (
-    <View style={styles.sliderContainer}>
-      <View style={styles.sliderHeader}>
-        <Text style={[styles.sliderLabel, { color }]}>{label}</Text>
-        <Text style={styles.sliderValue}>{value.toFixed(1)}</Text>
-      </View>
-
-      <TouchableOpacity
-        style={styles.track}
-        activeOpacity={1}
-        onLayout={(e) => setSliderWidth(e.nativeEvent.layout.width)}
-        onPress={handleTouch}
-      >
-        <View
-          style={[
-            styles.fill,
-            { width: `${(value / 10) * 100}%`, backgroundColor: color },
-          ]}
-        />
-        <View
-          style={[
-            styles.thumb,
-            { left: `${(value / 10) * 100}%`, borderColor: color },
-          ]}
-        />
-      </TouchableOpacity>
-
-      <View style={styles.buttons}>
-        <TouchableOpacity
-          onPress={() =>
-            onChange(Math.max(0, parseFloat((value - 0.5).toFixed(1))))
-          }
-          style={styles.adjBtn}
-        >
-          <Ionicons name="remove" size={16} color="#555" />
-        </TouchableOpacity>
-
-        <TouchableOpacity
-          onPress={() =>
-            onChange(Math.min(10, parseFloat((value + 0.5).toFixed(1))))
-          }
-          style={styles.adjBtn}
-        >
-          <Ionicons name="add" size={16} color="#555" />
-        </TouchableOpacity>
-      </View>
-    </View>
-  );
-};
+  const [, y, mo, d, h, mi, s] = m;
+  const dt = new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s));
+  return dt.toLocaleString();
+}
 
 export default function FertigationScreen() {
   useTunnelHeader("AI Fertigation");
-
-  const [stage, setStage] = useState(2);
-  const [npk, setNpk] = useState({ n: 7.0, p: 5.0, k: 5.0 });
-  const [isFlowering, setIsFlowering] = useState(false);
 
   const [c1Value, setC1Value] = useState("");
   const [c2Value, setC2Value] = useState("");
@@ -143,6 +83,7 @@ export default function FertigationScreen() {
 
   const [deviceStatus, setDeviceStatus] = useState<DeviceStatusDoc | null>(null);
   const [currentCommand, setCurrentCommand] = useState<DeviceCommand | null>(null);
+  const [executionLogs, setExecutionLogs] = useState<ExecutionLog[]>([]);
   const [nowMs, setNowMs] = useState(Date.now());
 
   useEffect(() => {
@@ -225,6 +166,41 @@ export default function FertigationScreen() {
     );
   }, []);
 
+  useEffect(() => {
+    const logsQuery = query(
+      collection(db, "dispenseLogs"),
+      orderBy(documentId(), "desc"),
+      limit(5)
+    );
+
+    return onSnapshot(
+      logsQuery,
+      (snap) => {
+        const logs = snap.docs.map((d) => {
+          const data = d.data() as any;
+          const n = Number(data?.inputMl1);
+          const p = Number(data?.inputMl2);
+          const k = Number(data?.inputMl3User);
+          const ts = safeFormatTimestamp(data?.ts);
+
+          return {
+            id: d.id,
+            date: ts !== "—" ? ts : parseLogDateFromId(d.id),
+            n: Number.isFinite(n) ? n : null,
+            p: Number.isFinite(p) ? p : null,
+            k: Number.isFinite(k) ? k : null,
+          } satisfies ExecutionLog;
+        });
+
+        setExecutionLogs(logs);
+      },
+      (err) => {
+        console.log("dispenseLogs listener error:", err);
+        setExecutionLogs([]);
+      }
+    );
+  }, []);
+
   const computedOnline = useMemo(() => {
     if (!deviceStatus?.lastSeenEpochMs) return false;
     return (
@@ -232,21 +208,6 @@ export default function FertigationScreen() {
       (deviceStatus.offlineTimeoutMs || 30000)
     );
   }, [deviceStatus, nowMs]);
-
-  const stages = [
-    { id: 1, title: "Stage 1", subtitle: "Early Growth (Week 1-2)" },
-    { id: 2, title: "Stage 2", subtitle: "Vegetative (Week 3-4)" },
-    { id: 3, title: "Stage 3", subtitle: "Flowering Season" },
-    { id: 4, title: "Stage 4", subtitle: "Fruiting (AI Detect)" },
-  ];
-
-  const handleStageChange = (id: number) => {
-    setStage(id);
-    if (id === 1) setNpk({ n: 6.0, p: 4.0, k: 4.0 });
-    if (id === 2) setNpk({ n: 7.0, p: 5.0, k: 5.0 });
-    if (id === 3) setNpk({ n: 4.0, p: 8.0, k: 7.0 });
-    if (id === 4) setNpk({ n: 5.0, p: 5.0, k: 8.0 });
-  };
 
   const sendFirestoreCommand = async (
     type: "dispense_all" | "stop_all",
@@ -763,78 +724,52 @@ export default function FertigationScreen() {
         )}
       </View>
 
-      <SectionTitle title="Configure Mix" />
-
-      <View style={styles.configCard}>
-        <View style={styles.timeline}>
-          {stages.map((s) => (
-            <TouchableOpacity
-              key={s.id}
-              style={[styles.stageStep, stage === s.id && styles.activeStep]}
-              onPress={() => handleStageChange(s.id)}
-            >
-              <Text
-                style={[
-                  styles.stepNum,
-                  stage === s.id && styles.activeStepNum,
-                ]}
-              >
-                {s.id}
-              </Text>
-            </TouchableOpacity>
-          ))}
-          <View style={styles.timelineLine} />
-        </View>
-
-        <View style={styles.stageMeta}>
-          <Text style={styles.stageName}>{stages[stage - 1].title}</Text>
-          <Text style={styles.stageDesc}>{stages[stage - 1].subtitle}</Text>
-        </View>
-
-        <View style={styles.divider} />
-
-        {stage === 3 && (
-          <View style={styles.dynamicBox}>
-            <View style={styles.row}>
-              <Ionicons name="flower-outline" size={20} color="#D81B60" />
-              <Text style={styles.dynamicText}>Flowering Detected?</Text>
-            </View>
-
-            <Switch
-              value={isFlowering}
-              onValueChange={(v) => {
-                setIsFlowering(v);
-                if (v) setNpk({ n: 3, p: 9, k: 6 });
-              }}
-              trackColor={{ false: "#767577", true: "#F48FB1" }}
-              thumbColor={isFlowering ? "#D81B60" : "#f4f3f4"}
-            />
+      <View style={styles.currentCommandCard}>
+        <View style={styles.cardHeaderRow}>
+          <View style={styles.commandIcon}>
+            <Ionicons name="time-outline" size={18} color="#2E7D32" />
           </View>
+          <Text style={styles.commandTitle}>Execution History</Text>
+        </View>
+
+        <View style={styles.logContainer}>
+          {executionLogs.map((log) => (
+            <View key={log.id} style={styles.logItem}>
+              <View style={styles.logMain}>
+                <View style={[styles.logIcon, { backgroundColor: "#E8F5E9" }]}>
+                  <Ionicons name="checkmark" size={18} color="#2E7D32" />
+                </View>
+                <View>
+                  <Text style={styles.logDate}>{log.date}</Text>
+                  <Text style={styles.logStage}>Dispense Log</Text>
+                </View>
+              </View>
+
+              <View style={styles.logRight}>
+                <View style={styles.miniNpkRow}>
+                  <View style={styles.miniCircle}>
+                    <Text style={styles.miniVal}>{log.n ?? "—"}</Text>
+                    <Text style={styles.miniLabel}>N</Text>
+                  </View>
+                  <View style={styles.miniCircle}>
+                    <Text style={styles.miniVal}>{log.p ?? "—"}</Text>
+                    <Text style={styles.miniLabel}>P</Text>
+                  </View>
+                  <View style={styles.miniCircle}>
+                    <Text style={styles.miniVal}>{log.k ?? "—"}</Text>
+                    <Text style={styles.miniLabel}>K</Text>
+                  </View>
+                </View>
+                <Text style={styles.logStatus}>Completed</Text>
+              </View>
+            </View>
+          ))}
+        </View>
+
+        {executionLogs.length === 0 && (
+          <Text style={styles.emptyHistoryText}>No dispense logs found.</Text>
         )}
-
-        <MockSlider
-          label="Nitrogen (N)"
-          value={npk.n}
-          color="#2E7D32"
-          onChange={(v) => setNpk({ ...npk, n: v })}
-        />
-        <MockSlider
-          label="Phosphorus (P)"
-          value={npk.p}
-          color="#F57C00"
-          onChange={(v) => setNpk({ ...npk, p: v })}
-        />
-        <MockSlider
-          label="Potassium (K)"
-          value={npk.k}
-          color="#7B1FA2"
-          onChange={(v) => setNpk({ ...npk, k: v })}
-        />
       </View>
-
-      <TouchableOpacity style={styles.applyBtn} activeOpacity={0.8}>
-        <Text style={styles.applyText}>Apply Configuration</Text>
-      </TouchableOpacity>
 
       <View style={{ height: 40 }} />
     </ScrollView>
@@ -843,115 +778,6 @@ export default function FertigationScreen() {
 
 const styles = StyleSheet.create({
   container: { padding: 16, backgroundColor: "#F8F9FA", flexGrow: 1 },
-
-  configCard: {
-    backgroundColor: "#fff",
-    borderRadius: 24,
-    padding: 20,
-    elevation: 2,
-    marginBottom: 16,
-  },
-
-  timeline: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    marginHorizontal: 12,
-    marginBottom: 16,
-    position: "relative",
-  },
-  timelineLine: {
-    position: "absolute",
-    top: 20,
-    left: 0,
-    right: 0,
-    height: 2,
-    backgroundColor: "#E0E0E0",
-    zIndex: -1,
-  },
-  stageStep: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: "#F5F5F5",
-    alignItems: "center",
-    justifyContent: "center",
-    borderWidth: 2,
-    borderColor: "#fff",
-  },
-  activeStep: {
-    backgroundColor: "#2E7D32",
-    borderColor: "#A5D6A7",
-    transform: [{ scale: 1.1 }],
-  },
-  stepNum: { fontWeight: "700", color: "#BDBDBD" },
-  activeStepNum: { color: "#fff" },
-
-  stageMeta: { alignItems: "center", marginBottom: 20 },
-  stageName: { fontSize: 16, fontWeight: "800", color: "#2E7D32" },
-  stageDesc: { fontSize: 12, color: "#757575" },
-
-  divider: { height: 1, backgroundColor: "#F5F5F5", marginBottom: 20 },
-
-  dynamicBox: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    backgroundColor: "#FCE4EC",
-    padding: 12,
-    borderRadius: 12,
-    marginBottom: 20,
-  },
-  row: { flexDirection: "row", alignItems: "center", gap: 8 },
-  dynamicText: { fontWeight: "700", color: "#D81B60", fontSize: 13 },
-
-  sliderContainer: { marginBottom: 20 },
-  sliderHeader: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    marginBottom: 8,
-  },
-  sliderLabel: { fontWeight: "700", fontSize: 13, color: "#555" },
-  sliderValue: { fontWeight: "800", color: "#333" },
-  track: {
-    height: 12,
-    backgroundColor: "#F5F5F5",
-    borderRadius: 6,
-    position: "relative",
-    marginBottom: 16,
-    justifyContent: "center",
-  },
-  fill: { height: 12, borderRadius: 6 },
-  thumb: {
-    position: "absolute",
-    top: -6,
-    width: 24,
-    height: 24,
-    borderRadius: 12,
-    backgroundColor: "#fff",
-    borderWidth: 4,
-    shadowColor: "#000",
-    shadowOpacity: 0.2,
-    elevation: 3,
-  },
-  buttons: { flexDirection: "row", justifyContent: "flex-end", gap: 12 },
-  adjBtn: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: "#F1F3F4",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-
-  applyBtn: {
-    backgroundColor: "#2E7D32",
-    paddingVertical: 18,
-    borderRadius: 16,
-    alignItems: "center",
-    marginBottom: 16,
-  },
-  applyText: { color: "#fff", fontWeight: "800", fontSize: 16 },
 
   manualDispenseCard: {
     backgroundColor: "#fff",
@@ -1270,4 +1096,42 @@ const styles = StyleSheet.create({
     alignItems: "center",
     paddingVertical: 24,
   },
+
+  logContainer: { gap: 12 },
+  logItem: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    backgroundColor: "#FAFAFA",
+    padding: 12,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#F0F0F0",
+  },
+  logMain: { flexDirection: "row", alignItems: "center", gap: 10, flex: 1 },
+  logIcon: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  logDate: { fontSize: 13, fontWeight: "700", color: "#333" },
+  logStage: { fontSize: 11, color: "#9E9E9E", marginTop: 2 },
+  logRight: { alignItems: "flex-end", gap: 6 },
+  miniNpkRow: { flexDirection: "row", gap: 6 },
+  miniCircle: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: "#F1F8E9",
+    borderWidth: 1,
+    borderColor: "#A5D6A7",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  miniVal: { fontSize: 10, fontWeight: "800", color: "#2E7D32", lineHeight: 11 },
+  miniLabel: { fontSize: 7, fontWeight: "700", color: "#4CAF50", lineHeight: 8 },
+  logStatus: { fontSize: 11, fontWeight: "600", color: "#9E9E9E" },
+  emptyHistoryText: { color: "#9E9E9E", fontSize: 13, textAlign: "center", marginTop: 6 },
 });
