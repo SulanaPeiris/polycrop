@@ -3,7 +3,6 @@ from pydantic import BaseModel
 import io
 import urllib.parse
 import uuid
-import time
 from typing import Dict, List, Any, Optional
 
 import numpy as np
@@ -12,15 +11,10 @@ from PIL import Image, ImageOps
 from ultralytics import YOLO
 
 import firebase_admin
-from firebase_admin import credentials, firestore, storage, db as rtdb
+from firebase_admin import credentials, firestore, storage
 
 # ====== CONFIG ======
 BUCKET_NAME = "polycrop.firebasestorage.app"
-
-# ✅ IMPORTANT: put your Realtime Database URL here
-# Example:
-# DATABASE_URL = "https://polycrop-default-rtdb.asia-southeast1.firebasedatabase.app"
-DATABASE_URL = "https://polycrop-default-rtdb.asia-southeast1.firebasedatabase.app"
 
 # Per-model thresholds
 CONF_CUCUMBER = 0.35
@@ -32,40 +26,41 @@ CONF_DISEASE = 0.25  # disease seg model
 DISEASE_ALPHA = 0.45
 
 # ====== CUCUMBER SIZE / RIPENESS CONFIG ======
+# We estimate real-world size from: (cucumber bbox pixels) × (cm_per_px)
+# where cm_per_px scales linearly with distance.
+#
+# ✅ You MUST calibrate cmPerPxAtBaseDistance for your phone camera.
+# How:
+#   1) Place a ruler/object of known width (e.g. 10cm) at a known distance (e.g. 80cm)
+#   2) Capture an image and measure the object's width in pixels (px)
+#   3) cmPerPxAtBaseDistance = 10 / px
+#   4) Store it in Firestore (recommended): tunnels/{tunnelId}.cameraCalib
+#      { baseDistanceCm: 80, cmPerPxAtBaseDistance: 0.0123 }
+#
+# If calibration is missing, we return bbox pixels but we DO NOT claim cm measurements.
 DEFAULT_BASE_DISTANCE_CM = 80.0
+
+# Sri Lanka salad cucumber (tune these)
 RIPE_MIN_LENGTH_CM = 18.0
 RIPE_MAX_LENGTH_CM = 22.0
 RIPE_MIN_DIAMETER_CM = 3.0
 RIPE_MAX_DIAMETER_CM = 5.5
 
+# Disease class colors (BGR for OpenCV)
+# Adjust names to match your model.names exactly (we map by name)
 DISEASE_COLORS_BGR = {
-    "downy_mildew": (0, 255, 255),
-    "powdery_mildew": (255, 0, 255),
-    "water_stress": (0, 165, 255),
+    "downy_mildew": (0, 255, 255),     # yellow/cyan-ish
+    "powdery_mildew": (255, 0, 255),   # magenta
+    "water_stress": (0, 165, 255),     # orange
 }
 
-# ====== Firebase Admin init ======
+# ====== Firebase Admin init (guard for reload) ======
 if not firebase_admin._apps:
     cred = credentials.Certificate("serviceAccountKey.json")
-    firebase_admin.initialize_app(cred, {
-        "storageBucket": BUCKET_NAME,
-        "databaseURL": DATABASE_URL
-    })
+    firebase_admin.initialize_app(cred, {"storageBucket": BUCKET_NAME})
 
 db = firestore.client()
 bucket = storage.bucket()
-
-app = FastAPI(title="PolyCrop Processor (YOLO + Disease Seg + Annotated Upload + RTDB Decision)")
-
-# ====== Load YOLO models ======
-yolo_cucumber = YOLO("weights/best.pt")
-yolo_leaf = YOLO("weights/cucumber_leaf_detection.pt")
-yolo_flower = YOLO("weights/cucumber_flower_detection.pt")
-yolo_disease = YOLO("weights/disease_detection_v2.pt")  # YOLOv8-seg
-
-
-class ProcessRequest(BaseModel):
-    captureId: str
 
 
 def safe_float(x) -> Optional[float]:
@@ -78,7 +73,14 @@ def safe_float(x) -> Optional[float]:
 
 
 def load_camera_calibration(tunnel_id: Optional[str], meta: dict) -> dict:
+    """Get camera calibration from capture meta OR tunnel doc.
+
+    Expected shape:
+      { baseDistanceCm: number, cmPerPxAtBaseDistance: number }
+    """
     calib = (meta.get("cameraCalib") or {}) if isinstance(meta, dict) else {}
+
+    # Merge with tunnel calibration if present
     if tunnel_id:
         try:
             t_snap = db.collection("tunnels").document(tunnel_id).get()
@@ -98,6 +100,21 @@ def load_camera_calibration(tunnel_id: Optional[str], meta: dict) -> dict:
         "baseDistanceCm": base_distance if base_distance is not None else DEFAULT_BASE_DISTANCE_CM,
         "cmPerPxAtBaseDistance": cm_per_px,
     }
+
+
+app = FastAPI(title="PolyCrop Processor (YOLO + Disease Seg + Annotated Upload)")
+
+# ====== Load YOLO models ======
+yolo_cucumber = YOLO("weights/best.pt")
+yolo_leaf = YOLO("weights/cucumber_leaf_detection.pt")
+yolo_flower = YOLO("weights/cucumber_flower_detection.pt")
+
+# Disease segmentation model (YOLOv8-seg)
+yolo_disease = YOLO("weights/disease_detection_v2.pt")
+
+
+class ProcessRequest(BaseModel):
+    captureId: str
 
 
 def run_yolo_boxes(model: YOLO, pil_img: Image.Image, conf=0.25):
@@ -124,14 +141,15 @@ def clamp_box(box, w, h):
     y1 = max(0, min(int(y1), h - 1))
     x2 = max(0, min(int(x2), w))
     y2 = max(0, min(int(y2), h))
-    if x2 <= x1:
-        x2 = min(w, x1 + 1)
-    if y2 <= y1:
-        y2 = min(h, y1 + 1)
+    if x2 <= x1: x2 = min(w, x1 + 1)
+    if y2 <= y1: y2 = min(h, y1 + 1)
     return x1, y1, x2, y2
 
 
 def pick_primary_det(dets: List[dict]) -> Optional[dict]:
+    """Pick the most likely main cucumber detection.
+    Uses (area × (0.5 + conf)) to prefer large + confident boxes.
+    """
     if not dets:
         return None
 
@@ -144,10 +162,23 @@ def pick_primary_det(dets: List[dict]) -> Optional[dict]:
     return max(dets, key=score)
 
 
-def compute_cucumber_size_and_ripeness(cuc_dets, img_w, img_h, distance_cm, calib) -> dict:
+def compute_cucumber_size_and_ripeness(
+    cuc_dets: List[dict],
+    img_w: int,
+    img_h: int,
+    distance_cm: Optional[float],
+    calib: dict,
+) -> dict:
+    """Estimate cucumber length/diameter (cm) + ripeness.
+    Returns a safe object even when distance/calibration are missing.
+    """
     primary = pick_primary_det(cuc_dets)
     if not primary:
-        return {"available": False, "reason": "no_cucumber_detected", "distanceCm": distance_cm}
+        return {
+            "available": False,
+            "reason": "no_cucumber_detected",
+            "distanceCm": distance_cm,
+        }
 
     x1, y1, x2, y2 = clamp_box(primary["box"], img_w, img_h)
     px_w = max(1, x2 - x1)
@@ -160,7 +191,12 @@ def compute_cucumber_size_and_ripeness(cuc_dets, img_w, img_h, distance_cm, cali
         "distanceCm": distance_cm,
         "primaryBox": [int(x1), int(y1), int(x2), int(y2)],
         "primaryConf": float(primary.get("conf", 0.0) or 0.0),
-        "pixel": {"lengthPx": length_px, "diameterPx": diameter_px, "bboxW": int(px_w), "bboxH": int(px_h)},
+        "pixel": {
+            "lengthPx": length_px,
+            "diameterPx": diameter_px,
+            "bboxW": int(px_w),
+            "bboxH": int(px_h),
+        },
         "calibration": {
             "baseDistanceCm": float(calib.get("baseDistanceCm") or DEFAULT_BASE_DISTANCE_CM),
             "cmPerPxAtBaseDistance": calib.get("cmPerPxAtBaseDistance"),
@@ -316,18 +352,6 @@ def run_disease_on_leaf_crops(pil_img: Image.Image, leaf_dets: List[dict], conf=
     return per_leaf, overlay, diseases_found
 
 
-def write_robot_command(robot_id: str, request_id: str, decision: str, spray_ms: int):
-    ref = rtdb.reference(f"robots/{robot_id}/command")
-    ref.set({
-        "robotId": robot_id,
-        "requestId": request_id,
-        "decision": decision,               # SPRAY | NO_SPRAY
-        "sprayDurationMs": int(spray_ms),
-        "state": "DECIDED",
-        "updatedAtMs": int(time.time() * 1000),
-    })
-
-
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -351,9 +375,9 @@ def process(req: ProcessRequest):
     robot_id: Optional[str] = meta.get("robotId")
     request_id: Optional[str] = meta.get("requestId")
 
-    distance_cm = safe_float(meta.get("distanceCm"))
+    # ultrasonic distance (cm) should be saved into capture.meta.distanceCm
+    distance_cm: Optional[float] = safe_float(meta.get("distanceCm"))
 
-    # 1) Download original image bytes from Storage
     src_blob = bucket.blob(storage_path)
     img_bytes = src_blob.download_as_bytes()
 
@@ -364,26 +388,23 @@ def process(req: ProcessRequest):
         pil = pil.rotate(90, expand=True)
         w, h = pil.size
 
-    # 2) Run object detectors
     cuc = run_yolo_boxes(yolo_cucumber, pil, conf=CONF_CUCUMBER)
     leaf = run_yolo_boxes(yolo_leaf, pil, conf=CONF_LEAF)
     flower = run_yolo_boxes(yolo_flower, pil, conf=CONF_FLOWER)
 
-    # 3) Disease segmentation
+    camera_calib = load_camera_calibration(tunnel_id, meta)
+    ripeness = compute_cucumber_size_and_ripeness(cuc, w, h, distance_cm, camera_calib)
+
     per_leaf, disease_overlay, diseases_found = run_disease_on_leaf_crops(pil, leaf, conf=CONF_DISEASE)
 
-    # 4) Compose annotated image
     img_bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
+    # ✅ SAFE BLEND
     blended = img_bgr.copy()
     if disease_overlay is not None:
         mask_any = disease_overlay.sum(axis=2) > 0
         if mask_any.any():
-            blended_full = cv2.addWeighted(
-                img_bgr, 1.0 - DISEASE_ALPHA,
-                disease_overlay, DISEASE_ALPHA,
-                0
-            )
+            blended_full = cv2.addWeighted(img_bgr, 1.0 - DISEASE_ALPHA, disease_overlay, DISEASE_ALPHA, 0)
             blended[mask_any] = blended_full[mask_any]
 
     draw_detection_boxes(blended, cuc, (0, 255, 0))
@@ -393,10 +414,7 @@ def process(req: ProcessRequest):
     legend_items = []
     disease_names_sorted = sorted(list(diseases_found))
     for name in disease_names_sorted:
-        legend_items.append({
-            "name": name,
-            "color_bgr": DISEASE_COLORS_BGR.get(name, (0, 255, 0))
-        })
+        legend_items.append({"name": name, "color_bgr": DISEASE_COLORS_BGR.get(name, (0, 255, 0))})
     add_legend(blended, legend_items)
 
     ok, buf = cv2.imencode(".jpg", blended, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
@@ -407,25 +425,24 @@ def process(req: ProcessRequest):
     annotated_path = storage_path.replace("/captures/", "/captures_annotated/")
     annotated_storage_path, annotated_url = upload_with_permanent_url(annotated_path, annotated_bytes)
 
-    # 5) Build outputs + spray decision
-    SPRAY_SEVERITY_THRESHOLD = 0.5
+    SPRAY_SEVERITY_THRESHOLD = 3.0
     spray_recommended = any((x.get("totalSeverityPercent", 0.0) >= SPRAY_SEVERITY_THRESHOLD) for x in per_leaf)
-
     decision = "SPRAY" if spray_recommended else "NO_SPRAY"
     spray_duration_ms = 3000 if spray_recommended else 0
 
-    calib = load_camera_calibration(tunnel_id, meta)
-    cucumber_size = compute_cucumber_size_and_ripeness(cuc, w, h, distance_cm, calib)
+    cm_obj = ripeness.get("cm") if isinstance(ripeness.get("cm"), dict) else None
+    cucumber_len_cm = cm_obj.get("lengthCm") if cm_obj else None
+    cucumber_diam_cm = cm_obj.get("diameterCm") if cm_obj else None
 
     outputs = {
         "image": {"width": w, "height": h},
         "yolo": {"cucumber": cuc, "leaf": leaf, "flower": flower},
+        "ripeness": ripeness,
         "disease": {
             "perLeaf": per_leaf,
-            "legend": [{ "name": it["name"], "colorBGR": list(it["color_bgr"]) } for it in legend_items],
-            "threshold": CONF_DISEASE
+            "legend": [{"name": it["name"], "colorBGR": list(it["color_bgr"])} for it in legend_items],
+            "threshold": CONF_DISEASE,
         },
-        "cucumber": cucumber_size,
         "summary": {
             "diseases": disease_names_sorted,
             "sprayRecommended": spray_recommended,
@@ -433,17 +450,15 @@ def process(req: ProcessRequest):
             "counts": {"cucumber": len(cuc), "leaf": len(leaf), "flower": len(flower)},
             "decision": decision,
             "sprayDurationMs": spray_duration_ms,
+            "distanceCm": distance_cm,
+            "ripe": ripeness.get("ripe"),
+            "cucumberLengthCm": cucumber_len_cm,
+            "cucumberDiameterCm": cucumber_diam_cm,
         },
         "meta": meta,
-        "thresholds": {
-            "cucumber": CONF_CUCUMBER,
-            "leaf": CONF_LEAF,
-            "flower": CONF_FLOWER,
-            "disease": CONF_DISEASE,
-        }
+        "thresholds": {"cucumber": CONF_CUCUMBER, "leaf": CONF_LEAF, "flower": CONF_FLOWER, "disease": CONF_DISEASE},
     }
 
-    # 6) Update Firestore capture doc
     cap_ref.update({
         "status": "DONE",
         "outputs": outputs,
@@ -452,17 +467,21 @@ def process(req: ProcessRequest):
         "updatedAt": firestore.SERVER_TIMESTAMP,
     })
 
-    # 7) Mirror into plant + update plant summary
+    # Mirror into plant (so your app pages work)
     if tunnel_id and plant_id:
         plant_ref = db.collection("tunnels").document(tunnel_id).collection("plants").document(plant_id)
         plant_ref.set({
             "lastScanAt": firestore.SERVER_TIMESTAMP,
             "lastCaptureId": req.captureId,
             "lastAnnotatedUrl": annotated_url,
-            "diseaseDetected": spray_recommended,
+            "diseaseDetected": bool(disease_names_sorted),
             "lastDiseases": disease_names_sorted,
             "lastCounts": outputs["summary"]["counts"],
             "lastSprayRecommended": spray_recommended,
+            "lastDistanceCm": distance_cm,
+            "lastCucumberLengthCm": cucumber_len_cm,
+            "lastCucumberDiameterCm": cucumber_diam_cm,
+            "lastRipe": ripeness.get("ripe"),
             "updatedAt": firestore.SERVER_TIMESTAMP,
         }, merge=True)
 
@@ -473,12 +492,15 @@ def process(req: ProcessRequest):
             "imageUrl": cap.get("imageUrl"),
             "annotatedUrl": annotated_url,
             "outputs": outputs,
+            "distanceCm": distance_cm,
+            "ripe": ripeness.get("ripe"),
+            "cucumberLengthCm": cucumber_len_cm,
+            "cucumberDiameterCm": cucumber_diam_cm,
             "updatedAt": firestore.SERVER_TIMESTAMP,
         }, merge=True)
 
-    # 8) Robot decision to Firestore (keep) + RTDB (NEW)
+    # Robot decision (optional)
     if robot_id and request_id:
-        # Firestore (keep old behavior)
         robot_ref = db.collection("robots").document(robot_id)
         robot_ref.set({
             "robotId": robot_id,
@@ -486,11 +508,10 @@ def process(req: ProcessRequest):
             "captureRequestId": request_id,
             "captureDecision": decision,
             "sprayDurationMs": spray_duration_ms,
+            "distanceCm": distance_cm,
+            "ripe": ripeness.get("ripe"),
             "updatedAt": firestore.SERVER_TIMESTAMP,
         }, merge=True)
-
-        # ✅ RTDB fast lane (robot listens)
-        write_robot_command(robot_id, request_id, decision, spray_duration_ms)
 
     return {
         "captureId": req.captureId,

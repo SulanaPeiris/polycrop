@@ -1,14 +1,87 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import { View, Text, StyleSheet, Dimensions, TouchableOpacity } from "react-native";
 import { useNavigation } from "@react-navigation/native";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
 import { RootStackParamList } from "../../navigation/types";
 import { Ionicons } from "@expo/vector-icons";
+import { collection, documentId, limit, onSnapshot, orderBy, query } from "firebase/firestore";
+import { db } from "../../firebase/firebase";
 
 const { width } = Dimensions.get("window");
 
+type ExecutionLog = {
+    id: string;
+    date: string;
+    n: number | null;
+    p: number | null;
+    k: number | null;
+    tunnelId?: string;
+};
+
+function safeFormatTimestamp(ts: any): string {
+    if (!ts) return "-";
+    if (typeof ts?.toDate === "function") return ts.toDate().toLocaleString();
+    if (typeof ts === "number") return new Date(ts).toLocaleString();
+
+    if (typeof ts === "string") {
+        const date = new Date(ts);
+        if (!Number.isNaN(date.getTime())) return date.toLocaleString();
+        return ts;
+    }
+
+    return "-";
+}
+
+function parseLogDateFromId(id: string): string {
+    const m = /^log_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/.exec(id);
+    if (!m) return id;
+
+    const [, y, mo, d, h, mi, s] = m;
+    const dt = new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s));
+    return dt.toLocaleString();
+}
+
 export default function TunnelOverview({ tunnel }: any) {
     const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
+    const [executionLogs, setExecutionLogs] = useState<ExecutionLog[]>([]);
+
+    useEffect(() => {
+        const logsQuery = query(
+            collection(db, "dispenseLogs"),
+            orderBy(documentId(), "desc"),
+            limit(20)
+        );
+
+        return onSnapshot(
+            logsQuery,
+            (snap) => {
+                const allLogs = snap.docs.map((d) => {
+                    const data = d.data() as any;
+                    const n = Number(data?.inputMl1);
+                    const p = Number(data?.inputMl2);
+                    const k = Number(data?.inputMl3User);
+                    const ts = safeFormatTimestamp(data?.ts);
+
+                    return {
+                        id: d.id,
+                        date: ts !== "-" ? ts : parseLogDateFromId(d.id),
+                        n: Number.isFinite(n) ? n : null,
+                        p: Number.isFinite(p) ? p : null,
+                        k: Number.isFinite(k) ? k : null,
+                        tunnelId: data?.tunnelId,
+                    } satisfies ExecutionLog;
+                });
+
+                const byTunnel = allLogs.filter((l) => l.tunnelId && l.tunnelId === tunnel?.id);
+                const finalLogs = (byTunnel.length > 0 ? byTunnel : allLogs).slice(0, 3);
+                setExecutionLogs(finalLogs);
+            },
+            (err) => {
+                console.log("overview dispenseLogs listener error:", err);
+                setExecutionLogs([]);
+            }
+        );
+    }, [tunnel?.id]);
 
     if (!tunnel) {
         return (
@@ -107,44 +180,25 @@ export default function TunnelOverview({ tunnel }: any) {
             {/* Fertigation Log Section */}
             <Text style={styles.sectionLabel}>RECENT FERTIGATION LOGS</Text>
 
-            {/* Log 1 (Next) */}
-            <View style={styles.fertigationCard}>
-                <View style={styles.npkContainer}>
-                    <View style={styles.npkItem}><View style={styles.npkCircle}><Text style={styles.npkValue}>20</Text></View><Text style={styles.npkLabel}>N</Text></View>
-                    <View style={styles.npkItem}><View style={styles.npkCircle}><Text style={styles.npkValue}>20</Text></View><Text style={styles.npkLabel}>P</Text></View>
-                    <View style={styles.npkItem}><View style={styles.npkCircle}><Text style={styles.npkValue}>20</Text></View><Text style={styles.npkLabel}>K</Text></View>
+            {executionLogs.length === 0 ? (
+                <View style={styles.fertigationCard}>
+                    <Text style={styles.emptyLogsText}>No fertigation execution history yet.</Text>
                 </View>
-                <View style={styles.scheduleContainer}>
-                    <Text style={styles.scheduleLabel}>Next Schedule:</Text>
-                    <Text style={styles.scheduleTime}>Watering at 4:00 PM</Text>
-                </View>
-            </View>
-
-            {/* Log 2 (Past) */}
-            <View style={styles.fertigationCard}>
-                <View style={styles.npkContainer}>
-                    <View style={styles.npkItem}><View style={styles.npkCircle}><Text style={styles.npkValue}>18</Text></View><Text style={styles.npkLabel}>N</Text></View>
-                    <View style={styles.npkItem}><View style={styles.npkCircle}><Text style={styles.npkValue}>18</Text></View><Text style={styles.npkLabel}>P</Text></View>
-                    <View style={styles.npkItem}><View style={styles.npkCircle}><Text style={styles.npkValue}>18</Text></View><Text style={styles.npkLabel}>K</Text></View>
-                </View>
-                <View style={styles.scheduleContainer}>
-                    <Text style={styles.scheduleLabel}>Completed:</Text>
-                    <Text style={styles.scheduleTime}>Yesterday, 4:00 PM</Text>
-                </View>
-            </View>
-
-            {/* Log 3 (Past) */}
-            <View style={styles.fertigationCard}>
-                <View style={styles.npkContainer}>
-                    <View style={styles.npkItem}><View style={styles.npkCircle}><Text style={styles.npkValue}>22</Text></View><Text style={styles.npkLabel}>N</Text></View>
-                    <View style={styles.npkItem}><View style={styles.npkCircle}><Text style={styles.npkValue}>22</Text></View><Text style={styles.npkLabel}>P</Text></View>
-                    <View style={styles.npkItem}><View style={styles.npkCircle}><Text style={styles.npkValue}>22</Text></View><Text style={styles.npkLabel}>K</Text></View>
-                </View>
-                <View style={styles.scheduleContainer}>
-                    <Text style={styles.scheduleLabel}>Completed:</Text>
-                    <Text style={styles.scheduleTime}>Jan 1, 4:00 PM</Text>
-                </View>
-            </View>
+            ) : (
+                executionLogs.map((log) => (
+                    <View style={styles.fertigationCard} key={log.id}>
+                        <View style={styles.npkContainer}>
+                            <View style={styles.npkItem}><View style={styles.npkCircle}><Text style={styles.npkValue}>{log.n ?? "-"}</Text></View><Text style={styles.npkLabel}>N</Text></View>
+                            <View style={styles.npkItem}><View style={styles.npkCircle}><Text style={styles.npkValue}>{log.p ?? "-"}</Text></View><Text style={styles.npkLabel}>P</Text></View>
+                            <View style={styles.npkItem}><View style={styles.npkCircle}><Text style={styles.npkValue}>{log.k ?? "-"}</Text></View><Text style={styles.npkLabel}>K</Text></View>
+                        </View>
+                        <View style={styles.scheduleContainer}>
+                            <Text style={styles.scheduleLabel}>Completed:</Text>
+                            <Text style={styles.scheduleTime}>{log.date}</Text>
+                        </View>
+                    </View>
+                ))
+            )}
 
         </View >
     );
@@ -363,6 +417,11 @@ const styles = StyleSheet.create({
         fontSize: 16,
         fontWeight: "800",
         color: "#333"
+    },
+    emptyLogsText: {
+        color: "#757575",
+        fontSize: 13,
+        fontWeight: "600"
     }
 
 });
