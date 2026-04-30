@@ -1,0 +1,1746 @@
+#include <Arduino.h>
+#include <HX711.h>
+#include <EEPROM.h>
+#include <math.h>
+#include <time.h>
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+// ============================================================
+// WIFI + FIREBASE
+// ============================================================
+#define WIFI_SSID       "Dinil"
+#define WIFI_PASSWORD   "20202020"
+
+#define API_KEY                 "AIzaSyA7mJ-uud7w7DDM94LGA4z-G8HJa2Q2qFA"
+#define FIREBASE_PROJECT_ID     "polycrop"
+
+static const char* DEVICE_ID = "liquid-system-01";
+
+// NTP
+static const char* NTP_SERVER_1 = "pool.ntp.org";
+static const char* NTP_SERVER_2 = "time.google.com";
+static const time_t MIN_VALID_EPOCH = 1700000000;
+
+// ============================================================
+// PIN CONFIGURATION
+// ============================================================
+
+// LOAD CELL 1
+static const uint8_t LC1_DT  = 16;
+static const uint8_t LC1_SCK = 17;
+
+// LOAD CELL 2
+static const uint8_t LC2_DT  = 18;
+static const uint8_t LC2_SCK = 19;
+
+// LOAD CELL 3
+static const uint8_t LC3_DT  = 20;
+static const uint8_t LC3_SCK = 21;
+
+// PUMPS
+static const uint8_t PUMP1_PIN = 6;
+static const uint8_t PUMP2_PIN = 7;
+static const uint8_t PUMP3_PIN = 8;
+
+// SOLENOIDS
+static const uint8_t SOL1_PIN = 9;
+static const uint8_t SOL2_PIN = 10;
+static const uint8_t SOL3_PIN = 11;
+
+// ============================================================
+// SETTINGS
+// ============================================================
+static const bool ACTIVE_LOW_OUTPUTS = false;
+static const uint32_t SERIAL_BAUD = 115200;
+
+static const size_t EEPROM_SIZE = 256;
+static const uint32_t EEPROM_MAGIC = 0x5A17C0DE;
+
+static const int READ_SAMPLES       = 5;
+static const int START_READ_SAMPLES = 10;
+static const int TARE_SAMPLES       = 15;
+static const int CAL_SAMPLES        = 15;
+
+static const float MIN_TRANSFER_G = 1.0f;
+static const unsigned long TRANSFER_TIMEOUT_MS = 120000UL;
+
+static const float SLOW_REGION_G = 20.0f;
+static const unsigned long FAST_ON_MS   = 80;
+static const unsigned long FAST_OFF_MS  = 20;
+static const unsigned long PULSE_ON_MS  = 120;
+static const unsigned long PULSE_OFF_MS = 250;
+
+static const unsigned long STATUS_PRINT_MS = 500;
+static const unsigned long HX_READY_TIMEOUT_MS = 400;
+static const unsigned long HX_LOST_MAX_MS = 2500;
+
+static const unsigned long COMMAND_POLL_INTERVAL_MS      = 2000UL;
+static const unsigned long STATUS_HEARTBEAT_MS           = 5000UL;
+static const unsigned long BUSY_STATUS_HEARTBEAT_MS      = 4000UL;
+static const unsigned long DEVICE_OFFLINE_TIMEOUT_MS     = 30000UL;
+static const unsigned long STOP_COMMAND_POLL_INTERVAL_MS = 1000UL;
+
+// Density (g/mL)
+static float DENSITY1_G_PER_ML = 1.00f;
+static float DENSITY2_G_PER_ML = 1.00f;
+static float DENSITY3_G_PER_ML = 1.00f;
+
+// ============================================================
+// HX711 OBJECTS
+// ============================================================
+HX711 lc1;
+HX711 lc2;
+HX711 lc3;
+
+// ============================================================
+// EEPROM CONFIG
+// ============================================================
+struct ConfigData {
+  uint32_t magic;
+  float scale1;
+  float scale2;
+  float scale3;
+  long offset1;
+  long offset2;
+  long offset3;
+};
+
+ConfigData cfg = {
+  EEPROM_MAGIC,
+  1000.0f, 1000.0f, 1000.0f,
+  0L, 0L, 0L
+};
+
+// ============================================================
+// FIREBASE AUTH STATE
+// ============================================================
+String fbIdToken = "";
+String fbRefreshToken = "";
+String fbUid = "";
+unsigned long fbTokenExpireAtMs = 0;
+bool fbSignedIn = false;
+bool timeSynced = false;
+
+// ============================================================
+// DEVICE RUNTIME STATE
+// ============================================================
+bool gDeviceBusy = false;
+String gDeviceState = "BOOTING";
+String gLastCommandId = "";
+String gLastLogId = "";
+String gLastExecutionStatus = "";
+String gLastHandledCommandId = "";
+
+unsigned long gLastCommandPollMs = 0;
+unsigned long gLastHeartbeatMs = 0;
+bool gMenuShown = false;
+
+// ============================================================
+// DATA STRUCTURES
+// ============================================================
+struct DeviceCommand {
+  bool exists = false;
+  String commandId = "";
+  String type = "";
+  float c1ml = 0.0f;
+  float c2ml = 0.0f;
+  float c3ml = 0.0f;
+  String status = "";
+  String requestedBy = "";
+  String requestedAt = "";
+  String lastUpdatedAt = "";
+  String startedAt = "";
+  String completedAt = "";
+  String executionStatus = "";
+  String lastLogId = "";
+};
+
+struct RunResult {
+  String finalStatus = "FAILED";
+  String logId = "";
+  bool commandDocHandled = false;
+};
+
+// ============================================================
+// OUTPUT CONTROL
+// ============================================================
+void outputOn(uint8_t pin) {
+  digitalWrite(pin, ACTIVE_LOW_OUTPUTS ? LOW : HIGH);
+}
+
+void outputOff(uint8_t pin) {
+  digitalWrite(pin, ACTIVE_LOW_OUTPUTS ? HIGH : LOW);
+}
+
+void stopAllOutputs() {
+  outputOff(PUMP1_PIN);
+  outputOff(PUMP2_PIN);
+  outputOff(PUMP3_PIN);
+  outputOff(SOL1_PIN);
+  outputOff(SOL2_PIN);
+  outputOff(SOL3_PIN);
+}
+
+void setPump1(bool on) {
+  on ? outputOn(PUMP1_PIN) : outputOff(PUMP1_PIN);
+}
+
+void setPump23(bool on) {
+  if (on) {
+    outputOn(PUMP2_PIN);
+    outputOn(PUMP3_PIN);
+  } else {
+    outputOff(PUMP2_PIN);
+    outputOff(PUMP3_PIN);
+  }
+}
+
+// ============================================================
+// HELPERS
+// ============================================================
+HX711* getLoadCell(uint8_t container) {
+  switch (container) {
+    case 1: return &lc1;
+    case 2: return &lc2;
+    case 3: return &lc3;
+    default: return nullptr;
+  }
+}
+
+long getOffset(uint8_t container) {
+  switch (container) {
+    case 1: return cfg.offset1;
+    case 2: return cfg.offset2;
+    case 3: return cfg.offset3;
+    default: return 0L;
+  }
+}
+
+void setOffset(uint8_t container, long value) {
+  switch (container) {
+    case 1: cfg.offset1 = value; break;
+    case 2: cfg.offset2 = value; break;
+    case 3: cfg.offset3 = value; break;
+  }
+}
+
+float getScale(uint8_t container) {
+  switch (container) {
+    case 1: return cfg.scale1;
+    case 2: return cfg.scale2;
+    case 3: return cfg.scale3;
+    default: return 1.0f;
+  }
+}
+
+void setScale(uint8_t container, float value) {
+  switch (container) {
+    case 1: cfg.scale1 = value; break;
+    case 2: cfg.scale2 = value; break;
+    case 3: cfg.scale3 = value; break;
+  }
+}
+
+String uint64ToString(uint64_t value) {
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%llu", (unsigned long long)value);
+  return String(buf);
+}
+
+// ============================================================
+// EEPROM
+// ============================================================
+void saveConfig() {
+  EEPROM.put(0, cfg);
+  EEPROM.commit();
+  Serial.println(F("Config saved"));
+}
+
+void loadConfig() {
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.get(0, cfg);
+
+  if (cfg.magic != EEPROM_MAGIC) {
+    Serial.println(F("No valid config. Using defaults."));
+    cfg.magic = EEPROM_MAGIC;
+    cfg.scale1 = 1000.0f;
+    cfg.scale2 = 1000.0f;
+    cfg.scale3 = 1000.0f;
+    cfg.offset1 = 0L;
+    cfg.offset2 = 0L;
+    cfg.offset3 = 0L;
+    saveConfig();
+  } else {
+    Serial.println(F("Saved config loaded"));
+  }
+}
+
+// ============================================================
+// HX711 SAFE READ
+// ============================================================
+bool waitReadyTimeout(HX711 &hx, unsigned long timeoutMs) {
+  unsigned long t0 = millis();
+  while (!hx.is_ready()) {
+    if (millis() - t0 >= timeoutMs) return false;
+    delay(1);
+  }
+  return true;
+}
+
+bool readAverageRawTimeout(HX711 &hx, int samples, long &outAvg) {
+  long total = 0;
+  for (int i = 0; i < samples; i++) {
+    if (!waitReadyTimeout(hx, HX_READY_TIMEOUT_MS)) return false;
+    total += hx.read();
+  }
+  outAvg = total / samples;
+  return true;
+}
+
+bool getWeightTimeout(uint8_t container, int samples, float &outWeight) {
+  HX711 *hx = getLoadCell(container);
+  if (!hx) return false;
+
+  long rawAvg = 0;
+  if (!readAverageRawTimeout(*hx, samples, rawAvg)) return false;
+
+  float scale = getScale(container);
+  long offset = getOffset(container);
+  if (scale == 0.0f) return false;
+
+  outWeight = (rawAvg - offset) / scale;
+  return true;
+}
+
+void printAllWeights() {
+  float w1, w2, w3;
+  bool ok1 = getWeightTimeout(1, READ_SAMPLES, w1);
+  bool ok2 = getWeightTimeout(2, READ_SAMPLES, w2);
+  bool ok3 = getWeightTimeout(3, READ_SAMPLES, w3);
+
+  Serial.println(F("------------------------------------"));
+  Serial.print(F("Container 1: "));
+  if (ok1) { Serial.print(w1, 2); Serial.println(F(" g")); }
+  else     { Serial.println(F("ERR")); }
+
+  Serial.print(F("Container 2: "));
+  if (ok2) { Serial.print(w2, 2); Serial.println(F(" g")); }
+  else     { Serial.println(F("ERR")); }
+
+  Serial.print(F("Container 3: "));
+  if (ok3) { Serial.print(w3, 2); Serial.println(F(" g")); }
+  else     { Serial.println(F("ERR (LC3 broken)")); }
+  Serial.println(F("------------------------------------"));
+}
+
+// ============================================================
+// TARE / CALIBRATE
+// ============================================================
+void tareContainer(uint8_t container) {
+  HX711 *hx = getLoadCell(container);
+  if (!hx) {
+    Serial.println(F("Invalid container"));
+    return;
+  }
+
+  long rawAvg = 0;
+  if (!readAverageRawTimeout(*hx, TARE_SAMPLES, rawAvg)) {
+    Serial.println(F("Load cell not ready"));
+    return;
+  }
+
+  setOffset(container, rawAvg);
+  saveConfig();
+
+  Serial.print(F("Container "));
+  Serial.print(container);
+  Serial.println(F(" tared"));
+}
+
+void tareAll() {
+  tareContainer(1);
+  tareContainer(2);
+  tareContainer(3);
+}
+
+void calibrateContainer(uint8_t container, float knownWeightG) {
+  HX711 *hx = getLoadCell(container);
+  if (!hx) {
+    Serial.println(F("Invalid container"));
+    return;
+  }
+
+  if (knownWeightG == 0.0f) {
+    Serial.println(F("Known weight must not be zero"));
+    return;
+  }
+
+  long rawAvg = 0;
+  if (!readAverageRawTimeout(*hx, CAL_SAMPLES, rawAvg)) {
+    Serial.println(F("Load cell not ready"));
+    return;
+  }
+
+  long rawDiff = rawAvg - getOffset(container);
+  float newScale = (float)rawDiff / knownWeightG;
+
+  if (newScale == 0.0f || isnan(newScale) || isinf(newScale)) {
+    Serial.println(F("Calibration failed"));
+    return;
+  }
+
+  setScale(container, newScale);
+  saveConfig();
+
+  Serial.print(F("New scale = "));
+  Serial.println(newScale, 6);
+}
+
+// ============================================================
+// WIFI + TIME
+// ============================================================
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  Serial.println(F("Connecting to WiFi..."));
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(300);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000UL) {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(F("WiFi connected"));
+    Serial.print(F("IP: "));
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println(F("WiFi connect failed"));
+  }
+}
+
+void syncTime() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  Serial.println(F("Syncing time..."));
+  configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
+
+  unsigned long t0 = millis();
+  while (millis() - t0 < 15000UL) {
+    time_t now = time(nullptr);
+    if (now >= MIN_VALID_EPOCH) {
+      timeSynced = true;
+      Serial.println(F("Time synced"));
+      return;
+    }
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println();
+  Serial.println(F("Time sync failed, using uptime fallback"));
+  timeSynced = false;
+}
+
+String makeUtcTimestamp() {
+  time_t now = time(nullptr);
+  if (now >= MIN_VALID_EPOCH) {
+    struct tm tmUtc;
+    gmtime_r(&now, &tmUtc);
+    char buf[25];
+    snprintf(
+      buf, sizeof(buf),
+      "%04d-%02d-%02dT%02d:%02d:%02dZ",
+      tmUtc.tm_year + 1900,
+      tmUtc.tm_mon + 1,
+      tmUtc.tm_mday,
+      tmUtc.tm_hour,
+      tmUtc.tm_min,
+      tmUtc.tm_sec
+    );
+    return String(buf);
+  }
+  return String("uptime_") + String(millis());
+}
+
+uint64_t makeLastSeenEpochMs() {
+  time_t now = time(nullptr);
+  if (now >= MIN_VALID_EPOCH) {
+    return ((uint64_t)now) * 1000ULL;
+  }
+  return 0ULL;
+}
+
+String makeLogDocId() {
+  time_t now = time(nullptr);
+  if (now >= MIN_VALID_EPOCH) {
+    struct tm tmUtc;
+    gmtime_r(&now, &tmUtc);
+    char buf[48];
+    snprintf(
+      buf, sizeof(buf),
+      "log_%04d%02d%02d_%02d%02d%02d_%lu",
+      tmUtc.tm_year + 1900,
+      tmUtc.tm_mon + 1,
+      tmUtc.tm_mday,
+      tmUtc.tm_hour,
+      tmUtc.tm_min,
+      tmUtc.tm_sec,
+      (unsigned long)millis()
+    );
+    return String(buf);
+  }
+  return String("log_uptime_") + String(millis());
+}
+
+// ============================================================
+// FIRESTORE FIELD PARSERS
+// ============================================================
+String fsGetString(JsonObject fields, const char *key) {
+  if (fields[key].isNull()) return "";
+  JsonVariant v = fields[key];
+
+  if (!v["stringValue"].isNull()) {
+    const char *s = v["stringValue"];
+    return s ? String(s) : "";
+  }
+  if (!v["integerValue"].isNull()) {
+    const char *s = v["integerValue"];
+    return s ? String(s) : "";
+  }
+  if (!v["doubleValue"].isNull()) {
+    return String(v["doubleValue"].as<double>(), 6);
+  }
+  if (!v["booleanValue"].isNull()) {
+    return v["booleanValue"].as<bool>() ? "true" : "false";
+  }
+  return "";
+}
+
+double fsGetDouble(JsonObject fields, const char *key, double defaultValue = 0.0) {
+  if (fields[key].isNull()) return defaultValue;
+  JsonVariant v = fields[key];
+
+  if (!v["doubleValue"].isNull()) {
+    return v["doubleValue"].as<double>();
+  }
+  if (!v["integerValue"].isNull()) {
+    const char *s = v["integerValue"];
+    return s ? atof(s) : defaultValue;
+  }
+  if (!v["stringValue"].isNull()) {
+    const char *s = v["stringValue"];
+    return s ? atof(s) : defaultValue;
+  }
+  return defaultValue;
+}
+
+bool fsGetBool(JsonObject fields, const char *key, bool defaultValue = false) {
+  if (fields[key].isNull()) return defaultValue;
+  JsonVariant v = fields[key];
+  if (!v["booleanValue"].isNull()) return v["booleanValue"].as<bool>();
+  if (!v["stringValue"].isNull()) {
+    String s = String((const char*)v["stringValue"]);
+    s.toLowerCase();
+    return s == "true";
+  }
+  return defaultValue;
+}
+
+// ============================================================
+// HTTP REQUEST
+// ============================================================
+bool httpRequest(const String &method,
+                 const String &url,
+                 const String &contentType,
+                 const String &payload,
+                 const String &bearerToken,
+                 int &httpCode,
+                 String &responseBody) {
+  if (WiFi.status() != WL_CONNECTED) {
+    httpCode = -1;
+    responseBody = "WiFi not connected";
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setTimeout(15000);
+
+  if (!http.begin(client, url)) {
+    httpCode = -2;
+    responseBody = "http.begin failed";
+    return false;
+  }
+
+  if (contentType.length()) {
+    http.addHeader("Content-Type", contentType);
+  }
+
+  if (bearerToken.length()) {
+    http.addHeader("Authorization", "Bearer " + bearerToken);
+  }
+
+  if (method == "GET") {
+    httpCode = http.GET();
+  } else if (method == "POST") {
+    httpCode = http.POST(payload);
+  } else if (method == "PATCH") {
+    httpCode = http.sendRequest("PATCH", payload);
+  } else {
+    http.end();
+    httpCode = -3;
+    responseBody = "unsupported method";
+    return false;
+  }
+
+  responseBody = http.getString();
+  http.end();
+  return true;
+}
+
+// ============================================================
+// FIREBASE AUTH
+// ============================================================
+bool firebaseAnonymousSignIn() {
+  int code = 0;
+  String resp;
+
+  String url = String("https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=") + API_KEY;
+  String payload = "{\"returnSecureToken\":true}";
+
+  bool ok = httpRequest("POST", url, "application/json", payload, "", code, resp);
+
+  Serial.print(F("[Auth] HTTP: "));
+  Serial.println(code);
+  Serial.println(resp);
+
+  if (!ok || code < 200 || code >= 300) {
+    fbSignedIn = false;
+    return false;
+  }
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, resp);
+  if (err) {
+    Serial.print(F("[Auth] JSON parse failed: "));
+    Serial.println(err.c_str());
+    fbSignedIn = false;
+    return false;
+  }
+
+  fbIdToken = doc["idToken"] | "";
+  fbRefreshToken = doc["refreshToken"] | "";
+  fbUid = doc["localId"] | "";
+  unsigned long expiresSec = strtoul((doc["expiresIn"] | "3600"), nullptr, 10);
+
+  fbTokenExpireAtMs = millis() + expiresSec * 1000UL;
+  fbSignedIn = fbIdToken.length() > 0;
+
+  return fbSignedIn;
+}
+
+bool firebaseRefreshToken() {
+  if (!fbRefreshToken.length()) return false;
+
+  int code = 0;
+  String resp;
+
+  String url = String("https://securetoken.googleapis.com/v1/token?key=") + API_KEY;
+  String payload = String("grant_type=refresh_token&refresh_token=") + fbRefreshToken;
+
+  bool ok = httpRequest("POST", url, "application/x-www-form-urlencoded", payload, "", code, resp);
+
+  Serial.print(F("[Refresh] HTTP: "));
+  Serial.println(code);
+  Serial.println(resp);
+
+  if (!ok || code < 200 || code >= 300) {
+    fbSignedIn = false;
+    return false;
+  }
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, resp);
+  if (err) {
+    Serial.print(F("[Refresh] JSON parse failed: "));
+    Serial.println(err.c_str());
+    fbSignedIn = false;
+    return false;
+  }
+
+  fbIdToken = doc["id_token"] | "";
+  fbRefreshToken = doc["refresh_token"] | fbRefreshToken;
+  fbUid = doc["user_id"] | fbUid;
+  unsigned long expiresSec = strtoul((doc["expires_in"] | "3600"), nullptr, 10);
+
+  fbTokenExpireAtMs = millis() + expiresSec * 1000UL;
+  fbSignedIn = fbIdToken.length() > 0;
+
+  return fbSignedIn;
+}
+
+bool firebaseEnsureReady() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("[Firebase] WiFi lost, reconnecting..."));
+    connectWiFi();
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("[Firebase] WiFi still not connected"));
+    return false;
+  }
+
+  if (!fbSignedIn || fbIdToken.length() == 0) {
+    Serial.println(F("[Firebase] Signing in..."));
+    if (!firebaseAnonymousSignIn()) return false;
+  }
+
+  if (millis() + 300000UL >= fbTokenExpireAtMs) {
+    Serial.println(F("[Firebase] Refreshing token..."));
+    if (!firebaseRefreshToken()) return false;
+  }
+
+  if (!timeSynced) {
+    syncTime();
+  }
+
+  return true;
+}
+
+// ============================================================
+// FIRESTORE STATUS DOC
+// ============================================================
+bool updateDeviceStatusDocument() {
+  if (!firebaseEnsureReady()) {
+    Serial.println(F("[Status] Firebase not ready"));
+    return false;
+  }
+
+  uint64_t lastSeenEpochMs = makeLastSeenEpochMs();
+
+  JsonDocument doc;
+  JsonObject fields = doc["fields"].to<JsonObject>();
+
+  fields["deviceId"]["stringValue"] = DEVICE_ID;
+  fields["online"]["booleanValue"] = (WiFi.status() == WL_CONNECTED);
+
+  fields["busy"]["booleanValue"] = gDeviceBusy;
+  fields["state"]["stringValue"] = gDeviceState;
+  fields["lastCommandId"]["stringValue"] = gLastCommandId;
+  fields["lastLogId"]["stringValue"] = gLastLogId;
+  fields["lastExecutionStatus"]["stringValue"] = gLastExecutionStatus;
+  fields["updatedAt"]["stringValue"] = makeUtcTimestamp();
+
+  fields["lastSeenEpochMs"]["integerValue"] = uint64ToString(lastSeenEpochMs);
+  fields["offlineTimeoutMs"]["integerValue"] = String((unsigned long)DEVICE_OFFLINE_TIMEOUT_MS);
+
+  fields["wifiConnected"]["booleanValue"] = (WiFi.status() == WL_CONNECTED);
+  fields["timeSynced"]["booleanValue"] = timeSynced;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  String url = String("https://firestore.googleapis.com/v1/projects/") +
+               FIREBASE_PROJECT_ID +
+               "/databases/(default)/documents/deviceStatus/" +
+               DEVICE_ID;
+
+  int code = 0;
+  String resp;
+  bool ok = httpRequest("PATCH", url, "application/json", payload, fbIdToken, code, resp);
+
+  Serial.print(F("[Status] HTTP: "));
+  Serial.println(code);
+
+  if (code == 401) {
+    Serial.println(F("[Status] Token expired/invalid, retrying once..."));
+    fbSignedIn = false;
+    if (!firebaseEnsureReady()) return false;
+
+    ok = httpRequest("PATCH", url, "application/json", payload, fbIdToken, code, resp);
+    Serial.print(F("[Status retry] HTTP: "));
+    Serial.println(code);
+  }
+
+  return ok && code >= 200 && code < 300;
+}
+
+// ============================================================
+// FIRESTORE COMMAND DOC
+// ============================================================
+bool fetchDeviceCommand(DeviceCommand &cmd) {
+  cmd = DeviceCommand();
+
+  if (!firebaseEnsureReady()) {
+    Serial.println(F("[Command] Firebase not ready"));
+    return false;
+  }
+
+  String url = String("https://firestore.googleapis.com/v1/projects/") +
+               FIREBASE_PROJECT_ID +
+               "/databases/(default)/documents/deviceCommands/" +
+               DEVICE_ID;
+
+  int code = 0;
+  String resp;
+  bool ok = httpRequest("GET", url, "", "", fbIdToken, code, resp);
+
+  if (code == 401) {
+    Serial.println(F("[Command] Token expired/invalid, retrying once..."));
+    fbSignedIn = false;
+    if (!firebaseEnsureReady()) return false;
+    ok = httpRequest("GET", url, "", "", fbIdToken, code, resp);
+  }
+
+  if (code == 404) {
+    return true;
+  }
+
+  if (!ok || code < 200 || code >= 300) {
+    Serial.print(F("[Command] Fetch failed HTTP "));
+    Serial.println(code);
+    Serial.println(resp);
+    return false;
+  }
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, resp);
+  if (err) {
+    Serial.print(F("[Command] JSON parse failed: "));
+    Serial.println(err.c_str());
+    return false;
+  }
+
+  JsonObject fields = doc["fields"].as<JsonObject>();
+  if (fields.isNull()) return true;
+
+  cmd.exists = true;
+  cmd.commandId = fsGetString(fields, "commandId");
+  cmd.type = fsGetString(fields, "type");
+  cmd.c1ml = fsGetDouble(fields, "c1ml", 0.0);
+  cmd.c2ml = fsGetDouble(fields, "c2ml", 0.0);
+  cmd.c3ml = fsGetDouble(fields, "c3ml", 0.0);
+  cmd.status = fsGetString(fields, "status");
+  cmd.requestedBy = fsGetString(fields, "requestedBy");
+  cmd.requestedAt = fsGetString(fields, "requestedAt");
+  cmd.lastUpdatedAt = fsGetString(fields, "lastUpdatedAt");
+  cmd.startedAt = fsGetString(fields, "startedAt");
+  cmd.completedAt = fsGetString(fields, "completedAt");
+  cmd.executionStatus = fsGetString(fields, "executionStatus");
+  cmd.lastLogId = fsGetString(fields, "lastLogId");
+
+  return true;
+}
+
+bool updateDeviceCommandDocument(const DeviceCommand &cmd) {
+  if (!firebaseEnsureReady()) {
+    Serial.println(F("[Command] Firebase not ready"));
+    return false;
+  }
+
+  JsonDocument doc;
+  JsonObject fields = doc["fields"].to<JsonObject>();
+
+  fields["deviceId"]["stringValue"] = DEVICE_ID;
+  fields["commandId"]["stringValue"] = cmd.commandId;
+  fields["type"]["stringValue"] = cmd.type;
+  fields["c1ml"]["doubleValue"] = cmd.c1ml;
+  fields["c2ml"]["doubleValue"] = cmd.c2ml;
+  fields["c3ml"]["doubleValue"] = cmd.c3ml;
+  fields["status"]["stringValue"] = cmd.status;
+  fields["requestedBy"]["stringValue"] = cmd.requestedBy;
+  fields["requestedAt"]["stringValue"] = cmd.requestedAt;
+  fields["lastUpdatedAt"]["stringValue"] = cmd.lastUpdatedAt;
+  fields["startedAt"]["stringValue"] = cmd.startedAt;
+  fields["completedAt"]["stringValue"] = cmd.completedAt;
+  fields["executionStatus"]["stringValue"] = cmd.executionStatus;
+  fields["lastLogId"]["stringValue"] = cmd.lastLogId;
+  fields["handledByDeviceId"]["stringValue"] = DEVICE_ID;
+  fields["handledByUid"]["stringValue"] = fbUid;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  String url = String("https://firestore.googleapis.com/v1/projects/") +
+               FIREBASE_PROJECT_ID +
+               "/databases/(default)/documents/deviceCommands/" +
+               DEVICE_ID;
+
+  int code = 0;
+  String resp;
+  bool ok = httpRequest("PATCH", url, "application/json", payload, fbIdToken, code, resp);
+
+  Serial.print(F("[Command update] HTTP: "));
+  Serial.println(code);
+
+  if (code == 401) {
+    Serial.println(F("[Command update] Token expired/invalid, retrying once..."));
+    fbSignedIn = false;
+    if (!firebaseEnsureReady()) return false;
+
+    ok = httpRequest("PATCH", url, "application/json", payload, fbIdToken, code, resp);
+    Serial.print(F("[Command update retry] HTTP: "));
+    Serial.println(code);
+  }
+
+  return ok && code >= 200 && code < 300;
+}
+
+// ============================================================
+// FIRESTORE LOG WRITE
+// ============================================================
+bool addDispenseLogToFirestore(float inputMl1,
+                               float inputMl2,
+                               float inputMl3User,
+                               float usedMl3,
+                               float target1g,
+                               float target2g,
+                               bool startOk1,
+                               bool startOk2,
+                               bool startOk3,
+                               float startW1,
+                               float startW2,
+                               float startW3,
+                               bool endOk1,
+                               bool endOk2,
+                               bool endOk3,
+                               float endW1,
+                               float endW2,
+                               float endW3,
+                               const String &status,
+                               String &outDocId) {
+  if (!firebaseEnsureReady()) {
+    Serial.println(F("[Firestore] Firebase not ready"));
+    return false;
+  }
+
+  outDocId = makeLogDocId();
+  String timestampUtc = makeUtcTimestamp();
+  time_t now = time(nullptr);
+  long epochSeconds = (now >= MIN_VALID_EPOCH) ? (long)now : -1;
+
+  JsonDocument doc;
+  JsonObject fields = doc["fields"].to<JsonObject>();
+
+  fields["logId"]["stringValue"] = outDocId;
+  fields["deviceId"]["stringValue"] = DEVICE_ID;
+  fields["status"]["stringValue"] = status;
+  fields["uid"]["stringValue"] = fbUid;
+  fields["commandId"]["stringValue"] = gLastCommandId;
+
+  fields["timestampUtc"]["stringValue"] = timestampUtc;
+  fields["epochSeconds"]["integerValue"] = String(epochSeconds);
+  fields["deviceMillis"]["integerValue"] = String(millis());
+
+  fields["inputMl1"]["doubleValue"] = inputMl1;
+  fields["inputMl2"]["doubleValue"] = inputMl2;
+  fields["inputMl3User"]["doubleValue"] = inputMl3User;
+  fields["usedMl3"]["doubleValue"] = usedMl3;
+
+  fields["target1g"]["doubleValue"] = target1g;
+  fields["target2g"]["doubleValue"] = target2g;
+
+  fields["startWeight1Ok"]["booleanValue"] = startOk1;
+  fields["startWeight2Ok"]["booleanValue"] = startOk2;
+  fields["startWeight3Ok"]["booleanValue"] = startOk3;
+
+  fields["startWeight1"]["doubleValue"] = startOk1 ? startW1 : 0.0;
+  fields["startWeight2"]["doubleValue"] = startOk2 ? startW2 : 0.0;
+  fields["startWeight3"]["doubleValue"] = startOk3 ? startW3 : 0.0;
+
+  fields["endWeight1Ok"]["booleanValue"] = endOk1;
+  fields["endWeight2Ok"]["booleanValue"] = endOk2;
+  fields["endWeight3Ok"]["booleanValue"] = endOk3;
+
+  fields["endWeight1"]["doubleValue"] = endOk1 ? endW1 : 0.0;
+  fields["endWeight2"]["doubleValue"] = endOk2 ? endW2 : 0.0;
+  fields["endWeight3"]["doubleValue"] = endOk3 ? endW3 : 0.0;
+
+  fields["wifiConnected"]["booleanValue"] = (WiFi.status() == WL_CONNECTED);
+  fields["timeSynced"]["booleanValue"] = timeSynced;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  String url = String("https://firestore.googleapis.com/v1/projects/") +
+               FIREBASE_PROJECT_ID +
+               "/databases/(default)/documents/dispenseLogs/" +
+               outDocId;
+
+  int code = 0;
+  String resp;
+  bool ok = httpRequest("PATCH", url, "application/json", payload, fbIdToken, code, resp);
+
+  Serial.print(F("[Firestore] HTTP: "));
+  Serial.println(code);
+
+  if (code == 401) {
+    Serial.println(F("[Firestore] Token expired/invalid, retrying once..."));
+    fbSignedIn = false;
+
+    if (!firebaseEnsureReady()) return false;
+
+    ok = httpRequest("PATCH", url, "application/json", payload, fbIdToken, code, resp);
+    Serial.print(F("[Firestore retry] HTTP: "));
+    Serial.println(code);
+  }
+
+  return ok && code >= 200 && code < 300;
+}
+
+bool addStopLogToFirestore(const String &status, String &outDocId) {
+  return addDispenseLogToFirestore(
+    0, 0, 0, 0,
+    0, 0,
+    false, false, false,
+    0, 0, 0,
+    false, false, false,
+    0, 0, 0,
+    status,
+    outDocId
+  );
+}
+
+// ============================================================
+// OPTION 9 HELPERS
+// ============================================================
+float mlToGrams(uint8_t container, float ml) {
+  float d = 1.0f;
+  if (container == 1) d = DENSITY1_G_PER_ML;
+  else if (container == 2) d = DENSITY2_G_PER_ML;
+  else if (container == 3) d = DENSITY3_G_PER_ML;
+  return ml * d;
+}
+
+struct PumpCtl {
+  bool enabled = false;
+  bool done = false;
+  bool pumpOn = false;
+  unsigned long nextSwitch = 0;
+  unsigned long startMs = 0;
+  unsigned long lastGoodMs = 0;
+  float startW = 0;
+  float lastW = 0;
+};
+
+// ============================================================
+// STOP COMMAND DETECTION
+// ============================================================
+bool pollPendingStopCommand(DeviceCommand &outStopCmd) {
+  DeviceCommand cmd;
+  if (!fetchDeviceCommand(cmd)) return false;
+  if (!cmd.exists) return false;
+  if (cmd.commandId.length() == 0) return false;
+  if (cmd.commandId == gLastHandledCommandId) return false;
+  if (cmd.status != "PENDING") return false;
+  if (cmd.type != "stop_all") return false;
+
+  outStopCmd = cmd;
+  return true;
+}
+
+// ============================================================
+// OPTION 9: DISPENSE ALL 3 SIMULTANEOUSLY
+// C3 forced = C2
+// LC3 ignored for control
+// Pump2 + Pump3 controlled by LC2
+// ============================================================
+void dispenseAllSimultaneousML(float ml1,
+                               float ml2,
+                               float ml3_user,
+                               String &outFinalStatus,
+                               String &outLogId,
+                               bool &outStoppedByCloudCommand,
+                               DeviceCommand &outStopCommand) {
+  outFinalStatus = "FAILED";
+  outLogId = "";
+  outStoppedByCloudCommand = false;
+  outStopCommand = DeviceCommand();
+
+  float ml3 = ml2;
+  float target1_g = mlToGrams(1, ml1);
+  float target2_g = mlToGrams(2, ml2);
+
+  float startW1 = 0, startW2 = 0, startW3 = 0;
+  float endW1 = 0, endW2 = 0, endW3 = 0;
+
+  bool startOk1 = getWeightTimeout(1, START_READ_SAMPLES, startW1);
+  bool startOk2 = getWeightTimeout(2, START_READ_SAMPLES, startW2);
+  bool startOk3 = getWeightTimeout(3, START_READ_SAMPLES, startW3);
+
+  Serial.println();
+  Serial.println(F("=========== SIMULTANEOUS DOSE ==========="));
+  Serial.print(F("Input mL: C1=")); Serial.print(ml1, 2);
+  Serial.print(F(" C2=")); Serial.print(ml2, 2);
+  Serial.print(F(" C3=")); Serial.print(ml3_user, 2);
+  Serial.println(F(" (C3 forced = C2)"));
+
+  Serial.print(F("Used mL: C1=")); Serial.print(ml1, 2);
+  Serial.print(F(" C2=")); Serial.print(ml2, 2);
+  Serial.print(F(" C3=")); Serial.print(ml3, 2);
+  Serial.println();
+
+  Serial.print(F("Target g: C1=")); Serial.print(target1_g, 2);
+  Serial.print(F(" C2=")); Serial.print(target2_g, 2);
+  Serial.println(F(" (C3 controlled by LC2)"));
+
+  Serial.println(F("Type X to emergency stop."));
+  Serial.println(F("========================================="));
+
+  PumpCtl c1, c23;
+  c1.enabled = (target1_g >= MIN_TRANSFER_G);
+  c23.enabled = (target2_g >= MIN_TRANSFER_G);
+
+  if (!c1.enabled && !c23.enabled) {
+    Serial.println(F("All requested amounts too small"));
+
+    bool endOk1 = getWeightTimeout(1, READ_SAMPLES, endW1);
+    bool endOk2 = getWeightTimeout(2, READ_SAMPLES, endW2);
+    bool endOk3 = getWeightTimeout(3, READ_SAMPLES, endW3);
+
+    String logId;
+    bool ok = addDispenseLogToFirestore(
+      ml1, ml2, ml3_user, ml3,
+      target1_g, target2_g,
+      startOk1, startOk2, startOk3,
+      startW1, startW2, startW3,
+      endOk1, endOk2, endOk3,
+      endW1, endW2, endW3,
+      "SKIPPED_TOO_SMALL",
+      logId
+    );
+
+    outFinalStatus = "SKIPPED_TOO_SMALL";
+    if (ok) outLogId = logId;
+    return;
+  }
+
+  if (c1.enabled) {
+    float w;
+    if (!getWeightTimeout(1, START_READ_SAMPLES, w)) {
+      Serial.println(F("C1 start read failed -> skip C1"));
+      c1.enabled = false;
+    } else {
+      c1.startW = c1.lastW = w;
+      c1.startMs = c1.lastGoodMs = millis();
+    }
+  }
+
+  if (c23.enabled) {
+    float w;
+    if (!getWeightTimeout(2, START_READ_SAMPLES, w)) {
+      Serial.println(F("C2 start read failed -> skip C2+C3"));
+      c23.enabled = false;
+    } else {
+      c23.startW = c23.lastW = w;
+      c23.startMs = c23.lastGoodMs = millis();
+    }
+  }
+
+  if (!c1.enabled && !c23.enabled) {
+    Serial.println(F("No usable channels"));
+
+    bool endOk1 = getWeightTimeout(1, READ_SAMPLES, endW1);
+    bool endOk2 = getWeightTimeout(2, READ_SAMPLES, endW2);
+    bool endOk3 = getWeightTimeout(3, READ_SAMPLES, endW3);
+
+    String logId;
+    bool ok = addDispenseLogToFirestore(
+      ml1, ml2, ml3_user, ml3,
+      target1_g, target2_g,
+      startOk1, startOk2, startOk3,
+      startW1, startW2, startW3,
+      endOk1, endOk2, endOk3,
+      endW1, endW2, endW3,
+      "FAILED_NO_CHANNEL",
+      logId
+    );
+
+    outFinalStatus = "FAILED_NO_CHANNEL";
+    if (ok) outLogId = logId;
+    return;
+  }
+
+  if (c1.enabled) outputOn(SOL1_PIN);
+  if (c23.enabled) {
+    outputOn(SOL2_PIN);
+    outputOn(SOL3_PIN);
+  }
+  delay(150);
+
+  setPump1(false);
+  setPump23(false);
+
+  unsigned long lastPrint = 0;
+  unsigned long lastStopPollMs = 0;
+  unsigned long lastBusyHeartbeatMs = 0;
+  String finalStatus = "DONE";
+
+  while (true) {
+    unsigned long now = millis();
+
+    // Keep status fresh while dispensing so app still sees device online
+    if (now - lastBusyHeartbeatMs >= BUSY_STATUS_HEARTBEAT_MS) {
+      lastBusyHeartbeatMs = now;
+      gDeviceBusy = true;
+      gDeviceState = "DISPENSING";
+      updateDeviceStatusDocument();
+      gLastHeartbeatMs = now;
+    }
+
+    if (now - lastStopPollMs >= STOP_COMMAND_POLL_INTERVAL_MS) {
+      lastStopPollMs = now;
+
+      DeviceCommand stopCmd;
+      if (pollPendingStopCommand(stopCmd)) {
+        Serial.println(F("[Cloud] stop_all detected during dispense"));
+
+        stopCmd.status = "RUNNING";
+        stopCmd.startedAt = makeUtcTimestamp();
+        stopCmd.lastUpdatedAt = stopCmd.startedAt;
+
+        updateDeviceCommandDocument(stopCmd);
+        gLastHandledCommandId = stopCmd.commandId;
+
+        outStoppedByCloudCommand = true;
+        outStopCommand = stopCmd;
+
+        stopAllOutputs();
+        finalStatus = "STOPPED_BY_COMMAND";
+        break;
+      }
+    }
+
+    if (Serial.available()) {
+      char ch = Serial.peek();
+      if (ch == 'x' || ch == 'X') {
+        Serial.read();
+        stopAllOutputs();
+        finalStatus = "EMERGENCY_STOP";
+        Serial.println(F("EMERGENCY STOP"));
+        break;
+      }
+    }
+
+    float disp1 = 0, rem1 = 0;
+    if (c1.enabled && !c1.done) {
+      float w;
+      if (getWeightTimeout(1, READ_SAMPLES, w)) {
+        c1.lastW = w;
+        c1.lastGoodMs = now;
+      } else {
+        setPump1(false);
+      }
+
+      if (now - c1.lastGoodMs > HX_LOST_MAX_MS) {
+        Serial.println(F("C1 sensor lost"));
+        c1.done = true;
+        setPump1(false);
+        outputOff(SOL1_PIN);
+        finalStatus = "SENSOR_LOST_C1";
+      } else if (!c1.done) {
+        disp1 = c1.startW - c1.lastW;
+        rem1 = target1_g - disp1;
+
+        if (disp1 >= target1_g) {
+          c1.done = true;
+          setPump1(false);
+          outputOff(SOL1_PIN);
+          Serial.println(F("C1 done"));
+        } else if (now - c1.startMs > TRANSFER_TIMEOUT_MS) {
+          c1.done = true;
+          setPump1(false);
+          outputOff(SOL1_PIN);
+          Serial.println(F("C1 timeout"));
+          finalStatus = "TIMEOUT_C1";
+        } else {
+          unsigned long onMs, offMs;
+          if (rem1 > SLOW_REGION_G) {
+            onMs = FAST_ON_MS;
+            offMs = FAST_OFF_MS;
+          } else {
+            onMs = PULSE_ON_MS;
+            offMs = PULSE_OFF_MS;
+          }
+
+          if (now >= c1.nextSwitch) {
+            c1.pumpOn = !c1.pumpOn;
+            setPump1(c1.pumpOn);
+            c1.nextSwitch = now + (c1.pumpOn ? onMs : offMs);
+          }
+        }
+      }
+    } else {
+      setPump1(false);
+    }
+
+    float disp2 = 0, rem2 = 0;
+    if (c23.enabled && !c23.done) {
+      float w;
+      if (getWeightTimeout(2, READ_SAMPLES, w)) {
+        c23.lastW = w;
+        c23.lastGoodMs = now;
+      } else {
+        setPump23(false);
+      }
+
+      if (now - c23.lastGoodMs > HX_LOST_MAX_MS) {
+        Serial.println(F("C2 sensor lost"));
+        c23.done = true;
+        setPump23(false);
+        outputOff(SOL2_PIN);
+        outputOff(SOL3_PIN);
+        finalStatus = "SENSOR_LOST_C2";
+      } else if (!c23.done) {
+        disp2 = c23.startW - c23.lastW;
+        rem2 = target2_g - disp2;
+
+        if (disp2 >= target2_g) {
+          c23.done = true;
+          setPump23(false);
+          outputOff(SOL2_PIN);
+          outputOff(SOL3_PIN);
+          Serial.println(F("C2+C3 done"));
+        } else if (now - c23.startMs > TRANSFER_TIMEOUT_MS) {
+          c23.done = true;
+          setPump23(false);
+          outputOff(SOL2_PIN);
+          outputOff(SOL3_PIN);
+          Serial.println(F("C2+C3 timeout"));
+          finalStatus = "TIMEOUT_C2_C3";
+        } else {
+          unsigned long onMs, offMs;
+          if (rem2 > SLOW_REGION_G) {
+            onMs = FAST_ON_MS;
+            offMs = FAST_OFF_MS;
+          } else {
+            onMs = PULSE_ON_MS;
+            offMs = PULSE_OFF_MS;
+          }
+
+          if (now >= c23.nextSwitch) {
+            c23.pumpOn = !c23.pumpOn;
+            setPump23(c23.pumpOn);
+            c23.nextSwitch = now + (c23.pumpOn ? onMs : offMs);
+          }
+        }
+      }
+    } else {
+      setPump23(false);
+    }
+
+    if (now - lastPrint >= STATUS_PRINT_MS) {
+      lastPrint = now;
+      Serial.print(F("[ALL] "));
+      if (c1.enabled) {
+        Serial.print(F("C1 disp=")); Serial.print(disp1, 2);
+        Serial.print(F("g rem=")); Serial.print(rem1, 2);
+        Serial.print(F("g | "));
+      } else {
+        Serial.print(F("C1 SKIP | "));
+      }
+
+      if (c23.enabled) {
+        Serial.print(F("C2 disp=")); Serial.print(disp2, 2);
+        Serial.print(F("g rem=")); Serial.print(rem2, 2);
+        Serial.print(F("g | C3 mirrors C2"));
+      } else {
+        Serial.print(F("C2+C3 SKIP"));
+      }
+      Serial.println();
+    }
+
+    bool done1 = (!c1.enabled) || c1.done;
+    bool done2 = (!c23.enabled) || c23.done;
+    if (done1 && done2) break;
+
+    delay(5);
+  }
+
+  stopAllOutputs();
+  Serial.println(F("========== ALL DONE =========="));
+
+  bool endOk1 = getWeightTimeout(1, READ_SAMPLES, endW1);
+  bool endOk2 = getWeightTimeout(2, READ_SAMPLES, endW2);
+  bool endOk3 = getWeightTimeout(3, READ_SAMPLES, endW3);
+
+  String logId;
+  bool ok = addDispenseLogToFirestore(
+    ml1, ml2, ml3_user, ml3,
+    target1_g, target2_g,
+    startOk1, startOk2, startOk3,
+    startW1, startW2, startW3,
+    endOk1, endOk2, endOk3,
+    endW1, endW2, endW3,
+    finalStatus,
+    logId
+  );
+
+  outFinalStatus = finalStatus;
+  if (ok) outLogId = logId;
+}
+
+// ============================================================
+// EXECUTION WRAPPERS
+// ============================================================
+RunResult runDispenseJob(float ml1,
+                         float ml2,
+                         float ml3User,
+                         const String &commandId) {
+  RunResult result;
+
+  gDeviceBusy = true;
+  gDeviceState = "DISPENSING";
+  gLastCommandId = commandId;
+  updateDeviceStatusDocument();
+  gLastHeartbeatMs = millis();
+
+  bool stoppedByCloudCommand = false;
+  DeviceCommand stopCmd;
+
+  dispenseAllSimultaneousML(
+    ml1,
+    ml2,
+    ml3User,
+    result.finalStatus,
+    result.logId,
+    stoppedByCloudCommand,
+    stopCmd
+  );
+
+  gDeviceBusy = false;
+  gDeviceState = "IDLE";
+  gLastExecutionStatus = result.finalStatus;
+
+  if (result.logId.length()) {
+    gLastLogId = result.logId;
+  }
+
+  if (stoppedByCloudCommand) {
+    gLastCommandId = stopCmd.commandId;
+
+    stopCmd.status = "DONE";
+    stopCmd.executionStatus = result.finalStatus;
+    stopCmd.completedAt = makeUtcTimestamp();
+    stopCmd.lastUpdatedAt = stopCmd.completedAt;
+    stopCmd.lastLogId = result.logId;
+
+    updateDeviceCommandDocument(stopCmd);
+    result.commandDocHandled = true;
+  }
+
+  updateDeviceStatusDocument();
+  gLastHeartbeatMs = millis();
+  return result;
+}
+
+RunResult runStopAllCommand(const String &commandId) {
+  RunResult result;
+  result.finalStatus = "STOPPED_BY_COMMAND";
+
+  stopAllOutputs();
+
+  gDeviceBusy = false;
+  gDeviceState = "IDLE";
+  gLastCommandId = commandId;
+  gLastExecutionStatus = result.finalStatus;
+
+  String logId;
+  if (addStopLogToFirestore(result.finalStatus, logId)) {
+    result.logId = logId;
+    gLastLogId = logId;
+  }
+
+  updateDeviceStatusDocument();
+  gLastHeartbeatMs = millis();
+  return result;
+}
+
+// ============================================================
+// CLOUD COMMAND HANDLER
+// ============================================================
+void pollAndHandleCloudCommand() {
+  DeviceCommand cmd;
+  if (!fetchDeviceCommand(cmd)) return;
+  if (!cmd.exists) return;
+  if (cmd.status != "PENDING") return;
+  if (cmd.commandId.length() == 0) return;
+  if (cmd.commandId == gLastHandledCommandId) return;
+
+  Serial.println();
+  Serial.println(F("[Cloud] New pending command detected"));
+  Serial.print(F("[Cloud] commandId: "));
+  Serial.println(cmd.commandId);
+  Serial.print(F("[Cloud] type: "));
+  Serial.println(cmd.type);
+
+  if (cmd.type == "stop_all") {
+    cmd.status = "RUNNING";
+    cmd.startedAt = makeUtcTimestamp();
+    cmd.lastUpdatedAt = cmd.startedAt;
+
+    if (!updateDeviceCommandDocument(cmd)) {
+      Serial.println(F("[Cloud] Failed to mark stop command RUNNING"));
+      return;
+    }
+
+    gLastHandledCommandId = cmd.commandId;
+
+    RunResult result = runStopAllCommand(cmd.commandId);
+
+    cmd.status = "DONE";
+    cmd.executionStatus = result.finalStatus;
+    cmd.completedAt = makeUtcTimestamp();
+    cmd.lastUpdatedAt = cmd.completedAt;
+    cmd.lastLogId = result.logId;
+
+    if (updateDeviceCommandDocument(cmd)) {
+      Serial.println(F("[Cloud] Stop command updated after execution"));
+    } else {
+      Serial.println(F("[Cloud] Failed to update stop command after execution"));
+    }
+    return;
+  }
+
+  if (gDeviceBusy) return;
+
+  if (cmd.type != "dispense_all") {
+    Serial.println(F("[Cloud] Unsupported command type"));
+
+    cmd.status = "FAILED";
+    cmd.executionStatus = "UNSUPPORTED_TYPE";
+    cmd.lastUpdatedAt = makeUtcTimestamp();
+    cmd.completedAt = cmd.lastUpdatedAt;
+    cmd.lastLogId = "";
+
+    updateDeviceCommandDocument(cmd);
+
+    gLastHandledCommandId = cmd.commandId;
+    gLastCommandId = cmd.commandId;
+    gLastExecutionStatus = "UNSUPPORTED_TYPE";
+    updateDeviceStatusDocument();
+    gLastHeartbeatMs = millis();
+    return;
+  }
+
+  cmd.status = "RUNNING";
+  cmd.startedAt = makeUtcTimestamp();
+  cmd.lastUpdatedAt = cmd.startedAt;
+
+  if (!updateDeviceCommandDocument(cmd)) {
+    Serial.println(F("[Cloud] Failed to mark command RUNNING"));
+    return;
+  }
+
+  gLastHandledCommandId = cmd.commandId;
+
+  RunResult result = runDispenseJob(cmd.c1ml, cmd.c2ml, cmd.c3ml, cmd.commandId);
+
+  if (result.commandDocHandled) {
+    Serial.println(F("[Cloud] Command doc already handled by stop_all"));
+    return;
+  }
+
+  cmd.status = (result.finalStatus == "DONE") ? "DONE" : "FAILED";
+  cmd.executionStatus = result.finalStatus;
+  cmd.completedAt = makeUtcTimestamp();
+  cmd.lastUpdatedAt = cmd.completedAt;
+  cmd.lastLogId = result.logId;
+
+  if (updateDeviceCommandDocument(cmd)) {
+    Serial.println(F("[Cloud] Command updated after execution"));
+  } else {
+    Serial.println(F("[Cloud] Failed to update command after execution"));
+  }
+}
+
+// ============================================================
+// SERIAL HELPERS
+// ============================================================
+String readLineBlocking() {
+  while (!Serial.available()) delay(10);
+  String s = Serial.readStringUntil('\n');
+  s.trim();
+  return s;
+}
+
+int readIntBlocking() {
+  return readLineBlocking().toInt();
+}
+
+float readFloatBlocking() {
+  return readLineBlocking().toFloat();
+}
+
+// ============================================================
+// MENU
+// ============================================================
+void showConfig() {
+  Serial.println(F("\nSaved configuration"));
+  Serial.print(F("scale1 = ")); Serial.println(cfg.scale1, 6);
+  Serial.print(F("scale2 = ")); Serial.println(cfg.scale2, 6);
+  Serial.print(F("scale3 = ")); Serial.println(cfg.scale3, 6);
+  Serial.print(F("offset1 = ")); Serial.println(cfg.offset1);
+  Serial.print(F("offset2 = ")); Serial.println(cfg.offset2);
+  Serial.print(F("offset3 = ")); Serial.println(cfg.offset3);
+}
+
+void showMenu() {
+  Serial.println();
+  Serial.println(F("============== MAIN MENU =============="));
+  Serial.println(F("1 - Show all weights"));
+  Serial.println(F("2 - Tare one container"));
+  Serial.println(F("3 - Tare all containers"));
+  Serial.println(F("4 - Calibrate one container"));
+  Serial.println(F("5 - Show saved config"));
+  Serial.println(F("9 - Dispense ALL 3 simultaneously (mL)"));
+  Serial.println(F("0 - Stop all outputs"));
+  Serial.println(F("======================================="));
+  Serial.print(F("Enter choice: "));
+}
+
+void processSerialCommand(int cmd) {
+  switch (cmd) {
+    case 1:
+      printAllWeights();
+      break;
+
+    case 2: {
+      Serial.print(F("Select container to tare (1-3): "));
+      int c = readIntBlocking();
+      tareContainer((uint8_t)c);
+      break;
+    }
+
+    case 3:
+      tareAll();
+      break;
+
+    case 4: {
+      Serial.print(F("Select container to calibrate (1-3): "));
+      int c = readIntBlocking();
+      Serial.print(F("Place known weight and enter value (g): "));
+      float known = readFloatBlocking();
+      calibrateContainer((uint8_t)c, known);
+      break;
+    }
+
+    case 5:
+      showConfig();
+      break;
+
+    case 9: {
+      Serial.println(F("Enter mL for container1 (C1): "));
+      float m1 = readFloatBlocking();
+
+      Serial.println(F("Enter mL for container2 (C2): "));
+      float m2 = readFloatBlocking();
+
+      Serial.println(F("Enter mL for container3 (C3) (ignored; C3=C2): "));
+      float m3 = readFloatBlocking();
+
+      String manualId = String("manual_") + String(millis());
+      RunResult result = runDispenseJob(m1, m2, m3, manualId);
+
+      Serial.print(F("[Manual] Final status: "));
+      Serial.println(result.finalStatus);
+      if (result.logId.length()) {
+        Serial.print(F("[Manual] Log ID: "));
+        Serial.println(result.logId);
+      }
+      break;
+    }
+
+    case 0:
+      stopAllOutputs();
+      Serial.println(F("All outputs OFF"));
+      break;
+
+    default:
+      Serial.println(F("Invalid choice"));
+      break;
+  }
+}
+
+// ============================================================
+// SETUP / LOOP
+// ============================================================
+void setup() {
+  Serial.begin(SERIAL_BAUD);
+  delay(1500);
+
+  pinMode(PUMP1_PIN, OUTPUT);
+  pinMode(PUMP2_PIN, OUTPUT);
+  pinMode(PUMP3_PIN, OUTPUT);
+  pinMode(SOL1_PIN, OUTPUT);
+  pinMode(SOL2_PIN, OUTPUT);
+  pinMode(SOL3_PIN, OUTPUT);
+
+  stopAllOutputs();
+
+  lc1.begin(LC1_DT, LC1_SCK);
+  lc2.begin(LC2_DT, LC2_SCK);
+  lc3.begin(LC3_DT, LC3_SCK);
+
+  loadConfig();
+
+  connectWiFi();
+
+  if (firebaseAnonymousSignIn()) {
+    Serial.println(F("[Setup] Firebase ready"));
+  } else {
+    Serial.println(F("[Setup] Firebase sign-in failed"));
+  }
+
+  syncTime();
+
+  gDeviceBusy = false;
+  gDeviceState = "IDLE";
+  gLastExecutionStatus = "";
+  updateDeviceStatusDocument();
+  gLastHeartbeatMs = millis();
+
+  Serial.println(F("\nSystem ready"));
+  Serial.println(F("Open Serial Monitor at 115200"));
+
+  showMenu();
+  gMenuShown = true;
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  if (now - gLastCommandPollMs >= COMMAND_POLL_INTERVAL_MS) {
+    gLastCommandPollMs = now;
+    pollAndHandleCloudCommand();
+  }
+
+  if (now - gLastHeartbeatMs >= STATUS_HEARTBEAT_MS) {
+    gLastHeartbeatMs = now;
+    updateDeviceStatusDocument();
+  }
+
+  if (!gMenuShown) {
+    showMenu();
+    gMenuShown = true;
+  }
+
+  if (Serial.available()) {
+    int cmd = readIntBlocking();
+    processSerialCommand(cmd);
+    gMenuShown = false;
+  }
+
+  delay(50);
+}
