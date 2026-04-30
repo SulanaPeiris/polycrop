@@ -99,9 +99,9 @@ function CapturePreview({ data }: { data: any }) {
           Cucumber: {counts.cucumber ?? 0} | Leaf: {counts.leaf ?? 0} | Flower: {counts.flower ?? 0}
         </Text>
         <Text style={styles.line}>Diseases: {diseases.length ? diseases.join(", ") : "None"}</Text>
-        <Text style={[styles.line, sprayRecommended ? styles.sprayYes : styles.sprayNo]}>
+        {/* <Text style={[styles.line, sprayRecommended ? styles.sprayYes : styles.sprayNo]}>
           Spray: {sprayRecommended ? "Recommended" : "Not needed"}
-        </Text>
+        </Text> */}
 
         {/* Cucumber size */}
         {cm ? (

@@ -425,7 +425,7 @@ def process(req: ProcessRequest):
     annotated_path = storage_path.replace("/captures/", "/captures_annotated/")
     annotated_storage_path, annotated_url = upload_with_permanent_url(annotated_path, annotated_bytes)
 
-    SPRAY_SEVERITY_THRESHOLD = 3.0
+    SPRAY_SEVERITY_THRESHOLD = 1.0
     spray_recommended = any((x.get("totalSeverityPercent", 0.0) >= SPRAY_SEVERITY_THRESHOLD) for x in per_leaf)
     decision = "SPRAY" if spray_recommended else "NO_SPRAY"
     spray_duration_ms = 3000 if spray_recommended else 0
