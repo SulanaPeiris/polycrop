@@ -56,6 +56,7 @@ export default function CameraScreen({ navigation }: any) {
 
         const status = r.captureStatus ?? "";
         const requestId = r.captureRequestId ?? "";
+        console.log("[Camera] robot snapshot:", { robotId, status, requestId, data: r });
 
         if (status !== "REQUESTED") return;
         if (!requestId) return;
@@ -67,20 +68,26 @@ export default function CameraScreen({ navigation }: any) {
         const plantId = r.capturePlantId ?? null;
 
         try {
+          console.log("[Camera] Auto-capture triggered", { robotId, requestId, plantId });
           setProcessing(true);
           setLastHandledRequestId(requestId);
 
           // Take photo
           // @ts-ignore
+          console.log("[Camera] taking photo...");
           const photo = await cameraRef.current?.takePictureAsync?.({
             quality: 0.8,
             exif: false,
             skipProcessing: false,
           });
 
+          console.log("[Camera] photo captured", photo?.uri);
+
           if (!photo?.uri) throw new Error("No photo captured");
           const normalizedUri = await normalizeToPortraitJpeg(photo);
+          console.log("[Camera] normalized uri", normalizedUri);
 
+          console.log("[Camera] upload+process start", { tunnelId, plantId, robotId, requestId });
           const payload = await captureUploadAndProcess({
             photoUri: normalizedUri,
             tunnelId,
@@ -97,6 +104,8 @@ export default function CameraScreen({ navigation }: any) {
             direction: r.captureDirection ?? null,
           });
 
+          console.log("[Camera] upload+process result", payload);
+
           // ACK robot: capture is ready (backend will later set DECIDED)
           await updateDoc(rref, {
             captureStatus: "CAPTURED",
@@ -104,8 +113,10 @@ export default function CameraScreen({ navigation }: any) {
             captureImageUrl: payload.imageUrl ?? null,
             updatedAt: serverTimestamp(),
           });
+
+          console.log("[Camera] robot ack updated", { captureId: payload.captureId });
         } catch (e: any) {
-          console.log("AUTO CAPTURE ERROR:", e?.message, e);
+          console.log("[Camera] AUTO CAPTURE ERROR:", e?.message, e);
           Alert.alert("Auto capture failed", e?.message ?? "Unknown error");
 
           // Ensure robot doesn't wait forever
@@ -140,8 +151,11 @@ export default function CameraScreen({ navigation }: any) {
 
       if (!photo?.uri) throw new Error("No photo captured");
       const normalizedUri = await normalizeToPortraitJpeg(photo);
+      
+      console.log("[Camera] manual capture taken", photo?.uri);
+      console.log("[Camera] manual normalized uri", normalizedUri);
 
-      await captureUploadAndProcess({
+      const payload = await captureUploadAndProcess({
         photoUri: normalizedUri,
         tunnelId,
         plantId: null,
@@ -154,6 +168,8 @@ export default function CameraScreen({ navigation }: any) {
         rounds: null,
         direction: null,
       });
+
+      console.log("[Camera] manual capture result", payload);
 
       Alert.alert("Done", "Manual capture processed.");
     } catch (e: any) {

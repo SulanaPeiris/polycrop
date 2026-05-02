@@ -4,6 +4,16 @@ import { auth, db, storage } from "../firebase/firebase";
 
 const INFER_URL = process.env.EXPO_PUBLIC_INFER_URL;
 
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 60000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function uriToBlob(uri: string): Promise<Blob> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -79,14 +89,18 @@ export async function captureUploadAndProcess(params: {
   const user = auth.currentUser;
   if (!user) throw new Error("Not logged in");
 
+  console.log("[capturePipeline] start", { inferUrl: INFER_URL, tunnelId: params.tunnelId ?? null, plantId: params.plantId ?? null, user: user?.uid });
+
   const tunnelId = params.tunnelId ?? null;
   const plantId = params.plantId ?? null;
 
   // ✅ Ensure requestId exists (important for linking sensor readings)
   const requestId = (params.requestId ?? makeRequestId()).toString();
+  console.log("[capturePipeline] requestId", requestId);
 
   // ✅ Read ultrasonic distance at capture time
   const distanceCm = await waitUltrasonicDistanceCm(requestId);
+  console.log("[capturePipeline] distanceCm", distanceCm);
 
   // 1) Upload ORIGINAL image to Firebase Storage
   const blob = await uriToBlob(params.photoUri);
@@ -100,8 +114,10 @@ export async function captureUploadAndProcess(params: {
   const storagePath = `${basePath}/${requestId}.jpg`;
   const storageRef = ref(storage, storagePath);
 
+  console.log("[capturePipeline] uploading to storagePath", storagePath);
   await uploadBytes(storageRef, blob, { contentType: "image/jpeg" });
   const imageUrl = await getDownloadURL(storageRef);
+  console.log("[capturePipeline] uploaded imageUrl", imageUrl);
 
   // 2) Create Firestore capture doc FIRST
   const capRef = await addDoc(collection(db, "captures"), {
@@ -140,6 +156,7 @@ export async function captureUploadAndProcess(params: {
   });
 
   const captureId = capRef.id;
+  console.log("[capturePipeline] created capture doc", captureId);
 
   // mirror under plant
   if (tunnelId && plantId) {
@@ -188,20 +205,26 @@ export async function captureUploadAndProcess(params: {
       });
     }
 
-    const res = await fetch(`${INFER_URL}/process`, {
+    console.log("[capturePipeline] calling backend process", `${INFER_URL}/process`, { captureId });
+    const processUrl = `${INFER_URL}/process`;
+    console.log("[capturePipeline] backend process request", { processUrl, captureId });
+    const res = await fetchWithTimeout(processUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ captureId }),
-    });
+    }, 60000);
 
     if (!res.ok) {
       const text = await res.text();
+      console.log("[capturePipeline] backend error response", res.status, text);
       throw new Error(text || "Processing failed");
     }
 
     const payload = await res.json();
+    console.log("[capturePipeline] backend payload", payload);
     return { captureId, imageUrl, storagePath, requestId, distanceCm, ...payload };
   } catch (e: any) {
+    console.log("[capturePipeline] processing failed", e?.message ?? e);
     await updateDoc(doc(db, "captures", captureId), {
       status: "FAILED",
       error: e?.message ?? "Unknown error",

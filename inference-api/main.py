@@ -12,6 +12,7 @@ from ultralytics import YOLO
 
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
+from pathlib import Path
 
 # ====== CONFIG ======
 BUCKET_NAME = "polycrop.firebasestorage.app"
@@ -56,8 +57,13 @@ DISEASE_COLORS_BGR = {
 
 # ====== Firebase Admin init (guard for reload) ======
 if not firebase_admin._apps:
-    cred = credentials.Certificate("serviceAccountKey.json")
-    firebase_admin.initialize_app(cred, {"storageBucket": BUCKET_NAME})
+    sa_path = Path(__file__).parent / "serviceAccountKey.json"
+    if sa_path.exists():
+        cred = credentials.Certificate(str(sa_path))
+        firebase_admin.initialize_app(cred, {"storageBucket": BUCKET_NAME})
+    else:
+        # Fall back to Application Default Credentials if available.
+        firebase_admin.initialize_app(options={"storageBucket": BUCKET_NAME})
 
 db = firestore.client()
 bucket = storage.bucket()
@@ -360,7 +366,12 @@ def health():
 @app.post("/process")
 def process(req: ProcessRequest):
     cap_ref = db.collection("captures").document(req.captureId)
-    snap = cap_ref.get()
+    try:
+        print("[process] reading capture", req.captureId)
+        snap = cap_ref.get(timeout=10)
+    except Exception as e:
+        print("[process] firestore read failed", repr(e))
+        raise HTTPException(status_code=500, detail=f"Failed to read capture: {e}")
     if not snap.exists:
         raise HTTPException(status_code=404, detail="Capture not found")
 
@@ -378,8 +389,12 @@ def process(req: ProcessRequest):
     # ultrasonic distance (cm) should be saved into capture.meta.distanceCm
     distance_cm: Optional[float] = safe_float(meta.get("distanceCm"))
 
-    src_blob = bucket.blob(storage_path)
-    img_bytes = src_blob.download_as_bytes()
+    try:
+        src_blob = bucket.blob(storage_path)
+        img_bytes = src_blob.download_as_bytes()
+    except Exception as e:
+        print("[process] storage download failed", repr(e))
+        raise HTTPException(status_code=500, detail=f"Failed to download capture image: {e}")
 
     pil = Image.open(io.BytesIO(img_bytes))
     pil = ImageOps.exif_transpose(pil).convert("RGB")
