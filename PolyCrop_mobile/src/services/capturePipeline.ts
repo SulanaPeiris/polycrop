@@ -4,7 +4,11 @@ import { auth, db, storage } from "../firebase/firebase";
 
 const INFER_URL = process.env.EXPO_PUBLIC_INFER_URL;
 
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 180000) {
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs = 180000
+) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
