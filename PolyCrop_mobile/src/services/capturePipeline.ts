@@ -4,11 +4,17 @@ import { auth, db, storage } from "../firebase/firebase";
 
 const INFER_URL = process.env.EXPO_PUBLIC_INFER_URL;
 
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 60000) {
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 180000) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
   try {
     return await fetch(url, { ...init, signal: controller.signal });
+  } catch (error: any) {
+    if (error?.name === "AbortError" || error?.message === "Aborted") {
+      throw new Error(`Backend processing timeout after ${timeoutMs / 1000}s`);
+    }
+    throw error;
   } finally {
     clearTimeout(timeout);
   }
@@ -212,7 +218,7 @@ export async function captureUploadAndProcess(params: {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ captureId }),
-    }, 60000);
+    }, 180000);
 
     if (!res.ok) {
       const text = await res.text();
