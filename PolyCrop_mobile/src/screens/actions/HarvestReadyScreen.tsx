@@ -1,12 +1,18 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity } from "react-native";
+import {
+  View,
+  Text,
+  StyleSheet,
+  ScrollView,
+  TouchableOpacity,
+} from "react-native";
 import { Ionicons } from "@expo/vector-icons";
-import { useTunnelHeader } from "../../hooks/useTunnelHeader";
-import SectionTitle from "../components/SectionTitle";
 import { collection, onSnapshot } from "firebase/firestore";
 
 import { db } from "../../firebase/firebase";
 import { useTunnel } from "../../context/TunnelContext";
+import { useTunnelHeader } from "../../hooks/useTunnelHeader";
+import SectionTitle from "../components/SectionTitle";
 
 type PlantDoc = {
   id: string;
@@ -16,16 +22,32 @@ type PlantDoc = {
   plantName?: string;
   rfidA?: string | null;
   rfidB?: string | null;
+
   lastCaptureId?: string | null;
   lastAnnotatedUrl?: string | null;
   lastScanAt?: any;
+
+  lastCounts?: {
+    cucumber?: number;
+    leaf?: number;
+    flower?: number;
+  };
+
+  lastDistanceCm?: number | null;
+  lastCucumberLengthCm?: number | null;
+  lastCucumberDiameterCm?: number | null;
+
+  lastRipe?: boolean | null;
+  lastRipeCucumberCount?: number | null;
+  lastRipeCucumbers?: any[];
 };
 
 type DisplayMetrics = {
   cucumberCount: number;
-  distanceCm: number;
-  lengthCm: number;
-  diameterCm: number;
+  ripeCucumberCount: number;
+  distanceCm: number | null;
+  lengthCm: number | null;
+  diameterCm: number | null;
   ripe: boolean;
 };
 
@@ -35,42 +57,52 @@ function parseIdToRowCol(id: string): { row?: number; column?: number } {
   return { row: Number(m[1]), column: Number(m[2]) };
 }
 
-function hashString(value: string) {
-  let h = 0;
-  for (let i = 0; i < value.length; i += 1) {
-    h = (h * 31 + value.charCodeAt(i)) >>> 0;
-  }
-  return h;
-}
-
-function seededRange(seed: number, min: number, max: number, decimals = 1) {
-  const x = Math.abs(Math.sin(seed) * 10000) % 1;
-  const raw = min + x * (max - min);
-  return Number(raw.toFixed(decimals));
-}
-
 function isPlantRFIDAssigned(plant: PlantDoc) {
   return Boolean((plant.rfidA || "").trim() || (plant.rfidB || "").trim());
 }
 
-function getFrontendMetrics(plant: PlantDoc, cucumberCount: number): DisplayMetrics {
-  const seed = hashString(plant.id || plant.plantUid || "plant");
-  const safeCount = Math.max(0, Number(cucumberCount ?? 0));
+function toNumberOrNull(value: any): number | null {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
 
-  const ripe = safeCount > 0 ? seed % 2 === 0 : false;
-  const distanceCm = seededRange(seed + 11, 30, 40, 1);
-  const lengthCm = ripe
-    ? seededRange(seed + 23, 15, 18, 1)
-    : seededRange(seed + 23, 8, 14.5, 1);
-  const diameterCm = ripe
-    ? seededRange(seed + 37, 2.1, 2.9, 1)
-    : seededRange(seed + 37, 1.2, 2.4, 1);
+function roundOrNull(value: any, decimals = 1): number | null {
+  const n = toNumberOrNull(value);
+  if (n === null) return null;
+  return Number(n.toFixed(decimals));
+}
+
+function formatCm(value: number | null, decimals = 1) {
+  if (value === null || value <= 0) return "N/A";
+  return `${value.toFixed(decimals)} cm`;
+}
+
+function getBackendMetrics(
+  plant: PlantDoc,
+  fallbackCucumberCount: number
+): DisplayMetrics {
+  const countFromPlant = toNumberOrNull(plant?.lastCounts?.cucumber);
+  const cucumberCount =
+    countFromPlant !== null
+      ? Math.max(0, countFromPlant)
+      : Math.max(0, Number(fallbackCucumberCount ?? 0));
+
+  const ripeCountFromPlant = toNumberOrNull(plant?.lastRipeCucumberCount);
+  const ripeCucumberCount =
+    ripeCountFromPlant !== null
+      ? Math.max(0, ripeCountFromPlant)
+      : plant?.lastRipe === true
+      ? 1
+      : 0;
+
+  const ripe = plant?.lastRipe === true || ripeCucumberCount > 0;
 
   return {
-    cucumberCount: safeCount,
-    distanceCm,
-    lengthCm,
-    diameterCm,
+    cucumberCount,
+    ripeCucumberCount,
+    distanceCm: roundOrNull(plant?.lastDistanceCm, 1),
+    lengthCm: roundOrNull(plant?.lastCucumberLengthCm, 2),
+    diameterCm: roundOrNull(plant?.lastCucumberDiameterCm, 2),
     ripe,
   };
 }
@@ -82,6 +114,7 @@ function toPlantTitle(plant: PlantDoc) {
 function toShortPlantLabel(plant: PlantDoc) {
   const row = plant.row ?? parseIdToRowCol(plant.id).row;
   const column = plant.column ?? parseIdToRowCol(plant.id).column;
+
   if (row && column) return `R${row}C${column}`;
   return (plant.plantUid ?? plant.id).replace("P-", "");
 }
@@ -90,28 +123,39 @@ export default function HarvestReadyScreen({ navigation }: any) {
   useTunnelHeader("Harvest Ready");
 
   const { selectedTunnel } = useTunnel();
-  const tunnelId = selectedTunnel?.id ?? "";
 
+  const tunnelId = selectedTunnel?.id ?? "";
   const rows = selectedTunnel?.rows ?? 0;
   const cols = selectedTunnel?.columns ?? 0;
 
   const [plants, setPlants] = useState<PlantDoc[]>([]);
   const [selectedPlant, setSelectedPlant] = useState<PlantDoc | null>(null);
-  const [captureCountsByPlant, setCaptureCountsByPlant] = useState<Record<string, number>>({});
+  const [captureCountsByPlant, setCaptureCountsByPlant] = useState<
+    Record<string, number>
+  >({});
 
   useEffect(() => {
     if (!tunnelId) {
       setPlants([]);
       return;
     }
+
     const ref = collection(db, "tunnels", tunnelId, "plants");
+
     return onSnapshot(ref, (snap) => {
-      const list = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) })) as PlantDoc[];
+      const list = snap.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as any),
+      })) as PlantDoc[];
+
       setPlants(list);
     });
   }, [tunnelId]);
 
-  const assignedPlants = useMemo(() => plants.filter(isPlantRFIDAssigned), [plants]);
+  const assignedPlants = useMemo(
+    () => plants.filter(isPlantRFIDAssigned),
+    [plants]
+  );
 
   useEffect(() => {
     if (!tunnelId || assignedPlants.length === 0) {
@@ -120,13 +164,22 @@ export default function HarvestReadyScreen({ navigation }: any) {
     }
 
     const unsubscribers = assignedPlants.map((plant) => {
-      const ref = collection(db, "tunnels", tunnelId, "plants", plant.id, "captures");
+      const ref = collection(
+        db,
+        "tunnels",
+        tunnelId,
+        "plants",
+        plant.id,
+        "captures"
+      );
+
       return onSnapshot(ref, (snap) => {
         let cucumberCount = 0;
 
         snap.forEach((docSnap) => {
           const data: any = docSnap.data() || {};
           const status = String(data.status ?? "").toUpperCase();
+
           if (status && status !== "DONE") return;
 
           const count = Number(data?.outputs?.summary?.counts?.cucumber ?? 0);
@@ -153,19 +206,29 @@ export default function HarvestReadyScreen({ navigation }: any) {
 
   const plantsByCoord = useMemo(() => {
     const map: Record<string, PlantDoc> = {};
+
     for (const p of assignedPlants) {
       const rr = p.row ?? parseIdToRowCol(p.id).row;
       const cc = p.column ?? parseIdToRowCol(p.id).column;
-      if (rr && cc) map[`r${rr}_c${cc}`] = { ...p, row: rr, column: cc };
+
+      if (rr && cc) {
+        map[`r${rr}_c${cc}`] = { ...p, row: rr, column: cc };
+      }
     }
+
     return map;
   }, [assignedPlants]);
 
   const displayMetricsByPlant = useMemo(() => {
     const map: Record<string, DisplayMetrics> = {};
+
     for (const plant of assignedPlants) {
-      map[plant.id] = getFrontendMetrics(plant, captureCountsByPlant[plant.id] ?? 0);
+      map[plant.id] = getBackendMetrics(
+        plant,
+        captureCountsByPlant[plant.id] ?? 0
+      );
     }
+
     return map;
   }, [assignedPlants, captureCountsByPlant]);
 
@@ -174,83 +237,114 @@ export default function HarvestReadyScreen({ navigation }: any) {
     [assignedPlants, displayMetricsByPlant]
   );
 
-  const totalRipeCount = harvestReadyPlants.length;
+  const totalRipePlants = harvestReadyPlants.length;
+
   const totalHarvestReadyCucumbers = harvestReadyPlants.reduce(
-    (sum, plant) => sum + (displayMetricsByPlant[plant.id]?.cucumberCount ?? 0),
+    (sum, plant) =>
+      sum + (displayMetricsByPlant[plant.id]?.ripeCucumberCount ?? 0),
     0
   );
 
   const totalAssignedPlants = assignedPlants.length;
+
   const totalAssignedCucumbers = assignedPlants.reduce(
     (sum, plant) => sum + (displayMetricsByPlant[plant.id]?.cucumberCount ?? 0),
     0
   );
 
-  const selectedMetrics = selectedPlant ? displayMetricsByPlant[selectedPlant.id] : null;
+  const selectedMetrics = selectedPlant
+    ? displayMetricsByPlant[selectedPlant.id]
+    : null;
+
   const selectedRFID = selectedPlant
     ? [selectedPlant.rfidA, selectedPlant.rfidB].filter(Boolean).join(" / ")
     : "";
 
-  const tunnelName = selectedTunnel?.tunnelName ?? selectedTunnel?.name ?? "Select a tunnel";
+  const tunnelName =
+    selectedTunnel?.tunnelName ?? selectedTunnel?.name ?? "Select a tunnel";
 
   const getPlantCardStyle = (plant: PlantDoc) => {
     const metrics = displayMetricsByPlant[plant.id];
-    if (metrics?.ripe) return { bg: "#FFF3E0", border: "#FFCC80", dot: "#EF6C00" };
+
+    if (metrics?.ripe) {
+      return { bg: "#FFF3E0", border: "#FFCC80", dot: "#EF6C00" };
+    }
+
     return { bg: "#E8F5E9", border: "#A5D6A7", dot: "#2E7D32" };
   };
 
   return (
     <View style={styles.container}>
-      <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
+      <ScrollView contentContainerStyle={styles.scrollContent}>
         <View style={styles.summaryCard}>
           <View style={styles.summaryIconBox}>
             <Ionicons name="basket" size={28} color="#fff" />
           </View>
+
           <View style={{ flex: 1 }}>
             <Text style={styles.summaryLabel}>Harvest Ready</Text>
-            <Text style={styles.summaryValue}>{totalRipeCount} Plants</Text>
-            <Text style={styles.summarySub}>{totalHarvestReadyCucumbers} Cucumbers • {tunnelName}</Text>
+            <Text style={styles.summaryValue}>{totalRipePlants} Plants</Text>
             <Text style={styles.summarySub}>
-              RFID assigned: {totalAssignedPlants} Plants • {totalAssignedCucumbers} Cucumbers
+              {totalHarvestReadyCucumbers} ripe cucumbers • {tunnelName}
             </Text>
           </View>
         </View>
 
-        <SectionTitle title="Tunnel Map" />
         <Text style={styles.legend}>
-          Only RFID-assigned plants are shown on the live tunnel layout. Cucumber counts come from each plant’s captures.
+          RFID assigned: {totalAssignedPlants} Plants • {totalAssignedCucumbers}{" "}
+          Detected Cucumbers
         </Text>
 
+        <Text style={styles.helper}>
+          Only RFID-assigned plants are shown on the live tunnel layout.
+        </Text>
+
+        <Text style={styles.helper}>
+          Ripe status comes from backend detection: length 15–16 cm and diameter
+          2.5–3.0 cm.
+        </Text>
+
+        <SectionTitle title="Live Tunnel Layout" />
+
         {!tunnelId ? (
-          <Text style={styles.helper}>Select a tunnel first.</Text>
+          <View style={styles.emptyBox}>
+            <Text style={styles.emptyText}>Select a tunnel first.</Text>
+          </View>
         ) : rows <= 0 || cols <= 0 ? (
-          <Text style={styles.helper}>This tunnel has no layout. Set rows and columns in tunnel setup.</Text>
+          <View style={styles.emptyBox}>
+            <Text style={styles.emptyText}>
+              This tunnel has no layout. Set rows and columns in tunnel setup.
+            </Text>
+          </View>
         ) : (
           <View style={styles.tunnelMapCard}>
             <View style={styles.mapHeader}>
               <View>
                 <Text style={styles.mapTitle}>{tunnelName}</Text>
-                <Text style={styles.mapSubTitle}>{rows} rows × {cols} columns</Text>
+                <Text style={styles.mapSubTitle}>
+                  {rows} rows × {cols} columns
+                </Text>
               </View>
+
               <View style={styles.entrancePill}>
-                <Ionicons name="log-in-outline" size={14} color="#2E7D32" />
+                <Ionicons name="walk-outline" size={15} color="#2E7D32" />
                 <Text style={styles.entrancePillText}>Entrance</Text>
               </View>
             </View>
 
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.horizontalPad}>
-              <View>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+              <View style={styles.horizontalPad}>
                 <View style={styles.columnHeaderRow}>
                   <View style={styles.axisCorner} />
                   {Array.from({ length: cols }).map((_, cIndex) => (
-                    <View key={`head-${cIndex + 1}`} style={styles.columnHeaderCell}>
+                    <View key={`c-${cIndex}`} style={styles.columnHeaderCell}>
                       <Text style={styles.axisText}>C{cIndex + 1}</Text>
                     </View>
                   ))}
                 </View>
 
                 {Array.from({ length: rows }).map((_, rIndex) => (
-                  <View key={`row-${rIndex + 1}`} style={styles.mapRowWrap}>
+                  <View key={`r-${rIndex}`} style={styles.mapRowWrap}>
                     <View style={styles.rowHeaderCell}>
                       <Text style={styles.axisText}>R{rIndex + 1}</Text>
                     </View>
@@ -262,7 +356,10 @@ export default function HarvestReadyScreen({ navigation }: any) {
 
                         if (!plant) {
                           return (
-                            <View key={id} style={[styles.emptyPlantSlot, styles.mapCell]}>
+                            <View
+                              key={id}
+                              style={[styles.mapCell, styles.emptyPlantSlot]}
+                            >
                               <Text style={styles.emptyPlantText}>—</Text>
                             </View>
                           );
@@ -274,29 +371,46 @@ export default function HarvestReadyScreen({ navigation }: any) {
 
                         return (
                           <TouchableOpacity
-                            key={plant.id}
-                            activeOpacity={0.82}
+                            key={id}
+                            activeOpacity={0.85}
                             onPress={() => setSelectedPlant(plant)}
                             style={[
                               styles.mapCell,
                               styles.plantCard,
                               {
                                 backgroundColor: cardStyle.bg,
-                                borderColor: isSelected ? "#2E7D32" : cardStyle.border,
+                                borderColor: isSelected
+                                  ? "#2E7D32"
+                                  : cardStyle.border,
                               },
                               isSelected && styles.selectedPlantCard,
                             ]}
                           >
                             <View style={styles.cardTopRow}>
-                              <View style={[styles.statusDot, { backgroundColor: cardStyle.dot }]} />
+                              <View
+                                style={[
+                                  styles.statusDot,
+                                  { backgroundColor: cardStyle.dot },
+                                ]}
+                              />
+
                               <View style={styles.countBadge}>
-                                <Text style={styles.countText}>{metrics?.cucumberCount ?? 0}</Text>
+                                <Text style={styles.countText}>
+                                  {metrics?.ripe
+                                    ? metrics?.ripeCucumberCount ?? 0
+                                    : metrics?.cucumberCount ?? 0}
+                                </Text>
                               </View>
                             </View>
 
-                            <Text style={styles.plantCardLabel}>{toShortPlantLabel(plant)}</Text>
+                            <Text style={styles.plantCardLabel}>
+                              {toShortPlantLabel(plant)}
+                            </Text>
+
                             <Text style={styles.plantCardRfid} numberOfLines={1}>
-                              {[plant.rfidA, plant.rfidB].filter(Boolean).join(" / ")}
+                              {[plant.rfidA, plant.rfidB]
+                                .filter(Boolean)
+                                .join(" / ")}
                             </Text>
                           </TouchableOpacity>
                         );
@@ -306,35 +420,36 @@ export default function HarvestReadyScreen({ navigation }: any) {
                 ))}
               </View>
             </ScrollView>
+
+            <View style={styles.legendContainer}>
+              <View style={styles.legendItem}>
+                <View style={[styles.legendDot, { backgroundColor: "#EF6C00" }]} />
+                <Text style={styles.legendText}>Harvest Ready</Text>
+              </View>
+
+              <View style={styles.legendItem}>
+                <View style={[styles.legendDot, { backgroundColor: "#2E7D32" }]} />
+                <Text style={styles.legendText}>Growing</Text>
+              </View>
+
+              <View style={styles.legendItem}>
+                <View style={styles.legendBadgeMini}>
+                  <Text style={styles.legendBadgeText}>2</Text>
+                </View>
+                <Text style={styles.legendText}>Cucumbers</Text>
+              </View>
+            </View>
           </View>
         )}
-
-        <View style={styles.legendContainer}>
-          <View style={styles.legendItem}>
-            <View style={[styles.legendDot, { backgroundColor: "#EF6C00" }]} />
-            <Text style={styles.legendText}>Harvest Ready</Text>
-          </View>
-          <View style={styles.legendItem}>
-            <View style={[styles.legendDot, { backgroundColor: "#2E7D32" }]} />
-            <Text style={styles.legendText}>Growing</Text>
-          </View>
-          <View style={styles.legendItem}>
-            <View style={styles.legendBadgeMini}>
-              <Text style={styles.legendBadgeText}>2</Text>
-            </View>
-            <Text style={styles.legendText}>Cucumbers from captures</Text>
-          </View>
-        </View>
-
-        <View style={{ height: 220 }} />
       </ScrollView>
 
       {selectedPlant && selectedMetrics && (
         <View style={styles.bottomSheet}>
           <View style={styles.sheetHeader}>
             <Text style={styles.sheetTitle}>{toPlantTitle(selectedPlant)}</Text>
+
             <TouchableOpacity onPress={() => setSelectedPlant(null)}>
-              <Ionicons name="close-circle" size={28} color="#aaa" />
+              <Ionicons name="close" size={24} color="#555" />
             </TouchableOpacity>
           </View>
 
@@ -342,12 +457,16 @@ export default function HarvestReadyScreen({ navigation }: any) {
             <View
               style={[
                 styles.iconBox,
-                { backgroundColor: selectedMetrics.ripe ? "#FFF3E0" : "#E8F5E9" },
+                {
+                  backgroundColor: selectedMetrics.ripe
+                    ? "#FFF3E0"
+                    : "#E8F5E9",
+                },
               ]}
             >
               <Ionicons
-                name={selectedMetrics.ripe ? "basket" : "leaf"}
-                size={24}
+                name={selectedMetrics.ripe ? "basket" : "leaf-outline"}
+                size={26}
                 color={selectedMetrics.ripe ? "#EF6C00" : "#2E7D32"}
               />
             </View>
@@ -356,27 +475,49 @@ export default function HarvestReadyScreen({ navigation }: any) {
               <Text style={styles.detailTitle}>
                 {selectedMetrics.ripe ? "Ready for Harvest" : "Not Ready Yet"}
               </Text>
-              <Text style={styles.detailSubtitle}>RFID: {selectedRFID || "Assigned"}</Text>
-              <Text style={styles.detailSubtitle}>Captured cucumbers: {selectedMetrics.cucumberCount}</Text>
+
               <Text style={styles.detailSubtitle}>
-                Length: {selectedMetrics.lengthCm} cm • Diameter: {selectedMetrics.diameterCm} cm
+                RFID: {selectedRFID || "Assigned"}
               </Text>
-              <Text style={styles.detailSubtitle}>Distance: {selectedMetrics.distanceCm} cm</Text>
+
+              <Text style={styles.detailSubtitle}>
+                Detected cucumbers: {selectedMetrics.cucumberCount}
+              </Text>
+
+              <Text style={styles.detailSubtitle}>
+                Ripe cucumbers: {selectedMetrics.ripeCucumberCount}
+              </Text>
+
+              <Text style={styles.detailSubtitle}>
+                Length: {formatCm(selectedMetrics.lengthCm, 2)} • Diameter:{" "}
+                {formatCm(selectedMetrics.diameterCm, 2)}
+              </Text>
+
+              <Text style={styles.detailSubtitle}>
+                Distance: {formatCm(selectedMetrics.distanceCm, 1)}
+              </Text>
             </View>
 
             <View
               style={[
                 styles.bigCountBadge,
-                { backgroundColor: selectedMetrics.ripe ? "#EF6C00" : "#2E7D32" },
+                {
+                  backgroundColor: selectedMetrics.ripe
+                    ? "#EF6C00"
+                    : "#2E7D32",
+                },
               ]}
             >
-              <Text style={styles.bigCountText}>{selectedMetrics.ripe ? "RIPE" : "UNRIPE"}</Text>
+              <Text style={styles.bigCountText}>
+                {selectedMetrics.ripe ? "RIPE" : "UNRIPE"}
+              </Text>
             </View>
           </View>
 
           {tunnelId ? (
             <TouchableOpacity
               style={styles.viewScansBtn}
+              activeOpacity={0.85}
               onPress={() => {
                 setSelectedPlant(null);
                 navigation.navigate("DetectionDetail", {
@@ -386,8 +527,8 @@ export default function HarvestReadyScreen({ navigation }: any) {
                 });
               }}
             >
-              <Ionicons name="scan-outline" size={18} color="#fff" />
-              <Text style={styles.viewScansText}>View Scans</Text>
+              <Ionicons name="images-outline" size={18} color="#fff" />
+              <Text style={styles.viewScansText}>View Cucumber Scans</Text>
             </TouchableOpacity>
           ) : null}
         </View>
@@ -400,7 +541,7 @@ const CELL_SIZE = 84;
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#F9F9F9" },
-  scrollContent: { padding: 16 },
+  scrollContent: { padding: 16, paddingBottom: 150 },
 
   summaryCard: {
     backgroundColor: "#2E7D32",
@@ -420,11 +561,28 @@ const styles = StyleSheet.create({
     marginRight: 14,
   },
   summaryLabel: { color: "#D7F5DD", fontSize: 13, fontWeight: "600" },
-  summaryValue: { color: "#fff", fontSize: 24, fontWeight: "800", marginTop: 2 },
+  summaryValue: {
+    color: "#fff",
+    fontSize: 24,
+    fontWeight: "800",
+    marginTop: 2,
+  },
   summarySub: { color: "#EAF8ED", fontSize: 13, marginTop: 4 },
 
   legend: { color: "#7A7A7A", marginTop: -6, marginBottom: 12, fontSize: 13 },
-  helper: { color: "#777", marginTop: 10 },
+  helper: { color: "#777", marginBottom: 8, fontSize: 13 },
+
+  emptyBox: {
+    backgroundColor: "#fff",
+    borderRadius: 18,
+    padding: 18,
+    borderWidth: 1,
+    borderColor: "#ECECEC",
+  },
+  emptyText: {
+    color: "#777",
+    fontWeight: "700",
+  },
 
   tunnelMapCard: {
     backgroundColor: "#fff",
@@ -441,16 +599,8 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between",
   },
-  mapTitle: {
-    fontSize: 17,
-    fontWeight: "800",
-    color: "#1E1E1E",
-  },
-  mapSubTitle: {
-    fontSize: 12,
-    color: "#777",
-    marginTop: 3,
-  },
+  mapTitle: { fontSize: 17, fontWeight: "800", color: "#1E1E1E" },
+  mapSubTitle: { fontSize: 12, color: "#777", marginTop: 3 },
   entrancePill: {
     flexDirection: "row",
     alignItems: "center",
@@ -460,51 +610,18 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
     borderRadius: 999,
   },
-  entrancePillText: {
-    color: "#2E7D32",
-    fontSize: 12,
-    fontWeight: "700",
-  },
-  horizontalPad: {
-    paddingHorizontal: 16,
-    paddingBottom: 4,
-  },
-  columnHeaderRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    marginBottom: 8,
-  },
-  axisCorner: {
-    width: 34,
-  },
-  columnHeaderCell: {
-    width: CELL_SIZE,
-    alignItems: "center",
-  },
-  rowHeaderCell: {
-    width: 34,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  axisText: {
-    fontSize: 12,
-    fontWeight: "700",
-    color: "#7A7A7A",
-  },
-  mapRowWrap: {
-    flexDirection: "row",
-    alignItems: "center",
-    marginBottom: 10,
-  },
-  mapRow: {
-    flexDirection: "row",
-  },
-  mapCell: {
-    width: CELL_SIZE,
-    height: 72,
-    marginRight: 10,
-    borderRadius: 18,
-  },
+  entrancePillText: { color: "#2E7D32", fontSize: 12, fontWeight: "700" },
+
+  horizontalPad: { paddingHorizontal: 16, paddingBottom: 4 },
+  columnHeaderRow: { flexDirection: "row", alignItems: "center", marginBottom: 8 },
+  axisCorner: { width: 34 },
+  columnHeaderCell: { width: CELL_SIZE, alignItems: "center" },
+  rowHeaderCell: { width: 34, alignItems: "center", justifyContent: "center" },
+  axisText: { fontSize: 12, fontWeight: "700", color: "#7A7A7A" },
+  mapRowWrap: { flexDirection: "row", alignItems: "center", marginBottom: 10 },
+  mapRow: { flexDirection: "row" },
+
+  mapCell: { width: CELL_SIZE, height: 72, marginRight: 10, borderRadius: 18 },
   emptyPlantSlot: {
     backgroundColor: "#F5F5F5",
     borderWidth: 1,
@@ -512,30 +629,15 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-  emptyPlantText: {
-    color: "#C5C5C5",
-    fontSize: 18,
-    fontWeight: "600",
-  },
-  plantCard: {
-    borderWidth: 1.5,
-    padding: 8,
-    justifyContent: "space-between",
-  },
-  selectedPlantCard: {
-    borderWidth: 2,
-    transform: [{ scale: 1.02 }],
-  },
+  emptyPlantText: { color: "#C5C5C5", fontSize: 18, fontWeight: "600" },
+  plantCard: { borderWidth: 1.5, padding: 8, justifyContent: "space-between" },
+  selectedPlantCard: { borderWidth: 2, transform: [{ scale: 1.02 }] },
   cardTopRow: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
   },
-  statusDot: {
-    width: 12,
-    height: 12,
-    borderRadius: 6,
-  },
+  statusDot: { width: 12, height: 12, borderRadius: 6 },
   countBadge: {
     minWidth: 22,
     height: 22,
@@ -545,43 +647,21 @@ const styles = StyleSheet.create({
     alignItems: "center",
     paddingHorizontal: 6,
   },
-  countText: {
-    color: "#fff",
-    fontSize: 11,
-    fontWeight: "800",
-  },
-  plantCardLabel: {
-    fontSize: 13,
-    fontWeight: "800",
-    color: "#222",
-  },
-  plantCardRfid: {
-    fontSize: 10,
-    color: "#666",
-  },
+  countText: { color: "#fff", fontSize: 11, fontWeight: "800" },
+  plantCardLabel: { fontSize: 13, fontWeight: "800", color: "#222" },
+  plantCardRfid: { fontSize: 10, color: "#666" },
 
   legendContainer: {
     flexDirection: "row",
     flexWrap: "wrap",
     gap: 14,
     marginTop: 16,
+    paddingHorizontal: 16,
     alignItems: "center",
   },
-  legendItem: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-  },
-  legendDot: {
-    width: 14,
-    height: 14,
-    borderRadius: 7,
-  },
-  legendText: {
-    color: "#666",
-    fontSize: 13,
-    fontWeight: "600",
-  },
+  legendItem: { flexDirection: "row", alignItems: "center", gap: 8 },
+  legendDot: { width: 14, height: 14, borderRadius: 7 },
+  legendText: { color: "#666", fontSize: 13, fontWeight: "600" },
   legendBadgeMini: {
     minWidth: 18,
     height: 18,
@@ -591,11 +671,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
     paddingHorizontal: 4,
   },
-  legendBadgeText: {
-    color: "#fff",
-    fontSize: 10,
-    fontWeight: "800",
-  },
+  legendBadgeText: { color: "#fff", fontSize: 10, fontWeight: "800" },
 
   bottomSheet: {
     position: "absolute",
@@ -626,11 +702,7 @@ const styles = StyleSheet.create({
     flex: 1,
     marginRight: 10,
   },
-  detailRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 12,
-  },
+  detailRow: { flexDirection: "row", alignItems: "center", gap: 12 },
   iconBox: {
     width: 52,
     height: 52,
@@ -644,21 +716,9 @@ const styles = StyleSheet.create({
     color: "#222",
     marginBottom: 4,
   },
-  detailSubtitle: {
-    fontSize: 13,
-    color: "#666",
-    marginBottom: 3,
-  },
-  bigCountBadge: {
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 14,
-  },
-  bigCountText: {
-    color: "#fff",
-    fontSize: 12,
-    fontWeight: "800",
-  },
+  detailSubtitle: { fontSize: 13, color: "#666", marginBottom: 3 },
+  bigCountBadge: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 14 },
+  bigCountText: { color: "#fff", fontSize: 12, fontWeight: "800" },
   viewScansBtn: {
     marginTop: 16,
     backgroundColor: "#2E7D32",
@@ -669,9 +729,5 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     gap: 8,
   },
-  viewScansText: {
-    color: "#fff",
-    fontSize: 14,
-    fontWeight: "700",
-  },
+  viewScansText: { color: "#fff", fontSize: 14, fontWeight: "700" },
 });
