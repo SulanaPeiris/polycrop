@@ -14,6 +14,11 @@ import { db } from "../firebase/firebase";
 
 export type TunnelStatus = "GOOD" | "NEED_ATTENTION";
 
+export type CameraCalib = {
+  baseDistanceCm: number;
+  cmPerPxAtBaseDistance: number;
+};
+
 export type Tunnel = {
   id: string;
   ownerId: string;
@@ -32,11 +37,24 @@ export type Tunnel = {
   robotId?: string;
   fertigationUnitId?: string;
 
+  // Used by inference-api/main.py to convert cucumber pixels into centimeters
+  cameraCalib?: CameraCalib | null;
+
   status: TunnelStatus;
   setupCompleted: boolean;
 };
 
 export type CreateTunnelInput = Omit<Tunnel, "id">;
+
+function cleanUndefinedToNull(obj: Record<string, any>) {
+  const cleaned: Record<string, any> = {};
+
+  Object.keys(obj).forEach((key) => {
+    cleaned[key] = obj[key] === undefined ? null : obj[key];
+  });
+
+  return cleaned;
+}
 
 export async function createTunnelWithPlants(input: CreateTunnelInput) {
   const tunnelName = (input.name || input.tunnelName || "").trim();
@@ -55,6 +73,9 @@ export async function createTunnelWithPlants(input: CreateTunnelInput) {
     sensorCount: input.sensorCount ?? null,
     robotId: input.robotId ?? null,
     fertigationUnitId: input.fertigationUnitId ?? null,
+
+    // Camera calibration for cucumber ripe-size detection
+    cameraCalib: input.cameraCalib ?? null,
 
     status: (input.status ?? "GOOD") as TunnelStatus,
     setupCompleted: !!input.setupCompleted,
@@ -79,7 +100,7 @@ export async function createTunnelWithPlants(input: CreateTunnelInput) {
         row: r,
         column: c,
 
-        // ✅ two RFIDs per plant
+        // two RFIDs per plant
         rfidA: null,
         rfidB: null,
 
@@ -101,7 +122,7 @@ export async function createTunnelWithPlants(input: CreateTunnelInput) {
 }
 
 export async function getMyTunnels(ownerId: string) {
-  // ✅ no orderBy => no composite index needed
+  // no orderBy => no composite index needed
   const q = query(collection(db, "tunnels"), where("ownerId", "==", ownerId));
   const snap = await getDocs(q);
   return snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) })) as Tunnel[];
@@ -112,7 +133,7 @@ export async function updateTunnel(
   patch: Partial<Omit<Tunnel, "id" | "ownerId">>
 ) {
   // keep both name + tunnelName in sync if provided
-  const next: any = { ...patch, updatedAt: serverTimestamp() };
+  const next: any = cleanUndefinedToNull({ ...patch, updatedAt: serverTimestamp() });
 
   if (typeof (patch as any).name === "string") {
     next.tunnelName = (patch as any).name;

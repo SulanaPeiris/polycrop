@@ -49,6 +49,28 @@ function getCucumberCount(docAny: any) {
   return Number(docAny?.outputs?.summary?.counts?.cucumber ?? 0);
 }
 
+function niceName(value: string) {
+  return String(value || "").replaceAll("_", " ");
+}
+
+function getActionLabel(decision: string) {
+  switch (decision) {
+    case "PUMP1":
+      return "Downy mildew treatment: Pump 1";
+    case "PUMP2":
+      return "Powdery mildew treatment: Pump 2";
+    case "PUMP1_PUMP2":
+      return "Both disease treatments: Pump 1 then Pump 2";
+    case "ALERT_ONLY":
+      return "Water stress alert only";
+    case "SPRAY":
+      return "Spray treatment";
+    case "NO_SPRAY":
+    default:
+      return "No spray needed";
+  }
+}
+
 function matchesFilter(docAny: any, filterMode: FilterMode) {
   if (filterMode === "ALL") return true;
   if (filterMode === "LEAF") return getLeafCount(docAny) > 0;
@@ -64,9 +86,17 @@ function CapturePreview({ data }: { data: any }) {
 
   const createdAtMs = tsToMs(data?.createdAt) || tsToMs(data?.updatedAt);
 
-  const counts = data?.outputs?.summary?.counts ?? {};
-  const diseases: string[] = data?.outputs?.summary?.diseases ?? [];
-  const sprayRecommended: boolean = !!data?.outputs?.summary?.sprayRecommended;
+  const summary = data?.outputs?.summary ?? {};
+  const counts = summary?.counts ?? {};
+  const diseases: string[] = summary?.diseases ?? [];
+
+  const captureDecision = String(summary?.captureDecision || summary?.decision || data?.captureDecision || "NO_SPRAY");
+  const actionLabel = String(summary?.actionLabel || data?.actionLabel || getActionLabel(captureDecision));
+  const pump1Ms = Number(summary?.pump1DurationMs ?? data?.pump1DurationMs ?? 0);
+  const pump2Ms = Number(summary?.pump2DurationMs ?? data?.pump2DurationMs ?? 0);
+  const waterStressAlert = Boolean(summary?.waterStressAlert ?? data?.waterStressAlert ?? false);
+  const diseaseSeverity: Record<string, any> = summary?.diseaseSeverity ?? data?.diseaseSeverity ?? {};
+  const severityEntries = Object.entries(diseaseSeverity);
 
   const legend: Array<{ name: string; colorBGR: number[] }> = data?.outputs?.disease?.legend ?? [];
   const perLeaf: any[] = data?.outputs?.disease?.perLeaf ?? [];
@@ -76,7 +106,6 @@ function CapturePreview({ data }: { data: any }) {
     return sorted.slice(0, 8);
   }, [perLeaf]);
 
-  const summary = data?.outputs?.summary ?? {};
 const ripeness = data?.outputs?.ripeness ?? {};
 
 const allCucumbers: any[] =
@@ -136,10 +165,18 @@ const ripeCount = Number(
         <Text style={styles.line}>
           Cucumber: {counts.cucumber ?? 0} | Leaf: {counts.leaf ?? 0} | Flower: {counts.flower ?? 0}
         </Text>
-        <Text style={styles.line}>Diseases: {diseases.length ? diseases.join(", ") : "None"}</Text>
-        {/* <Text style={[styles.line, sprayRecommended ? styles.sprayYes : styles.sprayNo]}>
-          Spray: {sprayRecommended ? "Recommended" : "Not needed"}
-        </Text> */}
+        <Text style={styles.line}>Diseases: {diseases.length ? diseases.map(niceName).join(", ") : "None"}</Text>
+
+        <View style={styles.actionBox}>
+          <Text style={styles.actionTitle}>Disease Action</Text>
+          <Text style={styles.actionText}>{actionLabel}</Text>
+          <Text style={styles.actionMeta}>
+            Decision: {captureDecision} • Pump 1: {pump1Ms}ms • Pump 2: {pump2Ms}ms
+          </Text>
+          <Text style={waterStressAlert ? styles.warningLine : styles.safeLine}>
+            Water Stress Alert: {waterStressAlert ? "Created for user" : "No"}
+          </Text>
+        </View>
 
         {/* Cucumber size */}
         {cm ? (
@@ -154,13 +191,38 @@ const ripeCount = Number(
 )}
       </View>
 
+      {severityEntries.length > 0 ? (
+        <View style={styles.card}>
+          <Text style={styles.title}>Disease Severity</Text>
+          {severityEntries.map(([name, stat]) => (
+            <View key={name} style={styles.severityRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.severityName}>{niceName(name)}</Text>
+                <Text style={styles.severityMeta}>
+                  Affected leaves: {Number((stat as any)?.affectedLeaves ?? 0)}
+                </Text>
+              </View>
+              <View style={styles.severityBadge}>
+                <Text style={styles.severityLevel}>{String((stat as any)?.severityLevel || "N/A")}</Text>
+                <Text style={styles.severityPercent}>
+                  Max {Number((stat as any)?.maxSeverityPercent ?? 0).toFixed(2)}%
+                </Text>
+                <Text style={styles.severityPercent}>
+                  Avg {Number((stat as any)?.avgSeverityPercent ?? 0).toFixed(2)}%
+                </Text>
+              </View>
+            </View>
+          ))}
+        </View>
+      ) : null}
+
       {legend.length > 0 ? (
         <View style={styles.card}>
           <Text style={styles.title}>Legend</Text>
           {legend.map((it, idx) => (
             <View key={`${it.name}-${idx}`} style={styles.legendRow}>
               <View style={[styles.swatch, { backgroundColor: bgrToRgbCss(it.colorBGR) }]} />
-              <Text style={styles.legendText}>{it.name.replaceAll("_", " ")}</Text>
+              <Text style={styles.legendText}>{niceName(it.name)}</Text>
             </View>
           ))}
         </View>
@@ -362,7 +424,10 @@ export default function DetectionDetailScreen({ route, navigation }: any) {
                   const thumb = item.annotatedUrl || item.imageUrl || "";
                   const ms = tsToMs(item.updatedAt) || tsToMs(item.createdAt);
 
-                  const spray = !!item.outputs?.summary?.sprayRecommended;
+                  const summary = item.outputs?.summary ?? {};
+                  const decision = String(summary.captureDecision || summary.decision || "NO_SPRAY");
+                  const pump1 = Number(summary.pump1DurationMs ?? 0);
+                  const pump2 = Number(summary.pump2DurationMs ?? 0);
                   const leaf = getLeafCount(item);
                   const cuc = getCucumberCount(item);
 
@@ -387,7 +452,7 @@ export default function DetectionDetailScreen({ route, navigation }: any) {
                           {item.id}
                         </Text>
                         <Text style={styles.scanMeta}>
-                          {ms ? timeAgo(ms) : "N/A"} • {spray ? "SPRAY" : "NO SPRAY"} • Leaf {leaf} • Cuc {cuc}
+                          {ms ? timeAgo(ms) : "N/A"} • {decision} • P1 {pump1}ms • P2 {pump2}ms • Leaf {leaf} • Cuc {cuc}
                         </Text>
                       </View>
 
@@ -473,6 +538,40 @@ const styles = StyleSheet.create({
   },
   title: { fontWeight: "900", color: "#1B5E20", fontSize: 16, marginBottom: 8 },
   line: { marginTop: 6, fontWeight: "700", color: "#333" },
+
+  actionBox: {
+    marginTop: 12,
+    padding: 12,
+    borderRadius: 14,
+    backgroundColor: "#F1F8E9",
+    borderWidth: 1,
+    borderColor: "#C8E6C9",
+  },
+  actionTitle: { fontWeight: "900", color: "#1B5E20", marginBottom: 4 },
+  actionText: { fontWeight: "800", color: "#333", lineHeight: 19 },
+  actionMeta: { marginTop: 5, fontWeight: "700", color: "#616161", fontSize: 12 },
+  warningLine: { marginTop: 5, fontWeight: "900", color: "#EF6C00", fontSize: 12 },
+  safeLine: { marginTop: 5, fontWeight: "800", color: "#2E7D32", fontSize: 12 },
+
+  severityRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: "#EEEEEE",
+  },
+  severityName: { fontWeight: "900", color: "#333", textTransform: "capitalize" },
+  severityMeta: { marginTop: 3, fontWeight: "700", color: "#757575", fontSize: 12 },
+  severityBadge: {
+    alignItems: "flex-end",
+    backgroundColor: "#FFF3E0",
+    borderRadius: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+  },
+  severityLevel: { fontWeight: "900", color: "#EF6C00", fontSize: 12 },
+  severityPercent: { fontWeight: "800", color: "#616161", fontSize: 11, marginTop: 2 },
 
   sprayYes: { color: "#D32F2F" },
   sprayNo: { color: "#2E7D32" },
