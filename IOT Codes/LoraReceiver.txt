@@ -14,8 +14,8 @@
 #include "addons/RTDBHelper.h"
 
 // ================= WIFI =================
-#define WIFI_SSID "Janith"
-#define WIFI_PASSWORD "11223344"
+#define WIFI_SSID "Dialog 4G 931"
+#define WIFI_PASSWORD "9e0Ff6c3"
 
 // ================= FIREBASE =================
 #define API_KEY "AIzaSyA7mJ-uud7w7DDM94LGA4z-G8HJa2Q2qFA"
