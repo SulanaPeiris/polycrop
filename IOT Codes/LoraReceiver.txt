@@ -88,86 +88,262 @@ bool oledBegin() {
   return false;
 }
 
+void serialLine() {
+  Serial.println("----------------------------------------");
+}
+
+void serialStatus(const String &title, const String &line1 = "", const String &line2 = "", const String &line3 = "", const String &line4 = "") {
+  serialLine();
+  Serial.println(title);
+
+  if (line1.length()) Serial.println(line1);
+  if (line2.length()) Serial.println(line2);
+  if (line3.length()) Serial.println(line3);
+  if (line4.length()) Serial.println(line4);
+
+  serialLine();
+}
+
+void serialSystemState() {
+  Serial.print("WiFi: ");
+  Serial.println(WiFi.status() == WL_CONNECTED ? "Connected" : "Offline");
+
+  Serial.print("Firebase: ");
+  Serial.println(Firebase.ready() ? "Ready" : "Not Ready");
+
+  Serial.print("Tunnel: ");
+  Serial.println(assignedTunnelId.length() ? assignedTunnelId : "NOT SET");
+
+  Serial.println("Frequency: 433MHz");
+}
+
+String shortText(String text, int maxChars) {
+  if (text.length() <= maxChars) return text;
+  return text.substring(0, maxChars - 2) + "..";
+}
+
+void drawCenteredText(const String &text, int y) {
+  int16_t x1, y1;
+  uint16_t w, h;
+
+  display.getTextBounds(text, 0, y, &x1, &y1, &w, &h);
+  int x = (128 - w) / 2;
+  if (x < 0) x = 0;
+
+  display.setCursor(x, y);
+  display.print(text);
+}
+
+void drawTopBar(const String &title, const String &tag = "") {
+  display.fillRoundRect(0, 0, 128, 15, 3, SH110X_WHITE);
+
+  display.setTextColor(SH110X_BLACK);
+  display.setTextSize(1);
+  display.setCursor(4, 4);
+  display.print(title);
+
+  if (tag.length()) {
+    int tagX = 128 - (tag.length() * 6) - 5;
+    if (tagX < 70) tagX = 70;
+
+    display.setCursor(tagX, 4);
+    display.print(tag);
+  }
+
+  display.setTextColor(SH110X_WHITE);
+}
+
+void drawCard(int x, int y, int w, int h, const String &title, const String &value) {
+  display.drawRoundRect(x, y, w, h, 4, SH110X_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(x + 4, y + 3);
+  display.print(title);
+
+  display.setCursor(x + 4, y + 15);
+  display.print(value);
+}
+
+String getVisualHealth(float t1, float h1, float t2, float h2) {
+  bool t1Valid = isfinite(t1) && t1 >= TEMP_MIN_C && t1 <= TEMP_MAX_C;
+  bool t2Valid = isfinite(t2) && t2 >= TEMP_MIN_C && t2 <= TEMP_MAX_C;
+  bool h1Valid = isfinite(h1) && h1 >= HUM_MIN_PCT && h1 <= HUM_MAX_PCT;
+  bool h2Valid = isfinite(h2) && h2 >= HUM_MIN_PCT && h2 <= HUM_MAX_PCT;
+
+  if (!t1Valid || !t2Valid || !h1Valid || !h2Valid) {
+    return "FAULT";
+  }
+
+  bool tempMismatch = fabs(t1 - t2) > TEMP_MISMATCH_C;
+  bool humMismatch = fabs(h1 - h2) > HUM_MISMATCH_PCT;
+
+  if (tempMismatch || humMismatch) {
+    return "WARN";
+  }
+
+  return "OK";
+}
+
+void drawStatusRow(int y, const String &label, const String &value) {
+  display.setTextSize(1);
+  display.setCursor(2, y);
+  display.print(label);
+
+  display.setCursor(62, y);
+  display.print(shortText(value, 11));
+}
+
 void oledStatus(const String &line1, const String &line2 = "", const String &line3 = "", const String &line4 = "") {
   display.clearDisplay();
   display.setTextColor(SH110X_WHITE);
+
+  drawTopBar("LoRa Gateway", "SETUP");
+
+  display.drawRoundRect(4, 22, 120, 82, 6, SH110X_WHITE);
+
   display.setTextSize(1);
+  drawCenteredText("System Status", 29);
 
-  display.setCursor(0, 0);
-  display.println("LoRa Receiver Setup");
+  display.drawLine(14, 42, 114, 42, SH110X_WHITE);
 
-  int y = 18;
-  if (line1.length()) { display.setCursor(0, y); display.println(line1); y += 12; }
-  if (line2.length()) { display.setCursor(0, y); display.println(line2); y += 12; }
-  if (line3.length()) { display.setCursor(0, y); display.println(line3); y += 12; }
-  if (line4.length()) { display.setCursor(0, y); display.println(line4); y += 12; }
+  int y = 50;
+
+  if (line1.length()) {
+    display.setCursor(10, y);
+    display.print("> ");
+    display.println(shortText(line1, 18));
+    y += 13;
+  }
+
+  if (line2.length()) {
+    display.setCursor(10, y);
+    display.print("> ");
+    display.println(shortText(line2, 18));
+    y += 13;
+  }
+
+  if (line3.length()) {
+    display.setCursor(10, y);
+    display.print("> ");
+    display.println(shortText(line3, 18));
+    y += 13;
+  }
+
+  if (line4.length()) {
+    display.setCursor(10, y);
+    display.print("> ");
+    display.println(shortText(line4, 18));
+    y += 13;
+  }
+
+  display.setCursor(8, 114);
+  display.print("Boot monitor active");
 
   display.display();
+
+  serialStatus("OLED STATUS", line1, line2, line3, line4);
 }
 
 void showWaitingScreen() {
   display.clearDisplay();
   display.setTextColor(SH110X_WHITE);
+
+  drawTopBar("LoRa Gateway", "WAIT");
+
+  // Antenna icon
+  display.drawCircle(64, 32, 3, SH110X_WHITE);
+  display.drawCircle(64, 32, 10, SH110X_WHITE);
+  display.drawCircle(64, 32, 18, SH110X_WHITE);
+
+  display.fillRect(62, 33, 5, 20, SH110X_WHITE);
+
   display.setTextSize(1);
+  drawCenteredText("Listening for data", 58);
 
-  display.setCursor(0, 0);
-  display.println("LoRa Receiver");
+  display.drawRoundRect(0, 73, 125, 44, 5, SH110X_WHITE);
 
-  display.setCursor(0, 20);
-  display.println("Waiting for LoRa...");
+  drawStatusRow(80, "WiFi", WiFi.status() == WL_CONNECTED ? "Connected" : "Offline");
+  drawStatusRow(93, "Firebase", Firebase.ready() ? "Ready" : "Not Ready");
+  drawStatusRow(106, "Tunnel", assignedTunnelId.length() ? assignedTunnelId : "NOT SET");
 
-  display.setCursor(0, 40);
-  display.print("WiFi: ");
-  display.println(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
-
-  display.setCursor(0, 55);
-  display.print("Firebase: ");
-  display.println(Firebase.ready() ? "Ready" : "Not ready");
-
-  display.setCursor(0, 70);
-  display.print("Tunnel: ");
-  display.println(assignedTunnelId.length() ? assignedTunnelId : "NOT SET");
-
-  display.setCursor(0, 90);
-  display.println("Freq: 433MHz");
+  display.setCursor(19, 119);
+  display.print("433MHz  |  SX1278 RX");
 
   display.display();
   showingWaiting = true;
+
+  serialLine();
+  Serial.println("WAITING SCREEN");
+  Serial.println("Listening for LoRa data...");
+  serialSystemState();
+  serialLine();
 }
 
 void drawData(float t1, float h1, float t2, float h2, int rssi, float snr) {
   display.clearDisplay();
   display.setTextColor(SH110X_WHITE);
 
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println("LoRa Receiver");
-
-  display.setCursor(0, 16);
-  display.print("Tunnel: ");
-  display.println(assignedTunnelId.length() ? assignedTunnelId : "NOT SET");
-
-  display.setCursor(0, 34);
-  display.print("T1: "); display.print(t1, 1); display.print("C  ");
-  display.print("H1: "); display.print(h1, 1); display.println("%");
-
-  display.setCursor(0, 48);
-  display.print("T2: "); display.print(t2, 1); display.print("C  ");
-  display.print("H2: "); display.print(h2, 1); display.println("%");
-
   float avgT = (t1 + t2) / 2.0;
   float avgH = (h1 + h2) / 2.0;
 
-  display.setCursor(0, 66);
-  display.print("AvgT: "); display.print(avgT, 1); display.print("C  ");
-  display.print("AvgH: "); display.print(avgH, 1); display.println("%");
+  String health = getVisualHealth(t1, h1, t2, h2);
 
-  display.setCursor(0, 84);
-  display.print("RSSI: "); display.print(rssi);
-  display.print("  SNR: "); display.println(snr, 1);
+  drawTopBar("Live Sensor", health);
+
+  display.setTextSize(1);
+  display.setCursor(0, 18);
+  display.print("Tunnel: ");
+  display.print(shortText(assignedTunnelId.length() ? assignedTunnelId : "NOT SET", 14));
+
+  // Sensor cards
+  drawCard(0, 31, 62, 26, "TEMP 1", String(t1, 1) + " C");
+
+  drawCard(66, 31, 62, 26, "HUM 1", String(h1, 1) + " %");
+
+  drawCard(0, 62, 62, 26, "TEMP 2", String(t2, 1) + " C");
+
+  drawCard(66, 62, 62, 26, "HUM 2", String(h2, 1) + " %");
+
+  // Average summary area
+  display.drawRoundRect(0, 93, 128, 17, 4, SH110X_WHITE);
+
+  display.setCursor(5, 98);
+  display.print("AVG ");
+  display.print(avgT, 1);
+  display.print("C");
+
+  display.setCursor(72, 98);
+  display.print(avgH, 1);
+  display.print("%");
+
+  // Signal footer
+  display.drawLine(0, 114, 128, 114, SH110X_WHITE);
+
+  display.setCursor(0, 118);
+  display.print("RSSI:");
+  display.print(rssi);
+
+  display.setCursor(72, 118);
+  display.print("SNR:");
+  display.print(snr, 1);
 
   display.display();
   showingWaiting = false;
+
+  serialLine();
+  Serial.println("LIVE SENSOR DATA");
+  Serial.print("Health: "); Serial.println(health);
+  Serial.print("Tunnel: "); Serial.println(assignedTunnelId.length() ? assignedTunnelId : "NOT SET");
+  Serial.print("Counter: "); Serial.println(lastCounter);
+  Serial.print("Sensor 1 Temperature: "); Serial.print(t1, 1); Serial.println(" C");
+  Serial.print("Sensor 1 Humidity: "); Serial.print(h1, 1); Serial.println(" %");
+  Serial.print("Sensor 2 Temperature: "); Serial.print(t2, 1); Serial.println(" C");
+  Serial.print("Sensor 2 Humidity: "); Serial.print(h2, 1); Serial.println(" %");
+  Serial.print("Average Temperature: "); Serial.print(avgT, 1); Serial.println(" C");
+  Serial.print("Average Humidity: "); Serial.print(avgH, 1); Serial.println(" %");
+  Serial.print("RSSI: "); Serial.println(rssi);
+  Serial.print("SNR: "); Serial.println(snr, 1);
+  serialLine();
 }
 
 // ================= TIME (TLS) =================
@@ -557,6 +733,12 @@ void loop() {
     String incoming = "";
     while (LoRa.available()) incoming += (char)LoRa.read();
 
+    serialLine();
+    Serial.println("LORA PACKET RECEIVED");
+    Serial.print("Raw Packet: ");
+    Serial.println(incoming);
+    serialLine();
+
     int rssi = LoRa.packetRssi();
     float snr = LoRa.packetSnr();
 
@@ -593,6 +775,9 @@ void loop() {
       showWaitingScreen();
     }
 
-    storeToFirestore();
+    bool firestoreSaved = storeToFirestore();
+
+    Serial.print("Firestore Save: ");
+    Serial.println(firestoreSaved ? "SUCCESS" : "FAILED / SKIPPED");
   }
 }
