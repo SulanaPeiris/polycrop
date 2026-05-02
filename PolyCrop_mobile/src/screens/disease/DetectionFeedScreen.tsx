@@ -22,6 +22,14 @@ type PlantDoc = {
   lastCounts?: { cucumber?: number; leaf?: number; flower?: number } | null;
   lastSprayRecommended?: boolean;
   lastCaptureId?: string | null;
+
+  // New fields written by inference-api/main.py
+  lastCaptureDecision?: string | null;
+  lastPump1DurationMs?: number | null;
+  lastPump2DurationMs?: number | null;
+  lastWaterStressAlert?: boolean;
+  lastDiseaseSeverity?: Record<string, any> | null;
+  lastActionLabel?: string | null;
 };
 
 type PlantStatus = "Healthy" | "Infected" | "WaterStress" | "Multiple" | "NotScanned";
@@ -33,6 +41,13 @@ type PlantVM = PlantDoc & {
   sprayedRecommended: boolean; // we show as "Robot Activity"
   leafCount: number;
   diseases: string[]; // normalized list
+
+  captureDecision: string;
+  pump1Ms: number;
+  pump2Ms: number;
+  waterStressAlert: boolean;
+  diseaseSeverity: Record<string, any>;
+  actionLabel: string;
 };
 
 function tsToMs(ts: any): number {
@@ -57,6 +72,42 @@ function timeAgo(ms: number) {
 
 function niceDiseaseName(x: string) {
   return x.replaceAll("_", " ");
+}
+
+function getSeverityStat(diseaseSeverity: Record<string, any> | null | undefined, disease: string) {
+  if (!diseaseSeverity) return null;
+
+  const key = disease.toLowerCase();
+  return diseaseSeverity[key] || diseaseSeverity[key.replaceAll(" ", "_")] || null;
+}
+
+function severityText(diseaseSeverity: Record<string, any> | null | undefined, disease: string) {
+  const stat = getSeverityStat(diseaseSeverity, disease);
+  if (!stat) return "Severity: N/A";
+
+  const level = stat.severityLevel || "N/A";
+  const max = Number(stat.maxSeverityPercent ?? 0).toFixed(2);
+  const avg = Number(stat.avgSeverityPercent ?? 0).toFixed(2);
+
+  return `Severity: ${level} • Max ${max}% • Avg ${avg}%`;
+}
+
+function pumpTextForDisease(disease: string, pump1Ms: number, pump2Ms: number) {
+  const d = disease.toLowerCase();
+
+  if (d === "downy_mildew") {
+    return pump1Ms > 0 ? `Pump 1 • ${pump1Ms}ms` : "Pump 1 not triggered";
+  }
+
+  if (d === "powdery_mildew") {
+    return pump2Ms > 0 ? `Pump 2 • ${pump2Ms}ms` : "Pump 2 not triggered";
+  }
+
+  if (d === "water_stress") {
+    return "User alert only";
+  }
+
+  return "Action pending";
 }
 
 function classifyFromDiseases(lastDiseases?: string[], scanned?: boolean): PlantStatus {
@@ -130,6 +181,13 @@ export default function DetectionFeedScreen({ navigation }: any) {
       const leafCount = Number(p.lastCounts?.leaf ?? 0);
       const sprayedRecommended = !!p.lastSprayRecommended;
 
+      const captureDecision = String(p.lastCaptureDecision || "NO_SPRAY");
+      const pump1Ms = Number(p.lastPump1DurationMs ?? 0);
+      const pump2Ms = Number(p.lastPump2DurationMs ?? 0);
+      const waterStressAlert = !!p.lastWaterStressAlert;
+      const diseaseSeverity = p.lastDiseaseSeverity ?? {};
+      const actionLabel = String(p.lastActionLabel || "No action needed.");
+
       const vm: PlantVM = {
         ...p,
         diseases,
@@ -138,6 +196,12 @@ export default function DetectionFeedScreen({ navigation }: any) {
         scannedAtMs,
         leafCount,
         sprayedRecommended,
+        captureDecision,
+        pump1Ms,
+        pump2Ms,
+        waterStressAlert,
+        diseaseSeverity,
+        actionLabel,
       };
 
       map[`r${p.row}_c${p.column}`] = vm;
@@ -293,7 +357,8 @@ export default function DetectionFeedScreen({ navigation }: any) {
 
                       <View style={{ flex: 1 }}>
                         <Text style={styles.issueText}>{niceDiseaseName(d)}</Text>
-                        <Text style={styles.issueMeta}>Fungal Infection detected</Text>
+                        <Text style={styles.issueMeta}>{severityText(selectedPlant.diseaseSeverity, d)}</Text>
+                        <Text style={styles.issueMeta}>Action: {pumpTextForDisease(d, selectedPlant.pump1Ms, selectedPlant.pump2Ms)}</Text>
                       </View>
 
                       <View style={styles.leafCountBadge}>
@@ -311,7 +376,8 @@ export default function DetectionFeedScreen({ navigation }: any) {
                     </View>
                     <View style={{ flex: 1 }}>
                       <Text style={styles.issueText}>Water Stress</Text>
-                      <Text style={styles.issueMeta}>Moisture condition flagged</Text>
+                      <Text style={styles.issueMeta}>{severityText(selectedPlant.diseaseSeverity, "water_stress")}</Text>
+                      <Text style={styles.issueMeta}>Action: User alert only, no pump</Text>
                     </View>
                   </View>
                 )}
@@ -336,18 +402,30 @@ export default function DetectionFeedScreen({ navigation }: any) {
             )}
 
             {/* Robot Action */}
-            <View style={styles.robotRow}>
-              <Text style={styles.robotLabel}>Robot Activity</Text>
-              {selectedPlant.sprayedRecommended ? (
-                <View style={styles.sprayedTag}>
-                  <Ionicons name="alert-circle" size={16} color="#EF6C00" />
-                  <Text style={[styles.sprayedText, { color: "#EF6C00" }]}>Spray Recommended</Text>
-                </View>
-              ) : (
-                <View style={styles.pendingTag}>
-                  <Text style={styles.pendingText}>No action needed</Text>
-                </View>
-              )}
+            <View style={styles.robotActionCard}>
+              <View style={styles.robotRow}>
+                <Text style={styles.robotLabel}>Robot Activity</Text>
+                {selectedPlant.sprayedRecommended ? (
+                  <View style={styles.sprayedTag}>
+                    <Ionicons name="alert-circle" size={16} color="#EF6C00" />
+                    <Text style={[styles.sprayedText, { color: "#EF6C00" }]}>Spray Required</Text>
+                  </View>
+                ) : selectedPlant.waterStressAlert ? (
+                  <View style={styles.warningTag}>
+                    <Ionicons name="water" size={16} color="#EF6C00" />
+                    <Text style={[styles.sprayedText, { color: "#EF6C00" }]}>Alert Only</Text>
+                  </View>
+                ) : (
+                  <View style={styles.pendingTag}>
+                    <Text style={styles.pendingText}>No action needed</Text>
+                  </View>
+                )}
+              </View>
+
+              <Text style={styles.actionLabel}>{selectedPlant.actionLabel}</Text>
+              <Text style={styles.actionMeta}>
+                Decision: {selectedPlant.captureDecision} • Pump 1: {selectedPlant.pump1Ms}ms • Pump 2: {selectedPlant.pump2Ms}ms
+              </Text>
             </View>
 
             {/* View last scan */}
@@ -537,13 +615,16 @@ const styles = StyleSheet.create({
   leafCountText: { fontSize: 18, fontWeight: "800", color: "#D32F2F" },
   leafCountLabel: { fontSize: 10, color: "#999", fontWeight: "600" },
 
+  robotActionCard: {
+    paddingTop: 14,
+    borderTopWidth: 1,
+    borderTopColor: "#F5F5F5",
+  },
+
   robotRow: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
-    paddingTop: 14,
-    borderTopWidth: 1,
-    borderTopColor: "#F5F5F5",
   },
   robotLabel: { fontSize: 14, color: "#616161", fontWeight: "600" },
   sprayedTag: {
@@ -556,6 +637,30 @@ const styles = StyleSheet.create({
     borderRadius: 20,
   },
   sprayedText: { color: "#2E7D32", fontWeight: "700", fontSize: 13 },
+
+  warningTag: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: "#FFF3E0",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 20,
+  },
+
+  actionLabel: {
+    marginTop: 10,
+    fontSize: 13,
+    color: "#424242",
+    fontWeight: "700",
+    lineHeight: 19,
+  },
+  actionMeta: {
+    marginTop: 4,
+    fontSize: 12,
+    color: "#757575",
+    fontWeight: "700",
+  },
 
   pendingTag: {
     backgroundColor: "#F5F5F5",

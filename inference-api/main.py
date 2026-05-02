@@ -26,6 +26,19 @@ CONF_DISEASE = 0.25  # disease seg model
 # Overlay alpha (0..1)
 DISEASE_ALPHA = 0.45
 
+# ====== DISEASE ACTION / PUMP CONFIG ======
+# Disease severity is calculated as: diseased_mask_area / leaf_area * 100
+# Downy mildew   -> Pump 1
+# Powdery mildew -> Pump 2
+# Water stress   -> alert only, no spray pump
+DISEASE_SPRAY_THRESHOLD_PERCENT = 1.0
+
+PUMP_DURATION_MS_BY_LEVEL = {
+    "LOW": 2000,
+    "MEDIUM": 3000,
+    "HIGH": 5000,
+}
+
 # ====== CUCUMBER SIZE / RIPENESS CONFIG ======
 # We estimate real-world size from: (cucumber bbox pixels) × (cm_per_px)
 # where cm_per_px scales linearly with distance.
@@ -105,6 +118,112 @@ def load_camera_calibration(tunnel_id: Optional[str], meta: dict) -> dict:
     return {
         "baseDistanceCm": base_distance if base_distance is not None else DEFAULT_BASE_DISTANCE_CM,
         "cmPerPxAtBaseDistance": cm_per_px,
+    }
+
+
+def normalize_disease_name(name: str) -> str:
+    """Normalize model class names so Pump logic works even if labels contain spaces/capital letters."""
+    return str(name or "").strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def get_severity_level(percent: float) -> str:
+    p = float(percent or 0.0)
+    if p >= 25.0:
+        return "HIGH"
+    if p >= 10.0:
+        return "MEDIUM"
+    if p >= DISEASE_SPRAY_THRESHOLD_PERCENT:
+        return "LOW"
+    return "NONE"
+
+
+def get_pump_duration_ms(percent: float) -> int:
+    level = get_severity_level(percent)
+    return PUMP_DURATION_MS_BY_LEVEL.get(level, 0)
+
+
+def build_disease_action(per_leaf: List[dict]) -> dict:
+    """
+    Convert disease severity into robot action.
+
+    Rules:
+      downy_mildew   -> Pump 1
+      powdery_mildew -> Pump 2
+      water_stress   -> mobile alert only
+    """
+    disease_stats: Dict[str, dict] = {}
+
+    for leaf in per_leaf:
+        sev_map = leaf.get("severityByDiseasePercent") or {}
+
+        for raw_name, raw_percent in sev_map.items():
+            name = normalize_disease_name(raw_name)
+            percent = float(raw_percent or 0.0)
+
+            if name not in disease_stats:
+                disease_stats[name] = {
+                    "detected": True,
+                    "affectedLeaves": 0,
+                    "totalSeverityPercent": 0.0,
+                    "maxSeverityPercent": 0.0,
+                    "avgSeverityPercent": 0.0,
+                    "severityLevel": "NONE",
+                }
+
+            disease_stats[name]["affectedLeaves"] += 1
+            disease_stats[name]["totalSeverityPercent"] += percent
+            disease_stats[name]["maxSeverityPercent"] = max(
+                disease_stats[name]["maxSeverityPercent"],
+                percent,
+            )
+
+    for name, stat in disease_stats.items():
+        affected = max(1, int(stat.get("affectedLeaves", 1)))
+        avg = float(stat.get("totalSeverityPercent", 0.0)) / affected
+        max_sev = float(stat.get("maxSeverityPercent", 0.0))
+
+        stat["totalSeverityPercent"] = round(float(stat.get("totalSeverityPercent", 0.0)), 2)
+        stat["avgSeverityPercent"] = round(avg, 2)
+        stat["maxSeverityPercent"] = round(max_sev, 2)
+        stat["severityLevel"] = get_severity_level(max_sev)
+
+    downy = disease_stats.get("downy_mildew")
+    powdery = disease_stats.get("powdery_mildew")
+    water = disease_stats.get("water_stress")
+
+    downy_sev = float(downy.get("maxSeverityPercent", 0.0)) if downy else 0.0
+    powdery_sev = float(powdery.get("maxSeverityPercent", 0.0)) if powdery else 0.0
+    water_sev = float(water.get("maxSeverityPercent", 0.0)) if water else 0.0
+
+    pump1_ms = get_pump_duration_ms(downy_sev) if downy_sev >= DISEASE_SPRAY_THRESHOLD_PERCENT else 0
+    pump2_ms = get_pump_duration_ms(powdery_sev) if powdery_sev >= DISEASE_SPRAY_THRESHOLD_PERCENT else 0
+    water_stress_alert = water_sev >= DISEASE_SPRAY_THRESHOLD_PERCENT
+
+    if pump1_ms > 0 and pump2_ms > 0:
+        decision = "PUMP1_PUMP2"
+        action_label = "Downy mildew and powdery mildew detected. Pump 1 and Pump 2 required."
+    elif pump1_ms > 0:
+        decision = "PUMP1"
+        action_label = "Downy mildew detected. Pump 1 required."
+    elif pump2_ms > 0:
+        decision = "PUMP2"
+        action_label = "Powdery mildew detected. Pump 2 required."
+    elif water_stress_alert:
+        decision = "ALERT_ONLY"
+        action_label = "Water stress detected. User alert required. No spray pump."
+    else:
+        decision = "NO_SPRAY"
+        action_label = "No treatment required."
+
+    return {
+        "captureDecision": decision,
+        "sprayRecommended": bool(pump1_ms > 0 or pump2_ms > 0),
+        "sprayDurationMs": int(max(pump1_ms, pump2_ms)),  # backward compatibility
+        "pump1DurationMs": int(pump1_ms),
+        "pump2DurationMs": int(pump2_ms),
+        "waterStressAlert": bool(water_stress_alert),
+        "diseaseSeverity": disease_stats,
+        "actionLabel": action_label,
     }
 
 
@@ -471,10 +590,16 @@ def process(req: ProcessRequest):
     annotated_path = storage_path.replace("/captures/", "/captures_annotated/")
     annotated_storage_path, annotated_url = upload_with_permanent_url(annotated_path, annotated_bytes)
 
-    SPRAY_SEVERITY_THRESHOLD = 1.0
-    spray_recommended = any((x.get("totalSeverityPercent", 0.0) >= SPRAY_SEVERITY_THRESHOLD) for x in per_leaf)
-    decision = "SPRAY" if spray_recommended else "NO_SPRAY"
-    spray_duration_ms = 3000 if spray_recommended else 0
+    disease_action = build_disease_action(per_leaf)
+
+    spray_recommended = disease_action["sprayRecommended"]
+    decision = disease_action["captureDecision"]
+    spray_duration_ms = disease_action["sprayDurationMs"]
+    spray_pump1_ms = disease_action["pump1DurationMs"]
+    spray_pump2_ms = disease_action["pump2DurationMs"]
+    water_stress_alert = disease_action["waterStressAlert"]
+    disease_severity = disease_action["diseaseSeverity"]
+    action_label = disease_action["actionLabel"]
 
     # ✅ Ripe cucumber summary from all detected cucumbers
     all_cucumbers = ripeness.get("cucumbers", []) if isinstance(ripeness.get("cucumbers", []), list) else []
@@ -501,10 +626,16 @@ def process(req: ProcessRequest):
         "summary": {
             "diseases": disease_names_sorted,
             "sprayRecommended": spray_recommended,
-            "spraySeverityThresholdPercent": SPRAY_SEVERITY_THRESHOLD,
+            "spraySeverityThresholdPercent": DISEASE_SPRAY_THRESHOLD_PERCENT,
             "counts": {"cucumber": len(cuc), "leaf": len(leaf), "flower": len(flower)},
             "decision": decision,
+            "captureDecision": decision,
             "sprayDurationMs": spray_duration_ms,
+            "pump1DurationMs": spray_pump1_ms,
+            "pump2DurationMs": spray_pump2_ms,
+            "waterStressAlert": water_stress_alert,
+            "diseaseSeverity": disease_severity,
+            "actionLabel": action_label,
             "distanceCm": distance_cm,
             "ripe": has_ripe,
             "ripeCucumberCount": ripe_count,
@@ -536,6 +667,12 @@ def process(req: ProcessRequest):
             "lastDiseases": disease_names_sorted,
             "lastCounts": outputs["summary"]["counts"],
             "lastSprayRecommended": spray_recommended,
+            "lastCaptureDecision": decision,
+            "lastPump1DurationMs": spray_pump1_ms,
+            "lastPump2DurationMs": spray_pump2_ms,
+            "lastWaterStressAlert": water_stress_alert,
+            "lastDiseaseSeverity": disease_severity,
+            "lastActionLabel": action_label,
             "lastDistanceCm": distance_cm,
             "lastCucumberLengthCm": cucumber_len_cm,
             "lastCucumberDiameterCm": cucumber_diam_cm,
@@ -552,12 +689,37 @@ def process(req: ProcessRequest):
             "imageUrl": cap.get("imageUrl"),
             "annotatedUrl": annotated_url,
             "outputs": outputs,
+            "captureDecision": decision,
+            "pump1DurationMs": spray_pump1_ms,
+            "pump2DurationMs": spray_pump2_ms,
+            "waterStressAlert": water_stress_alert,
+            "diseaseSeverity": disease_severity,
+            "actionLabel": action_label,
             "distanceCm": distance_cm,
             "ripe": has_ripe,
             "ripeCucumberCount": ripe_count,
             "ripeCucumbers": ripe_cucumbers,
             "cucumberLengthCm": cucumber_len_cm,
             "cucumberDiameterCm": cucumber_diam_cm,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+
+    # Create water stress alert for the mobile app
+    owner_id = cap.get("ownerId")
+    if owner_id and tunnel_id and plant_id and water_stress_alert:
+        alert_ref = db.collection("alerts").document(f"{req.captureId}_water_stress")
+        alert_ref.set({
+            "ownerId": owner_id,
+            "tunnelId": tunnel_id,
+            "plantId": plant_id,
+            "captureId": req.captureId,
+            "type": "WATER_STRESS",
+            "severity": "WARNING",
+            "title": "Water Stress Detected",
+            "description": f"Water stress detected in plant {plant_id}. Please inspect irrigation or moisture condition.",
+            "diseaseSeverity": disease_severity.get("water_stress"),
+            "read": False,
+            "createdAt": firestore.SERVER_TIMESTAMP,
             "updatedAt": firestore.SERVER_TIMESTAMP,
         }, merge=True)
 
@@ -570,6 +732,11 @@ def process(req: ProcessRequest):
             "captureRequestId": request_id,
             "captureDecision": decision,
             "sprayDurationMs": spray_duration_ms,
+            "sprayPump1Ms": spray_pump1_ms,
+            "sprayPump2Ms": spray_pump2_ms,
+            "waterStressAlert": water_stress_alert,
+            "diseaseSeverity": disease_severity,
+            "actionLabel": action_label,
             "distanceCm": distance_cm,
             "ripe": has_ripe,
             "ripeCucumberCount": ripe_count,
@@ -582,5 +749,11 @@ def process(req: ProcessRequest):
         "annotatedStoragePath": annotated_storage_path,
         "outputs": outputs,
         "decision": decision,
+        "captureDecision": decision,
         "sprayDurationMs": spray_duration_ms,
+        "sprayPump1Ms": spray_pump1_ms,
+        "sprayPump2Ms": spray_pump2_ms,
+        "waterStressAlert": water_stress_alert,
+        "diseaseSeverity": disease_severity,
+        "actionLabel": action_label,
     }
