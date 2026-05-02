@@ -26,6 +26,20 @@ import { useTunnel } from "../../context/TunnelContext";
 
 type CaptureMode = "auto" | "manual";
 
+type LensOption = {
+  label: string;
+  value: string;
+};
+
+const LENS_OPTIONS: LensOption[] = [
+  { label: "0.5x", value: "builtInUltraWideCamera" },
+  { label: "1x", value: "builtInWideAngleCamera" },
+  { label: "2x/3x", value: "builtInTelephotoCamera" },
+  { label: "Dual", value: "builtInDualCamera" },
+  { label: "Dual Wide", value: "builtInDualWideCamera" },
+  { label: "Triple", value: "builtInTripleCamera" },
+];
+
 type PlantOption = {
   id: string;
   plantUid?: string | null;
@@ -60,6 +74,10 @@ export default function CameraScreen({ navigation }: any) {
   const [processing, setProcessing] = useState(false);
   const [mode, setMode] = useState<CaptureMode>("auto");
 
+  // iOS lens selector. Default to 1x wide lens.
+  const [selectedLens, setSelectedLens] = useState<string>("builtInWideAngleCamera");
+  const [availableLenses, setAvailableLenses] = useState<string[]>([]);
+
   const [lastHandledRequestId, setLastHandledRequestId] = useState("");
   const [statusText, setStatusText] = useState("Waiting for robot stop…");
 
@@ -82,6 +100,30 @@ export default function CameraScreen({ navigation }: any) {
     if (selectedPlant.rfidB === selectedRFID) return "B";
     return null;
   }, [selectedPlant, selectedRFID]);
+
+  const visibleLensOptions = useMemo(() => {
+    // Before Expo reports available lenses, show the main physical options.
+    if (!availableLenses.length) {
+      return LENS_OPTIONS.slice(0, 3);
+    }
+
+    const known = LENS_OPTIONS.filter((item) =>
+      availableLenses.includes(item.value)
+    );
+
+    const unknown = availableLenses
+      .filter((lens) => !LENS_OPTIONS.some((item) => item.value === lens))
+      .map((lens) => ({ label: lens, value: lens }));
+
+    return [...known, ...unknown];
+  }, [availableLenses]);
+
+  const changeLens = (lens: string) => {
+    if (processing) return;
+    setIsReady(false);
+    setSelectedLens(lens);
+    console.log("[Camera] selected lens:", lens);
+  };
 
   useEffect(() => {
     if (!permission) return;
@@ -372,11 +414,50 @@ export default function CameraScreen({ navigation }: any) {
   return (
     <View style={styles.container}>
       <CameraView
+        key={`camera-${selectedLens}`}
         ref={cameraRef}
         style={styles.camera}
         facing="back"
+        {...({
+          selectedLens,
+          zoom: 0,
+          onAvailableLensesChanged: (event: any) => {
+            const lenses =
+              event?.nativeEvent?.lenses ??
+              event?.nativeEvent?.availableLenses ??
+              event?.lenses ??
+              event?.availableLenses ??
+              [];
+
+            if (Array.isArray(lenses)) {
+              setAvailableLenses(lenses);
+              console.log("[Camera] available lenses:", lenses);
+            }
+          },
+        } as any)}
         onCameraReady={() => setIsReady(true)}
       />
+
+      <View style={styles.lensSelector}>
+        {visibleLensOptions.map((lens) => {
+          const active = selectedLens === lens.value;
+
+          return (
+            <TouchableOpacity
+              key={lens.value}
+              style={[styles.lensChip, active && styles.lensChipActive]}
+              onPress={() => changeLens(lens.value)}
+              disabled={processing}
+            >
+              <Text
+                style={[styles.lensChipText, active && styles.lensChipTextActive]}
+              >
+                {lens.label}
+              </Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
 
       <View style={styles.infoCard}>
         <View style={styles.modeRow}>
@@ -554,9 +635,46 @@ const styles = StyleSheet.create({
   camera: {
     flex: 1,
   },
+  lensSelector: {
+    position: "absolute",
+    top: 50,
+    zIndex: 20,
+    elevation: 20,
+    alignSelf: "center",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    backgroundColor: "rgba(0,0,0,0.42)",
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.16)",
+  },
+  lensChip: {
+    minWidth: 46,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderRadius: 999,
+    backgroundColor: "rgba(255,255,255,0.12)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  lensChipActive: {
+    backgroundColor: "#fff",
+  },
+  lensChipText: {
+    color: "#fff",
+    fontWeight: "900",
+    fontSize: 12,
+  },
+  lensChipTextActive: {
+    color: "#111",
+  },
   infoCard: {
     position: "absolute",
-    top: 55,
+    top: 75,
     left: 14,
     right: 14,
     backgroundColor: "rgba(0,0,0,0.62)",

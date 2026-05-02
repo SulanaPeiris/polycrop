@@ -2,7 +2,12 @@ import React, { createContext, useContext, useEffect, useMemo, useState } from "
 import { collection, onSnapshot, query, where } from "firebase/firestore";
 import { db } from "../firebase/firebase";
 import { useAuth } from "./AuthContext";
-import { createTunnelWithPlants, Tunnel as TunnelDoc, TunnelStatus } from "../services/tunnels";
+import {
+  createTunnelWithPlants,
+  CameraCalib,
+  Tunnel as TunnelDoc,
+  TunnelStatus,
+} from "../services/tunnels";
 
 export type Tunnel = TunnelDoc;
 
@@ -15,6 +20,7 @@ type CreateTunnelForm = {
   sensorCount?: number;
   robotId?: string;
   fertigationUnitId?: string;
+  cameraCalib?: CameraCalib | null;
 };
 
 type TunnelContextType = {
@@ -34,6 +40,29 @@ function normalizeStatus(s: any): TunnelStatus {
   return s === "NEED_ATTENTION" ? "NEED_ATTENTION" : "GOOD";
 }
 
+function normalizeCameraCalib(data: any): CameraCalib | null {
+  const c = data?.cameraCalib;
+
+  if (!c || typeof c !== "object") return null;
+
+  const baseDistanceCm = Number(c.baseDistanceCm);
+  const cmPerPxAtBaseDistance = Number(c.cmPerPxAtBaseDistance);
+
+  if (
+    !Number.isFinite(baseDistanceCm) ||
+    baseDistanceCm <= 0 ||
+    !Number.isFinite(cmPerPxAtBaseDistance) ||
+    cmPerPxAtBaseDistance <= 0
+  ) {
+    return null;
+  }
+
+  return {
+    baseDistanceCm,
+    cmPerPxAtBaseDistance,
+  };
+}
+
 export function TunnelProvider({ children }: { children: React.ReactNode }) {
   const { user } = useAuth();
 
@@ -51,7 +80,7 @@ export function TunnelProvider({ children }: { children: React.ReactNode }) {
 
     setIsTunnelsLoading(true);
 
-    // ✅ no orderBy => no composite index required
+    // no orderBy => no composite index required
     const qy = query(collection(db, "tunnels"), where("ownerId", "==", user.uid));
 
     const unsub = onSnapshot(
@@ -74,6 +103,7 @@ export function TunnelProvider({ children }: { children: React.ReactNode }) {
             sensorCount: data.sensorCount ?? undefined,
             robotId: data.robotId ?? undefined,
             fertigationUnitId: data.fertigationUnitId ?? undefined,
+            cameraCalib: normalizeCameraCalib(data),
             status,
             setupCompleted: !!data.setupCompleted,
           } as Tunnel;
@@ -125,6 +155,7 @@ export function TunnelProvider({ children }: { children: React.ReactNode }) {
       sensorCount: input.sensorCount,
       robotId: input.robotId?.trim() || undefined,
       fertigationUnitId: input.fertigationUnitId?.trim() || undefined,
+      cameraCalib: input.cameraCalib ?? null,
       status: "GOOD",
       setupCompleted: false,
     });
