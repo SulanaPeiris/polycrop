@@ -41,11 +41,11 @@ DISEASE_ALPHA = 0.45
 # If calibration is missing, we return bbox pixels but we DO NOT claim cm measurements.
 DEFAULT_BASE_DISTANCE_CM = 80.0
 
-# Sri Lanka salad cucumber (tune these)
-RIPE_MIN_LENGTH_CM = 18.0
-RIPE_MAX_LENGTH_CM = 22.0
-RIPE_MIN_DIAMETER_CM = 3.0
-RIPE_MAX_DIAMETER_CM = 5.5
+# Sri Lanka salad cucumber ripe range
+RIPE_MIN_LENGTH_CM = 15.0
+RIPE_MAX_LENGTH_CM = 16.0
+RIPE_MIN_DIAMETER_CM = 2.5
+RIPE_MAX_DIAMETER_CM = 3.0
 
 # Disease class colors (BGR for OpenCV)
 # Adjust names to match your model.names exactly (we map by name)
@@ -147,8 +147,10 @@ def clamp_box(box, w, h):
     y1 = max(0, min(int(y1), h - 1))
     x2 = max(0, min(int(x2), w))
     y2 = max(0, min(int(y2), h))
-    if x2 <= x1: x2 = min(w, x1 + 1)
-    if y2 <= y1: y2 = min(h, y1 + 1)
+    if x2 <= x1:
+        x2 = min(w, x1 + 1)
+    if y2 <= y1:
+        y2 = min(h, y1 + 1)
     return x1, y1, x2, y2
 
 
@@ -175,74 +177,103 @@ def compute_cucumber_size_and_ripeness(
     distance_cm: Optional[float],
     calib: dict,
 ) -> dict:
-    """Estimate cucumber length/diameter (cm) + ripeness.
-    Returns a safe object even when distance/calibration are missing.
     """
-    primary = pick_primary_det(cuc_dets)
-    if not primary:
+    Estimate size for every detected cucumber.
+    A cucumber is ripe when:
+    length = 15–16 cm
+    diameter = 2.5–3.0 cm
+    """
+
+    if not cuc_dets:
         return {
             "available": False,
             "reason": "no_cucumber_detected",
             "distanceCm": distance_cm,
+            "cucumbers": [],
+            "ripeCount": 0,
+            "hasRipe": False,
+            "ripe": False,  # compatibility field
         }
 
-    x1, y1, x2, y2 = clamp_box(primary["box"], img_w, img_h)
-    px_w = max(1, x2 - x1)
-    px_h = max(1, y2 - y1)
-    length_px = float(max(px_w, px_h))
-    diameter_px = float(min(px_w, px_h))
+    cm_per_px_base = safe_float(calib.get("cmPerPxAtBaseDistance"))
+    base_distance = float(calib.get("baseDistanceCm") or DEFAULT_BASE_DISTANCE_CM)
 
-    out = {
+    result = {
         "available": True,
         "distanceCm": distance_cm,
-        "primaryBox": [int(x1), int(y1), int(x2), int(y2)],
-        "primaryConf": float(primary.get("conf", 0.0) or 0.0),
-        "pixel": {
-            "lengthPx": length_px,
-            "diameterPx": diameter_px,
-            "bboxW": int(px_w),
-            "bboxH": int(px_h),
-        },
         "calibration": {
-            "baseDistanceCm": float(calib.get("baseDistanceCm") or DEFAULT_BASE_DISTANCE_CM),
-            "cmPerPxAtBaseDistance": calib.get("cmPerPxAtBaseDistance"),
+            "baseDistanceCm": base_distance,
+            "cmPerPxAtBaseDistance": cm_per_px_base,
         },
-    }
-
-    cm_per_px_base = safe_float(calib.get("cmPerPxAtBaseDistance"))
-    if distance_cm is None:
-        out.update({"cm": None, "ripe": None, "reason": "missing_distanceCm"})
-        return out
-    if cm_per_px_base is None:
-        out.update({"cm": None, "ripe": None, "reason": "missing_camera_calibration"})
-        return out
-
-    base_distance = float(calib.get("baseDistanceCm") or DEFAULT_BASE_DISTANCE_CM)
-    cm_per_px = cm_per_px_base * (float(distance_cm) / base_distance)
-
-    length_cm = length_px * cm_per_px
-    diameter_cm = diameter_px * cm_per_px
-
-    ripe = (
-        RIPE_MIN_LENGTH_CM <= length_cm <= RIPE_MAX_LENGTH_CM
-        and RIPE_MIN_DIAMETER_CM <= diameter_cm <= RIPE_MAX_DIAMETER_CM
-    )
-
-    out.update({
-        "cm": {
-            "cmPerPx": round(cm_per_px, 6),
-            "lengthCm": round(length_cm, 2),
-            "diameterCm": round(diameter_cm, 2),
-        },
-        "ripe": bool(ripe),
         "rules": {
             "minLengthCm": RIPE_MIN_LENGTH_CM,
             "maxLengthCm": RIPE_MAX_LENGTH_CM,
             "minDiameterCm": RIPE_MIN_DIAMETER_CM,
             "maxDiameterCm": RIPE_MAX_DIAMETER_CM,
         },
-    })
-    return out
+        "cucumbers": [],
+        "ripeCount": 0,
+        "hasRipe": False,
+        "ripe": False,  # compatibility field
+    }
+
+    if distance_cm is None:
+        result["reason"] = "missing_distanceCm"
+
+    if cm_per_px_base is None:
+        result["reason"] = "missing_camera_calibration"
+
+    cm_per_px = None
+    if distance_cm is not None and cm_per_px_base is not None:
+        cm_per_px = cm_per_px_base * (float(distance_cm) / base_distance)
+
+    for index, det in enumerate(cuc_dets):
+        x1, y1, x2, y2 = clamp_box(det["box"], img_w, img_h)
+
+        px_w = max(1, x2 - x1)
+        px_h = max(1, y2 - y1)
+
+        length_px = float(max(px_w, px_h))
+        diameter_px = float(min(px_w, px_h))
+
+        cucumber_obj = {
+            "index": index,
+            "box": [int(x1), int(y1), int(x2), int(y2)],
+            "conf": float(det.get("conf", 0.0) or 0.0),
+            "pixel": {
+                "lengthPx": length_px,
+                "diameterPx": diameter_px,
+                "bboxW": int(px_w),
+                "bboxH": int(px_h),
+            },
+            "cm": None,
+            "ripe": None,
+        }
+
+        if cm_per_px is not None:
+            length_cm = length_px * cm_per_px
+            diameter_cm = diameter_px * cm_per_px
+
+            is_ripe = (
+                RIPE_MIN_LENGTH_CM <= length_cm <= RIPE_MAX_LENGTH_CM
+                and RIPE_MIN_DIAMETER_CM <= diameter_cm <= RIPE_MAX_DIAMETER_CM
+            )
+
+            cucumber_obj["cm"] = {
+                "cmPerPx": round(cm_per_px, 6),
+                "lengthCm": round(length_cm, 2),
+                "diameterCm": round(diameter_cm, 2),
+            }
+            cucumber_obj["ripe"] = bool(is_ripe)
+
+            if is_ripe:
+                result["ripeCount"] += 1
+
+        result["cucumbers"].append(cucumber_obj)
+
+    result["hasRipe"] = result["ripeCount"] > 0
+    result["ripe"] = result["hasRipe"]
+    return result
 
 
 def upload_with_permanent_url(path: str, jpg_bytes: bytes):
@@ -445,7 +476,16 @@ def process(req: ProcessRequest):
     decision = "SPRAY" if spray_recommended else "NO_SPRAY"
     spray_duration_ms = 3000 if spray_recommended else 0
 
-    cm_obj = ripeness.get("cm") if isinstance(ripeness.get("cm"), dict) else None
+    # ✅ Ripe cucumber summary from all detected cucumbers
+    all_cucumbers = ripeness.get("cucumbers", []) if isinstance(ripeness.get("cucumbers", []), list) else []
+    ripe_cucumbers = [c for c in all_cucumbers if c.get("ripe") is True]
+    ripe_count = len(ripe_cucumbers)
+    has_ripe = ripe_count > 0
+
+    # Prefer displaying the first ripe cucumber size.
+    # If no ripe cucumber exists, display the first detected cucumber size.
+    display_cucumber = ripe_cucumbers[0] if ripe_cucumbers else (all_cucumbers[0] if all_cucumbers else None)
+    cm_obj = display_cucumber.get("cm") if display_cucumber and isinstance(display_cucumber.get("cm"), dict) else None
     cucumber_len_cm = cm_obj.get("lengthCm") if cm_obj else None
     cucumber_diam_cm = cm_obj.get("diameterCm") if cm_obj else None
 
@@ -466,7 +506,10 @@ def process(req: ProcessRequest):
             "decision": decision,
             "sprayDurationMs": spray_duration_ms,
             "distanceCm": distance_cm,
-            "ripe": ripeness.get("ripe"),
+            "ripe": has_ripe,
+            "ripeCucumberCount": ripe_count,
+            "ripeCucumbers": ripe_cucumbers,
+            "allCucumbers": all_cucumbers,
             "cucumberLengthCm": cucumber_len_cm,
             "cucumberDiameterCm": cucumber_diam_cm,
         },
@@ -496,7 +539,9 @@ def process(req: ProcessRequest):
             "lastDistanceCm": distance_cm,
             "lastCucumberLengthCm": cucumber_len_cm,
             "lastCucumberDiameterCm": cucumber_diam_cm,
-            "lastRipe": ripeness.get("ripe"),
+            "lastRipe": has_ripe,
+            "lastRipeCucumberCount": ripe_count,
+            "lastRipeCucumbers": ripe_cucumbers,
             "updatedAt": firestore.SERVER_TIMESTAMP,
         }, merge=True)
 
@@ -508,7 +553,9 @@ def process(req: ProcessRequest):
             "annotatedUrl": annotated_url,
             "outputs": outputs,
             "distanceCm": distance_cm,
-            "ripe": ripeness.get("ripe"),
+            "ripe": has_ripe,
+            "ripeCucumberCount": ripe_count,
+            "ripeCucumbers": ripe_cucumbers,
             "cucumberLengthCm": cucumber_len_cm,
             "cucumberDiameterCm": cucumber_diam_cm,
             "updatedAt": firestore.SERVER_TIMESTAMP,
@@ -524,7 +571,8 @@ def process(req: ProcessRequest):
             "captureDecision": decision,
             "sprayDurationMs": spray_duration_ms,
             "distanceCm": distance_cm,
-            "ripe": ripeness.get("ripe"),
+            "ripe": has_ripe,
+            "ripeCucumberCount": ripe_count,
             "updatedAt": firestore.SERVER_TIMESTAMP,
         }, merge=True)
 

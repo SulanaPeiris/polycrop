@@ -76,9 +76,47 @@ function CapturePreview({ data }: { data: any }) {
     return sorted.slice(0, 8);
   }, [perLeaf]);
 
-  const ripeness = data?.outputs?.ripeness;
-  const cm = ripeness?.cm;
-  const ripe = ripeness?.ripe;
+  const summary = data?.outputs?.summary ?? {};
+const ripeness = data?.outputs?.ripeness ?? {};
+
+const allCucumbers: any[] =
+  summary?.allCucumbers ??
+  ripeness?.cucumbers ??
+  [];
+
+const ripeCucumbers: any[] =
+  summary?.ripeCucumbers ??
+  allCucumbers.filter((c: any) => c?.ripe === true);
+
+const displayCucumber =
+  ripeCucumbers[0] ??
+  allCucumbers[0] ??
+  null;
+
+const cm =
+  displayCucumber?.cm ??
+  (
+    summary?.cucumberLengthCm || summary?.cucumberDiameterCm
+      ? {
+          lengthCm: summary?.cucumberLengthCm,
+          diameterCm: summary?.cucumberDiameterCm,
+        }
+      : null
+  );
+
+const ripe = Boolean(
+  summary?.ripe ??
+    ripeness?.hasRipe ??
+    ripeness?.ripe ??
+    false
+);
+
+const ripeCount = Number(
+  summary?.ripeCucumberCount ??
+    ripeness?.ripeCount ??
+    ripeCucumbers.length ??
+    0
+);
 
   return (
     <View>
@@ -105,11 +143,15 @@ function CapturePreview({ data }: { data: any }) {
 
         {/* Cucumber size */}
         {cm ? (
-          <Text style={styles.line}>
-            Size: {cm.lengthCm}cm × {cm.diameterCm}cm •{" "}
-            {ripe === true ? "RIPE" : ripe === false ? "NOT RIPE" : "N/A"}
-          </Text>
-        ) : null}
+  <Text style={styles.line}>
+    Size: {cm.lengthCm ?? "N/A"}cm × {cm.diameterCm ?? "N/A"}cm •{" "}
+    {ripe ? "RIPE" : "NOT RIPE"} • Ripe Count: {ripeCount}
+  </Text>
+) : (
+  <Text style={styles.line}>
+    Size: N/A • {ripe ? "RIPE" : "NOT RIPE"} • Ripe Count: {ripeCount}
+  </Text>
+)}
       </View>
 
       {legend.length > 0 ? (
