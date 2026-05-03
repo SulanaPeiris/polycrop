@@ -16,8 +16,8 @@
 #include "addons/RTDBHelper.h"
 
 // === FIREBASE ADDITION: CREDENTIALS ===
-#define WIFI_SSID "Dialog 4G 931"
-#define WIFI_PASSWORD "9e0Ff6c3"
+#define WIFI_SSID "Janith"
+#define WIFI_PASSWORD "11223344"
 #define API_KEY "AIzaSyA7mJ-uud7w7DDM94LGA4z-G8HJa2Q2qFA"
 
 // ====== FIRESTORE ======
@@ -48,8 +48,11 @@ String currentPositionLabel = "NONE";
 String currentRFIDSide = "";          // "A" or "B" (from rfidMap)
 String captureStatus = "IDLE";        // IDLE | REQUESTED | CAPTURED | DECIDED | DONE
 String captureRequestId = "";
-String captureDecision = "";          // SPRAY | NO_SPRAY
-int sprayDurationMs = 0;              // set by backend
+String captureDecision = "";          // PUMP1 | PUMP2 | PUMP1_PUMP2 | ALERT_ONLY | NO_SPRAY | SPRAY(old fallback)
+int sprayDurationMs = 0;              // set by backend (compatibility)
+int sprayPump1Ms = 0;                 // Downy mildew -> Pump 1
+int sprayPump2Ms = 0;                 // Powdery mildew -> Pump 2
+bool waterStressAlert = false;        // Water stress -> user alert only, no pump
 String captureId = "";
 String captureImageUrl = "";
 
@@ -324,6 +327,9 @@ void requestCaptureAtStop(int rounds, const String& directionLabel) {
   captureStatus = "REQUESTED";
   captureDecision = "";
   sprayDurationMs = 0;
+  sprayPump1Ms = 0;
+  sprayPump2Ms = 0;
+  waterStressAlert = false;
   captureId = "";
   captureImageUrl = "";
 
@@ -342,7 +348,14 @@ void requestCaptureAtStop(int rounds, const String& directionLabel) {
   logScanEvent("CAPTURE_REQUESTED", currentPositionLabel + " stop#" + String(stepperStopIndex) + " rounds=" + String(rounds));
 }
 
-bool fetchDecisionForRequest(const String& reqId, String& outDecision, int& outSprayMs) {
+bool fetchDecisionForRequest(
+  const String& reqId,
+  String& outDecision,
+  int& outSprayMs,
+  int& outPump1Ms,
+  int& outPump2Ms,
+  bool& outWaterStressAlert
+) {
   if (!Firebase.ready()) return false;
 
   String path = String(ROBOTS_COLLECTION) + "/" + String(ROBOT_ID);
@@ -371,6 +384,58 @@ bool fetchDecisionForRequest(const String& reqId, String& outDecision, int& outS
 
   json.get(data, "fields/sprayDurationMs/integerValue");
   outSprayMs = data.success ? data.to<int>() : 0;
+  if (!data.success) {
+    json.get(data, "fields/sprayDurationMs/doubleValue");
+    outSprayMs = data.success ? (int)data.to<float>() : 0;
+  }
+
+  // New backend fields:
+  //   Downy mildew   -> sprayPump1Ms
+  //   Powdery mildew -> sprayPump2Ms
+  json.get(data, "fields/sprayPump1Ms/integerValue");
+  outPump1Ms = data.success ? data.to<int>() : 0;
+  if (!data.success) {
+    json.get(data, "fields/sprayPump1Ms/doubleValue");
+    outPump1Ms = data.success ? (int)data.to<float>() : 0;
+  }
+  // Compatibility if backend sends pump1DurationMs instead of sprayPump1Ms
+  if (outPump1Ms <= 0) {
+    json.get(data, "fields/pump1DurationMs/integerValue");
+    outPump1Ms = data.success ? data.to<int>() : outPump1Ms;
+  }
+
+  json.get(data, "fields/sprayPump2Ms/integerValue");
+  outPump2Ms = data.success ? data.to<int>() : 0;
+  if (!data.success) {
+    json.get(data, "fields/sprayPump2Ms/doubleValue");
+    outPump2Ms = data.success ? (int)data.to<float>() : 0;
+  }
+  // Compatibility if backend sends pump2DurationMs instead of sprayPump2Ms
+  if (outPump2Ms <= 0) {
+    json.get(data, "fields/pump2DurationMs/integerValue");
+    outPump2Ms = data.success ? data.to<int>() : outPump2Ms;
+  }
+
+  json.get(data, "fields/waterStressAlert/booleanValue");
+  outWaterStressAlert = data.success ? data.to<bool>() : false;
+
+  // Backward compatibility with old backend decisions.
+  if (outPump1Ms <= 0 && outPump2Ms <= 0 && outDecision == "SPRAY" && outSprayMs > 0) {
+    outPump1Ms = outSprayMs;
+  }
+
+  if (outDecision == "PUMP1" && outPump1Ms <= 0 && outSprayMs > 0) {
+    outPump1Ms = outSprayMs;
+  }
+
+  if (outDecision == "PUMP2" && outPump2Ms <= 0 && outSprayMs > 0) {
+    outPump2Ms = outSprayMs;
+  }
+
+  if (outDecision == "PUMP1_PUMP2" && outSprayMs > 0) {
+    if (outPump1Ms <= 0) outPump1Ms = outSprayMs;
+    if (outPump2Ms <= 0) outPump2Ms = outSprayMs;
+  }
 
   return true;
 }
@@ -380,17 +445,23 @@ void markCaptureDoneOnRobotDoc() {
   pushDataToFirebase();
 }
 
-void sprayNow(int ms) {
+void sprayOnePump(int pumpNo, int ms) {
   if (ms <= 0) return;
 
-  actuatorStatus = "SPRAYING";
+  String pumpLabel = pumpNo == 1 ? "PUMP1" : "PUMP2";
+  actuatorStatus = pumpNo == 1 ? "PUMP1_ON" : "PUMP2_ON";
+
   pushDataToFirebase();
-  logScanEvent("SPRAY_START", currentPositionLabel + " stop#" + String(stepperStopIndex) + " ms=" + String(ms));
+  logScanEvent(pumpLabel + "_START", currentPositionLabel + " stop#" + String(stepperStopIndex) + " ms=" + String(ms));
 
   // Pump ON
-  pump1On();
+  if (pumpNo == 1) {
+    pump1On();
+  } else {
+    pump2On();
+  }
 
-  // Optional nozzle wiggle
+  // Optional nozzle wiggle - kept same behavior as old sprayNow()
   nozzleServo.attach(SERVO_PIN, 500, 2400);
   delay(100);
 
@@ -407,11 +478,45 @@ void sprayNow(int ms) {
   }
 
   nozzleServo.detach();
-  pump1Off();
+
+  // Pump OFF
+  if (pumpNo == 1) {
+    pump1Off();
+  } else {
+    pump2Off();
+  }
 
   actuatorStatus = "OFF";
   pushDataToFirebase();
-  logScanEvent("SPRAY_DONE", currentPositionLabel + " stop#" + String(stepperStopIndex));
+  logScanEvent(pumpLabel + "_DONE", currentPositionLabel + " stop#" + String(stepperStopIndex));
+}
+
+// Backward compatible wrapper: old SPRAY decision means Pump 1.
+void sprayNow(int ms) {
+  sprayOnePump(1, ms);
+}
+
+void sprayByDecision(const String& decision, int pump1Ms, int pump2Ms, bool waterAlert) {
+  if (waterAlert) {
+    logScanEvent("WATER_STRESS_ALERT", currentPositionLabel + " stop#" + String(stepperStopIndex) + " water stress detected");
+  }
+
+  if (pump1Ms <= 0 && pump2Ms <= 0) {
+    logScanEvent("NO_SPRAY", currentPositionLabel + " stop#" + String(stepperStopIndex) + " decision=" + decision);
+    return;
+  }
+
+  // Downy mildew -> Pump 1
+  if (pump1Ms > 0) {
+    sprayOnePump(1, pump1Ms);
+    delay(500);
+  }
+
+  // Powdery mildew -> Pump 2
+  if (pump2Ms > 0) {
+    sprayOnePump(2, pump2Ms);
+    delay(500);
+  }
 }
 
 
@@ -444,6 +549,9 @@ void updateRobotDoc() {
   content.set("fields/captureRequestId/stringValue", captureRequestId);
   content.set("fields/captureDecision/stringValue", captureDecision);
   content.set("fields/sprayDurationMs/integerValue", (int)sprayDurationMs);
+  content.set("fields/sprayPump1Ms/integerValue", (int)sprayPump1Ms);
+  content.set("fields/sprayPump2Ms/integerValue", (int)sprayPump2Ms);
+  content.set("fields/waterStressAlert/booleanValue", waterStressAlert);
   content.set("fields/captureId/stringValue", captureId);
   content.set("fields/captureImageUrl/stringValue", captureImageUrl);
 
@@ -459,7 +567,7 @@ void updateRobotDoc() {
   content.set("fields/updatedAt/timestampValue", nowRFC3339Z());
 
   String mask = "robotId,assignedTunnelId,rfid,currentPosition,moving,scanning,actuator,mode,rssi,"
-                "captureStatus,captureRequestId,captureDecision,sprayDurationMs,captureId,captureImageUrl,"
+                "captureStatus,captureRequestId,captureDecision,sprayDurationMs,sprayPump1Ms,sprayPump2Ms,waterStressAlert,captureId,captureImageUrl,"
                 "captureTunnelId,capturePlantId,captureRFID,captureSide,capturePosition,captureStopIndex,captureRounds,captureDirection,"
                 "updatedAt";
 
@@ -649,6 +757,9 @@ void finalizePositionAfterScan() {
   captureRequestId = "";
   captureDecision = "";
   sprayDurationMs = 0;
+  sprayPump1Ms = 0;
+  sprayPump2Ms = 0;
+  waterStressAlert = false;
   captureId = "";
   captureImageUrl = "";
 
@@ -798,13 +909,26 @@ void handleStepperScanMode() {
   if (captureWaitActive) {
     String decision = "";
     int ms = 0;
+    int pump1Ms = 0;
+    int pump2Ms = 0;
+    bool waterAlert = false;
 
-    bool decided = fetchDecisionForRequest(captureRequestId, decision, ms);
+    bool decided = fetchDecisionForRequest(
+      captureRequestId,
+      decision,
+      ms,
+      pump1Ms,
+      pump2Ms,
+      waterAlert
+    );
 
     if (!decided) {
       if (millis() - captureWaitStartMs > CAPTURE_WAIT_TIMEOUT_MS) {
         decision = "NO_SPRAY";
         ms = 0;
+        pump1Ms = 0;
+        pump2Ms = 0;
+        waterAlert = false;
         logScanEvent("CAPTURE_TIMEOUT", currentPositionLabel + " stop#" + String(stepperStopIndex) + " timeout, continue without spray");
       } else {
         delay(250); // small yield
@@ -814,13 +938,12 @@ void handleStepperScanMode() {
 
     captureDecision = decision;
     sprayDurationMs = ms;
+    sprayPump1Ms = pump1Ms;
+    sprayPump2Ms = pump2Ms;
+    waterStressAlert = waterAlert;
 
-    // Apply decision
-    if (captureDecision == "SPRAY" && sprayDurationMs > 0) {
-      sprayNow(sprayDurationMs);
-    } else {
-      logScanEvent("NO_SPRAY", currentPositionLabel + " stop#" + String(stepperStopIndex));
-    }
+    // Apply class-specific decision
+    sprayByDecision(captureDecision, sprayPump1Ms, sprayPump2Ms, waterStressAlert);
 
     markCaptureDoneOnRobotDoc();
 
