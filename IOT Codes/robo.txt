@@ -12,7 +12,6 @@
 
 // Provide the token generation process info.
 #include "addons/TokenHelper.h"
-// Provide the RTDB payload printing info and other helper functions.
 #include "addons/RTDBHelper.h"
 
 // === FIREBASE ADDITION: CREDENTIALS ===
@@ -44,36 +43,36 @@ String actuatorStatus = "OFF"; // OFF | PUMP1_ON | PUMP2_ON | SERVO_MOVING
 String modeStr = "LINE_FOLLOW";
 String currentPositionLabel = "NONE";
 
-// ===== CAPTURE HANDSHAKE (robot -> phone -> backend -> robot) =====
-String currentRFIDSide = "";          // "A" or "B" (from rfidMap)
-String captureStatus = "IDLE";        // IDLE | REQUESTED | CAPTURED | DECIDED | DONE
+// ===== CAPTURES =====
+String currentRFIDSide = "";          // "A" or "B"
+String captureStatus = "IDLE";
 String captureRequestId = "";
-String captureDecision = "";          // PUMP1 | PUMP2 | PUMP1_PUMP2 | ALERT_ONLY | NO_SPRAY | SPRAY(old fallback)
-int sprayDurationMs = 0;              // set by backend (compatibility)
+String captureDecision = "";          // PUMP1 | PUMP2 | PUMP1_PUMP2 | ALERT_ONLY | NO_SPRAY
+int sprayDurationMs = 0;              // set by backend
 int sprayPump1Ms = 0;                 // Downy mildew -> Pump 1
 int sprayPump2Ms = 0;                 // Powdery mildew -> Pump 2
-bool waterStressAlert = false;        // Water stress -> user alert only, no pump
+bool waterStressAlert = false;
 String captureId = "";
 String captureImageUrl = "";
 
-String captureTunnelId = "";          // assignedTunnelId
-String capturePlantId = "";           // currentPlantDocId
+String captureTunnelId = "";
+String capturePlantId = "";
 String captureRFID = "";
 String captureSide = "";
-String capturePosition = "";          // A/B/C
+String capturePosition = "";
 int captureStopIndex = 0;
 int captureRounds = 0;
-String captureDirection = "";         // FWD/BWD
+String captureDirection = "";
 
 bool captureWaitActive = false;
 unsigned long captureWaitStartMs = 0;
-const unsigned long CAPTURE_WAIT_TIMEOUT_MS = 120000; // 2 minutes
+const unsigned long CAPTURE_WAIT_TIMEOUT_MS = 120000;
 
-// tunnel assignment + resolved plant doc id
+// tunnel and resolved plant doc id
 String assignedTunnelId = "";
 String currentPlantDocId = "";
 unsigned long lastTunnelFetchMs = 0;
-const unsigned long TUNNEL_REFRESH_MS = 30000; // refresh assignment every 30s
+const unsigned long TUNNEL_REFRESH_MS = 30000;
 
 // ================= MOTOR + IR PINS =================
 // Left Motor Driver
@@ -88,7 +87,7 @@ const unsigned long TUNNEL_REFRESH_MS = 30000; // refresh assignment every 30s
 #define R_REN  15
 #define R_LEN  4
 
-// EN pins are wired to 5V, so ESP32 should NOT drive them
+
 const bool USE_GPIO_EN_PINS = false;
 
 // IR Sensors
@@ -120,7 +119,7 @@ AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
 #define PUMP1_CTRL 13
 #define PUMP2_CTRL 12
 
-// ================= SERVO =================
+// ================= SERVO MOTOR=================
 #define SERVO_PIN 27
 Servo nozzleServo;
 const int SERVO_ANGLE_A = 40;
@@ -131,8 +130,8 @@ const int MOTOR_STEPS_PER_REV = 200;
 const int INCREMENT_ROUNDS = 10;
 const int TOTAL_MAX_ROUNDS = 50;
 
-const long STEPS_PER_STOP = INCREMENT_ROUNDS * MOTOR_STEPS_PER_REV; // 2000
-const long FINAL_TARGET = TOTAL_MAX_ROUNDS * MOTOR_STEPS_PER_REV;   // 10000
+const long STEPS_PER_STOP = INCREMENT_ROUNDS * MOTOR_STEPS_PER_REV;
+const long FINAL_TARGET = TOTAL_MAX_ROUNDS * MOTOR_STEPS_PER_REV;
 
 const float STEPPER_MAX_SPEED = 2000;
 const float STEPPER_ACCEL     = 1500;
@@ -151,9 +150,9 @@ unsigned long lastRFIDTimeMs = 0;
 const unsigned long RFID_COOLDOWN_MS = 4000;
 
 // ================= POSITION TRACKING =================
-bool rfidDetected = false;       // after first RFID, next both-black = A
-int plantStopCount = 0;          // 0=none yet, 1=A done, 2=B done, 3=C done
-bool bothBlackLatched = false;   // detect new both-black edge only
+bool rfidDetected = false;
+int plantStopCount = 0;
+bool bothBlackLatched = false;
 
 // ================= STATE MACHINE =================
 enum Mode {
@@ -193,9 +192,9 @@ void stopMotors() {
   ledcWrite(CH_R_LPWM, 0);
 }
 
-// ================= TIME SYNC (TLS) =================
+// ================= TIME SYNC =================
 void initTime() {
-  configTime(19800, 0, "pool.ntp.org", "time.nist.gov"); // Sri Lanka UTC+5:30
+  configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
   Serial.print("Syncing time");
   time_t now = time(nullptr);
   int retry = 0;
@@ -274,7 +273,7 @@ void fetchAssignedTunnelId() {
 
 // Reads: tunnels/{assignedTunnelId}/rfidMap/{RFID} -> fields/plantId/stringValue
 void resolvePlantDocIdFromRFID() {
-  currentPlantDocId = currentRFID; // fallback (old behavior)
+  currentPlantDocId = currentRFID;
   currentRFIDSide = "";
 
   if (!Firebase.ready()) return;
@@ -389,7 +388,6 @@ bool fetchDecisionForRequest(
     outSprayMs = data.success ? (int)data.to<float>() : 0;
   }
 
-  // New backend fields:
   //   Downy mildew   -> sprayPump1Ms
   //   Powdery mildew -> sprayPump2Ms
   json.get(data, "fields/sprayPump1Ms/integerValue");
@@ -398,7 +396,7 @@ bool fetchDecisionForRequest(
     json.get(data, "fields/sprayPump1Ms/doubleValue");
     outPump1Ms = data.success ? (int)data.to<float>() : 0;
   }
-  // Compatibility if backend sends pump1DurationMs instead of sprayPump1Ms
+  // if backend sends pump1DurationMs
   if (outPump1Ms <= 0) {
     json.get(data, "fields/pump1DurationMs/integerValue");
     outPump1Ms = data.success ? data.to<int>() : outPump1Ms;
@@ -410,7 +408,7 @@ bool fetchDecisionForRequest(
     json.get(data, "fields/sprayPump2Ms/doubleValue");
     outPump2Ms = data.success ? (int)data.to<float>() : 0;
   }
-  // Compatibility if backend sends pump2DurationMs instead of sprayPump2Ms
+  // if backend sends pump2DurationMs
   if (outPump2Ms <= 0) {
     json.get(data, "fields/pump2DurationMs/integerValue");
     outPump2Ms = data.success ? data.to<int>() : outPump2Ms;
@@ -419,7 +417,7 @@ bool fetchDecisionForRequest(
   json.get(data, "fields/waterStressAlert/booleanValue");
   outWaterStressAlert = data.success ? data.to<bool>() : false;
 
-  // Backward compatibility with old backend decisions.
+  // Backward compatibility.
   if (outPump1Ms <= 0 && outPump2Ms <= 0 && outDecision == "SPRAY" && outSprayMs > 0) {
     outPump1Ms = outSprayMs;
   }
@@ -445,7 +443,6 @@ void markCaptureDoneOnRobotDoc() {
   pushDataToFirebase();
 }
 
-// Servo helper forward declarations
 void setServoAngleForStepper(int angle);
 void setServoForScanDirection();
 
@@ -458,7 +455,6 @@ void sprayOnePump(int pumpNo, int ms) {
   pushDataToFirebase();
   logScanEvent(pumpLabel + "_START", currentPositionLabel + " stop#" + String(stepperStopIndex) + " ms=" + String(ms));
 
-  // Keep servo fixed according to stepper direction
   // Upward  -> 90°
   // Downward -> 40°
   setServoForScanDirection();
@@ -479,7 +475,7 @@ void sprayOnePump(int pumpNo, int ms) {
     pump2Off();
   }
 
-  // After spraying, keep servo still fixed to scan direction
+  // After spraying, keep servo still fixed
   setServoForScanDirection();
 
   actuatorStatus = "OFF";
@@ -487,7 +483,7 @@ void sprayOnePump(int pumpNo, int ms) {
   logScanEvent(pumpLabel + "_DONE", currentPositionLabel + " stop#" + String(stepperStopIndex));
 }
 
-// Backward compatible wrapper: old SPRAY decision means Pump 1.
+// Backward compatible.
 void sprayNow(int ms) {
   sprayOnePump(1, ms);
 }
@@ -515,12 +511,10 @@ void sprayByDecision(const String& decision, int pump1Ms, int pump2Ms, bool wate
   }
 }
 
-
 // ------------------------- FIRESTORE WRITE FUNCTIONS -------------------------
 void updateRobotDoc() {
   if (!Firebase.ready()) return;
 
-  // Keep capture meta aligned to current state
   captureTunnelId = assignedTunnelId;
   capturePlantId = currentPlantDocId;
   captureRFID = currentRFID;
@@ -540,7 +534,7 @@ void updateRobotDoc() {
   content.set("fields/mode/stringValue", modeStr);
   content.set("fields/rssi/integerValue", (int)WiFi.RSSI());
 
-  // ---- Capture handshake fields ----
+  // ---- Capture fields ----
   content.set("fields/captureStatus/stringValue", captureStatus);
   content.set("fields/captureRequestId/stringValue", captureRequestId);
   content.set("fields/captureDecision/stringValue", captureDecision);
@@ -680,7 +674,7 @@ void setServoForScanDirection() {
 
 void moveForwardToClearMarker() {
   forward();
-  delay(500);   // move forward to leave the black marker
+  delay(500);
   stopMotors();
   delay(100);
 }
@@ -694,7 +688,6 @@ void startStepperScanSequence() {
   captureWaitActive = false;
   stepperStopIndex = 0;
 
-  // Upward scan start වෙන්න කලින් servo එක 90° fixed කරන්න
   setServoForScanDirection();
 
   stepper.setCurrentPosition(0);
@@ -836,10 +829,10 @@ void runActuationSequence() {
   nozzleServo.attach(SERVO_PIN, 500, 2400);
   delay(100);
 
-  nozzleServo.write(SERVO_ANGLE_A);   // 40 deg
+  nozzleServo.write(SERVO_ANGLE_A);
   delay(5000);
 
-  nozzleServo.write(SERVO_ANGLE_B);   // 90 deg
+  nozzleServo.write(SERVO_ANGLE_B);
   delay(5000);
 
   nozzleServo.detach();
@@ -942,7 +935,7 @@ void handleStepperScanMode() {
         waterAlert = false;
         logScanEvent("CAPTURE_TIMEOUT", currentPositionLabel + " stop#" + String(stepperStopIndex) + " timeout, continue without spray");
       } else {
-        delay(250); // small yield
+        delay(250);
         return;
       }
     }
@@ -953,7 +946,6 @@ void handleStepperScanMode() {
     sprayPump2Ms = pump2Ms;
     waterStressAlert = waterAlert;
 
-    // Apply class-specific decision
     sprayByDecision(captureDecision, sprayPump1Ms, sprayPump2Ms, waterStressAlert);
 
     markCaptureDoneOnRobotDoc();
@@ -974,7 +966,7 @@ void handleStepperScanMode() {
 
       logScanEvent("STEPPER_NEXT_FORWARD", currentPositionLabel + " next forward target " + String(nextStop / MOTOR_STEPS_PER_REV) + " rounds");
 
-      // Upward movement එකට කලින් servo 90° fixed කරන්න
+      // Before Upward movement servo 90° fixed 
       setServoForScanDirection();
 
       stepper.moveTo(nextStop);
@@ -984,7 +976,7 @@ void handleStepperScanMode() {
       movingForward = false;
       nextStop -= STEPS_PER_STOP;
 
-      // Downward scan start වෙන්න කලින් servo එක 40° fixed කරන්න
+      // Before Downward scan start servo 40° fixed
       setServoForScanDirection();
 
       Serial.println("50 rounds reached. Servo set to 40. Switching to CCW.");
@@ -1003,7 +995,7 @@ void handleStepperScanMode() {
 
       logScanEvent("STEPPER_NEXT_BACKWARD", currentPositionLabel + " next backward target " + String(nextStop / MOTOR_STEPS_PER_REV) + " rounds");
 
-      // Downward movement එකට කලින් servo 40° fixed කරන්න
+      // Before Downward scan start servo 40° fixed
       setServoForScanDirection();
 
       stepper.moveTo(nextStop);
@@ -1083,7 +1075,7 @@ void setup() {
   // Servo
   nozzleServo.setPeriodHertz(50);
 
-  // Motor Enable Pins (only if actually controlled by ESP32)
+  // Motor Enable Pins
   if (USE_GPIO_EN_PINS) {
     pinMode(L_REN, OUTPUT);
     pinMode(L_LEN, OUTPUT);
@@ -1127,7 +1119,7 @@ void setup() {
 
   stopMotors();
 
-  // Load assigned tunnel once on boot
+  // Load assigned tunnel on boot
   fetchAssignedTunnelId();
   lastTunnelFetchMs = millis();
 

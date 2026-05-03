@@ -9,17 +9,12 @@ from detection_utils import run_yolo_boxes, clamp_box
 
 CONF_CUCUMBER = 0.35
 
-
 def detect_cucumbers(model, pil_img, conf=CONF_CUCUMBER):
     return run_yolo_boxes(model, pil_img, conf=conf)
 
 
 def pick_primary_det(dets: List[dict]) -> Optional[dict]:
-    """
-    Pick the most likely main cucumber detection.
-    Uses area × (0.5 + conf) to prefer large + confident boxes.
-    Kept for compatibility with your previous code.
-    """
+
     if not dets:
         return None
 
@@ -33,12 +28,7 @@ def pick_primary_det(dets: List[dict]) -> Optional[dict]:
 
 
 def draw_cucumber_measurement_labels(img_bgr, cucumbers: List[dict]):
-    """
-    Draw separate cucumber size labels on the annotated image.
 
-    This keeps the existing green detection boxes and adds C1/C2/C3 labels
-    so multiple cucumbers in one image can be identified separately.
-    """
     if not cucumbers:
         return
 
