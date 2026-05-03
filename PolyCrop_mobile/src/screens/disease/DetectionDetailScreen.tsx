@@ -6,609 +6,680 @@ import {
   ScrollView,
   Image,
   ActivityIndicator,
-  FlatList,
   TouchableOpacity,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
-import { collection, doc, limit, onSnapshot, orderBy, query } from "firebase/firestore";
+import { collection, doc, onSnapshot } from "firebase/firestore";
+
 import { db } from "../../firebase/firebase";
+import {
+  bgrToRgbCss,
+  CaptureMetrics,
+  diseaseBg,
+  diseaseColor,
+  extractCaptureMetrics,
+  formatPercent,
+  getActionLabel,
+  getDotColor,
+  getSeverityForDisease,
+  matchesFilter,
+  niceDiseaseName,
+  pumpTextForDisease,
+  statusText,
+  timeAgo,
+  toNumber,
+} from "../../services/diseaseScanUtils";
 
 type FilterMode = "LEAF" | "CUCUMBER" | "ALL";
 
-function tsToMs(ts: any): number {
-  if (!ts) return 0;
-  if (typeof ts.toMillis === "function") return ts.toMillis();
-  if (typeof ts === "string") return Date.parse(ts) || 0;
-  return 0;
+type CaptureItem = CaptureMetrics & {
+  id: string;
+};
+
+function getImageAspectRatio(data: any) {
+  const width = Number(data?.outputs?.image?.width ?? data?.image?.width ?? 0);
+  const height = Number(data?.outputs?.image?.height ?? data?.image?.height ?? 0);
+
+  if (width > 0 && height > 0) return width / height;
+  return 4 / 3;
 }
 
-function timeAgo(ms: number) {
-  if (!ms) return "N/A";
-  const diff = Date.now() - ms;
-  const sec = Math.floor(diff / 1000);
-  if (sec < 10) return "just now";
-  if (sec < 60) return `${sec}s ago`;
-  const min = Math.floor(sec / 60);
-  if (min < 60) return `${min}m ago`;
-  const hr = Math.floor(min / 60);
-  if (hr < 24) return `${hr}h ago`;
-  const days = Math.floor(hr / 24);
-  return `${days}d ago`;
+function diseaseIcon(disease: string) {
+  if (disease === "powdery_mildew") return "snow-outline";
+  if (disease === "water_stress") return "water-outline";
+  return "leaf-outline";
 }
 
-function bgrToRgbCss(bgr: number[]) {
-  const [b, g, r] = bgr;
-  return `rgb(${r}, ${g}, ${b})`;
+function decisionColor(decision: string) {
+  const d = String(decision || "").toUpperCase();
+  if (["PUMP1", "PUMP2", "PUMP1_PUMP2", "SPRAY"].includes(d)) return "#2E7D32";
+  if (d === "ALERT_ONLY") return "#EF6C00";
+  return "#78909C";
 }
 
-function getLeafCount(docAny: any) {
-  return Number(docAny?.outputs?.summary?.counts?.leaf ?? 0);
-}
-function getCucumberCount(docAny: any) {
-  return Number(docAny?.outputs?.summary?.counts?.cucumber ?? 0);
+function severityLevelOnly(metrics: CaptureMetrics, disease: string) {
+  const stat = getSeverityForDisease(metrics.diseaseSeverity, disease);
+  return String(stat?.severityLevel ?? "N/A").toUpperCase();
 }
 
-function niceName(value: string) {
-  return String(value || "").replaceAll("_", " ");
+function severityNumbersOnly(metrics: CaptureMetrics, disease: string) {
+  const stat = getSeverityForDisease(metrics.diseaseSeverity, disease);
+  if (!stat) return "Max N/A • Avg N/A";
+
+  return `Max ${formatPercent(stat.maxSeverityPercent ?? 0, 2)} • Avg ${formatPercent(
+    stat.avgSeverityPercent ?? 0,
+    2
+  )}`;
 }
 
-function getActionLabel(decision: string) {
-  switch (decision) {
-    case "PUMP1":
-      return "Downy mildew treatment: Pump 1";
-    case "PUMP2":
-      return "Powdery mildew treatment: Pump 2";
-    case "PUMP1_PUMP2":
-      return "Both disease treatments: Pump 1 then Pump 2";
-    case "ALERT_ONLY":
-      return "Water stress alert only";
-    case "SPRAY":
-      return "Spray treatment";
-    case "NO_SPRAY":
-    default:
-      return "No spray needed";
-  }
-}
-
-function matchesFilter(docAny: any, filterMode: FilterMode) {
-  if (filterMode === "ALL") return true;
-  if (filterMode === "LEAF") return getLeafCount(docAny) > 0;
-  if (filterMode === "CUCUMBER") return getCucumberCount(docAny) > 0;
-  return true;
-}
-
-function CapturePreview({ data }: { data: any }) {
-  const annotatedUrl = data?.annotatedUrl || data?.imageUrl || "";
-  const imgW = data?.outputs?.image?.width ?? 1;
-  const imgH = data?.outputs?.image?.height ?? 1;
-  const aspectRatio = imgW / imgH;
-
-  const createdAtMs = tsToMs(data?.createdAt) || tsToMs(data?.updatedAt);
-
-  const summary = data?.outputs?.summary ?? {};
-  const counts = summary?.counts ?? {};
-  const diseases: string[] = summary?.diseases ?? [];
-
-  const captureDecision = String(summary?.captureDecision || summary?.decision || data?.captureDecision || "NO_SPRAY");
-  const actionLabel = String(summary?.actionLabel || data?.actionLabel || getActionLabel(captureDecision));
-  const pump1Ms = Number(summary?.pump1DurationMs ?? data?.pump1DurationMs ?? 0);
-  const pump2Ms = Number(summary?.pump2DurationMs ?? data?.pump2DurationMs ?? 0);
-  const waterStressAlert = Boolean(summary?.waterStressAlert ?? data?.waterStressAlert ?? false);
-  const diseaseSeverity: Record<string, any> = summary?.diseaseSeverity ?? data?.diseaseSeverity ?? {};
-  const severityEntries = Object.entries(diseaseSeverity);
-
-  const legend: Array<{ name: string; colorBGR: number[] }> = data?.outputs?.disease?.legend ?? [];
-  const perLeaf: any[] = data?.outputs?.disease?.perLeaf ?? [];
-
-  const topLeaves = useMemo(() => {
-    const sorted = [...perLeaf].sort((a, b) => (b.totalSeverityPercent ?? 0) - (a.totalSeverityPercent ?? 0));
-    return sorted.slice(0, 8);
-  }, [perLeaf]);
-
-const ripeness = data?.outputs?.ripeness ?? {};
-
-const allCucumbers: any[] =
-  summary?.allCucumbers ??
-  ripeness?.cucumbers ??
-  [];
-
-const ripeCucumbers: any[] =
-  summary?.ripeCucumbers ??
-  allCucumbers.filter((c: any) => c?.ripe === true);
-
-const displayCucumber =
-  ripeCucumbers[0] ??
-  allCucumbers[0] ??
-  null;
-
-const cm =
-  displayCucumber?.cm ??
-  (
-    summary?.cucumberLengthCm || summary?.cucumberDiameterCm
-      ? {
-          lengthCm: summary?.cucumberLengthCm,
-          diameterCm: summary?.cucumberDiameterCm,
-        }
-      : null
+function SectionHeader({ title, subtitle }: { title: string; subtitle?: string }) {
+  return (
+    <View style={styles.sectionHeader}>
+      <Text style={styles.sectionTitle}>{title}</Text>
+      {subtitle ? <Text style={styles.sectionSubtitle}>{subtitle}</Text> : null}
+    </View>
   );
+}
 
-const ripe = Boolean(
-  summary?.ripe ??
-    ripeness?.hasRipe ??
-    ripeness?.ripe ??
-    false
-);
+function StatBox({ value, label }: { value: string | number; label: string }) {
+  return (
+    <View style={styles.statBox}>
+      <Text style={styles.statValue}>{value}</Text>
+      <Text style={styles.statLabel}>{label}</Text>
+    </View>
+  );
+}
 
-const ripeCount = Number(
-  summary?.ripeCucumberCount ??
-    ripeness?.ripeCount ??
-    ripeCucumbers.length ??
-    0
-);
+function RobotActionCard({ metrics }: { metrics: CaptureMetrics }) {
+  const color = decisionColor(metrics.captureDecision);
 
   return (
-    <View>
-      {annotatedUrl ? (
-        <Image source={{ uri: annotatedUrl }} style={[styles.image, { aspectRatio }]} resizeMode="contain" />
-      ) : (
-        <View style={[styles.image, styles.imagePlaceholder]}>
-          <Text style={styles.helper}>No image available</Text>
-        </View>
-      )}
-
-      <View style={styles.card}>
-        <Text style={styles.title}>Summary</Text>
-        <Text style={styles.line}>
-          Time: {createdAtMs ? new Date(createdAtMs).toLocaleString() : "N/A"} ({timeAgo(createdAtMs)})
-        </Text>
-        <Text style={styles.line}>
-          Cucumber: {counts.cucumber ?? 0} | Leaf: {counts.leaf ?? 0} | Flower: {counts.flower ?? 0}
-        </Text>
-        <Text style={styles.line}>Diseases: {diseases.length ? diseases.map(niceName).join(", ") : "None"}</Text>
-
-        <View style={styles.actionBox}>
-          <Text style={styles.actionTitle}>Disease Action</Text>
-          <Text style={styles.actionText}>{actionLabel}</Text>
-          <Text style={styles.actionMeta}>
-            Decision: {captureDecision} • Pump 1: {pump1Ms}ms • Pump 2: {pump2Ms}ms
-          </Text>
-          <Text style={waterStressAlert ? styles.warningLine : styles.safeLine}>
-            Water Stress Alert: {waterStressAlert ? "Created for user" : "No"}
-          </Text>
+    <View style={styles.robotCard}>
+      <View style={styles.robotTopRow}>
+        <View>
+          <Text style={styles.robotTitle}>Robot Action</Text>
+          <Text style={styles.robotSub}>{metrics.actionLabel || getActionLabel(metrics.captureDecision)}</Text>
         </View>
 
-        {/* Cucumber size */}
-        {cm ? (
-  <Text style={styles.line}>
-    Size: {cm.lengthCm ?? "N/A"}cm × {cm.diameterCm ?? "N/A"}cm •{" "}
-    {ripe ? "RIPE" : "NOT RIPE"} • Ripe Count: {ripeCount}
-  </Text>
-) : (
-  <Text style={styles.line}>
-    Size: N/A • {ripe ? "RIPE" : "NOT RIPE"} • Ripe Count: {ripeCount}
-  </Text>
-)}
+        <View style={[styles.decisionPill, { backgroundColor: `${color}18` }]}>
+          <Text style={[styles.decisionPillText, { color }]}>{metrics.captureDecision}</Text>
+        </View>
       </View>
 
-      {severityEntries.length > 0 ? (
-        <View style={styles.card}>
-          <Text style={styles.title}>Disease Severity</Text>
-          {severityEntries.map(([name, stat]) => (
-            <View key={name} style={styles.severityRow}>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.severityName}>{niceName(name)}</Text>
-                <Text style={styles.severityMeta}>
-                  Affected leaves: {Number((stat as any)?.affectedLeaves ?? 0)}
-                </Text>
-              </View>
-              <View style={styles.severityBadge}>
-                <Text style={styles.severityLevel}>{String((stat as any)?.severityLevel || "N/A")}</Text>
-                <Text style={styles.severityPercent}>
-                  Max {Number((stat as any)?.maxSeverityPercent ?? 0).toFixed(2)}%
-                </Text>
-                <Text style={styles.severityPercent}>
-                  Avg {Number((stat as any)?.avgSeverityPercent ?? 0).toFixed(2)}%
-                </Text>
-              </View>
-            </View>
-          ))}
+      <View style={styles.pumpGrid}>
+        <View style={styles.pumpBox}>
+          <Ionicons name="flame-outline" size={18} color="#D32F2F" />
+          <Text style={styles.pumpTitle}>Pump 1</Text>
+          <Text style={styles.pumpValue}>{metrics.pump1Ms}ms</Text>
+          <Text style={styles.pumpHint}>Downy mildew</Text>
         </View>
-      ) : null}
 
-      {legend.length > 0 ? (
-        <View style={styles.card}>
-          <Text style={styles.title}>Legend</Text>
-          {legend.map((it, idx) => (
-            <View key={`${it.name}-${idx}`} style={styles.legendRow}>
-              <View style={[styles.swatch, { backgroundColor: bgrToRgbCss(it.colorBGR) }]} />
-              <Text style={styles.legendText}>{niceName(it.name)}</Text>
-            </View>
-          ))}
+        <View style={styles.pumpBox}>
+          <Ionicons name="snow-outline" size={18} color="#7B1FA2" />
+          <Text style={styles.pumpTitle}>Pump 2</Text>
+          <Text style={styles.pumpValue}>{metrics.pump2Ms}ms</Text>
+          <Text style={styles.pumpHint}>Powdery mildew</Text>
         </View>
-      ) : null}
 
-      <View style={styles.card}>
-        <Text style={styles.title}>Leaf Severity (Top)</Text>
-        {topLeaves.length === 0 ? (
-          <Text style={styles.helper}>No disease detected on leaves.</Text>
-        ) : (
-          topLeaves.map((l) => (
-            <View key={String(l.leafIndex)} style={styles.leafRow}>
-              <Text style={styles.leafName}>Leaf #{(l.leafIndex ?? 0) + 1}</Text>
-              <Text style={styles.leafSev}>{(l.totalSeverityPercent ?? 0).toFixed(2)}%</Text>
-            </View>
-          ))
-        )}
+        <View style={styles.pumpBox}>
+          <Ionicons name="water-outline" size={18} color="#EF6C00" />
+          <Text style={styles.pumpTitle}>Water Alert</Text>
+          <Text style={styles.pumpValue}>{metrics.waterStressAlert ? "Yes" : "No"}</Text>
+          <Text style={styles.pumpHint}>User notification</Text>
+        </View>
       </View>
     </View>
   );
 }
 
-export default function DetectionDetailScreen({ route, navigation }: any) {
-  // Backward compatible
-  const captureId: string | undefined =
-    route?.params?.captureId ?? route?.params?.imageId ?? route?.params?.id;
+function CaptureScanCard({
+  item,
+  onPress,
+}: {
+  item: CaptureItem;
+  onPress: () => void;
+}) {
+  const primaryDisease = item.diseases[0];
+  const color = item.affected ? diseaseColor(primaryDisease) : "#2E7D32";
+  const bg = item.affected ? diseaseBg(primaryDisease) : "#E8F5E9";
 
-  const tunnelId: string | undefined = route?.params?.tunnelId;
-  const plantId: string | undefined = route?.params?.plantId;
-
-  // ✅ This controls which scans are shown when in plant mode
-  const initialFilter: FilterMode = (route?.params?.filterMode ?? "LEAF") as FilterMode;
-  const [filterMode, setFilterMode] = useState<FilterMode>(initialFilter);
-
-  // -----------------------
-  // MODE A: Plant scan list (tunnelId+plantId)
-  // -----------------------
-  const [list, setList] = useState<any[]>([]);
-  const [activeId, setActiveId] = useState<string>("");
-  const [activeDoc, setActiveDoc] = useState<any>(null);
-  const [loading, setLoading] = useState(true);
-
-  const inPlantMode = !!tunnelId && !!plantId;
-
-  const filteredList = useMemo(() => {
-    if (!inPlantMode) return [];
-    return list.filter((x) => matchesFilter(x, filterMode));
-  }, [list, filterMode, inPlantMode]);
-
-  // Load plant captures list
-  useEffect(() => {
-    if (!inPlantMode) return;
-
-    setLoading(true);
-    const ref = collection(db, "tunnels", tunnelId!, "plants", plantId!, "captures");
-    const q = query(ref, orderBy("updatedAt", "desc"), limit(200));
-
-    return onSnapshot(
-      q,
-      (snap) => {
-        const items = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
-        setList(items);
-        setLoading(false);
-
-        // choose active
-        const filtered = items.filter((x) => matchesFilter(x, filterMode));
-        const preferred = captureId && filtered.some((x) => x.id === captureId) ? captureId : filtered[0]?.id;
-
-        setActiveId(preferred ?? "");
-      },
-      (err) => {
-        console.log("plant captures error:", err?.message);
-        setLoading(false);
-      }
-    );
-  }, [inPlantMode, tunnelId, plantId, captureId, filterMode]);
-
-  // Subscribe active capture doc (prefer plant path; fallback top-level)
-  useEffect(() => {
-    if (!inPlantMode) return;
-    if (!activeId) {
-      setActiveDoc(null);
-      return;
-    }
-
-    let unsub1: any = null;
-    let unsub2: any = null;
-
-    const plantRef = doc(db, "tunnels", tunnelId!, "plants", plantId!, "captures", activeId);
-    unsub1 = onSnapshot(plantRef, (snap) => {
-      if (snap.exists()) {
-        setActiveDoc({ id: snap.id, ...(snap.data() as any) });
-        unsub2?.();
-        return;
-      }
-      // fallback to top-level
-      const topRef = doc(db, "captures", activeId);
-      unsub2 = onSnapshot(topRef, (snap2) => {
-        setActiveDoc(snap2.exists() ? { id: snap2.id, ...(snap2.data() as any) } : null);
-      });
-    });
-
-    return () => {
-      unsub1?.();
-      unsub2?.();
-    };
-  }, [inPlantMode, tunnelId, plantId, activeId]);
-
-  // -----------------------
-  // MODE B: Single capture (only captureId)
-  // -----------------------
-  const [singleDoc, setSingleDoc] = useState<any>(null);
-  const [singleLoading, setSingleLoading] = useState(false);
-
-  useEffect(() => {
-    if (inPlantMode) return;
-    if (!captureId) return;
-
-    setSingleLoading(true);
-    const ref = doc(db, "captures", captureId);
-    return onSnapshot(
-      ref,
-      (snap) => {
-        setSingleDoc(snap.exists() ? snap.data() : null);
-        setSingleLoading(false);
-      },
-      () => setSingleLoading(false)
-    );
-  }, [inPlantMode, captureId]);
-
-  // -----------------------
-  // UI
-  // -----------------------
-  if (inPlantMode) {
-    if (loading) {
-      return (
-        <SafeAreaView style={{ flex: 1, backgroundColor: "#fff" }}>
-          <View style={styles.center}>
-            <ActivityIndicator />
-            <Text style={styles.helper}>Loading plant scans…</Text>
+  return (
+    <TouchableOpacity style={styles.scanCard} activeOpacity={0.88} onPress={onPress}>
+      <View style={styles.scanImageWrap}>
+        {item.annotatedUrl ? (
+          <Image source={{ uri: item.annotatedUrl }} style={styles.scanImage} />
+        ) : (
+          <View style={styles.scanImagePlaceholder}>
+            <Ionicons name="image-outline" size={26} color="#90A4AE" />
           </View>
-        </SafeAreaView>
-      );
-    }
+        )}
+      </View>
 
-    return (
-      <SafeAreaView style={{ flex: 1, backgroundColor: "#fff" }}>
-        <ScrollView contentContainerStyle={styles.container} showsVerticalScrollIndicator={false}>
-          <Text style={styles.h1}>Detection Detail</Text>
-          <Text style={styles.sub}>
-            Plant: {plantId} • Showing {filteredList.length}/{list.length}
-          </Text>
+      <View style={styles.scanBody}>
+        <View style={styles.scanTopRow}>
+          <View style={[styles.scanStatusPill, { backgroundColor: bg }]}>
+            <View style={[styles.scanDot, { backgroundColor: color }]} />
+            <Text style={[styles.scanStatusText, { color }]}>{statusText(item.status)}</Text>
+          </View>
 
-          {/* Filter tabs */}
-          <View style={styles.tabs}>
-            {(["LEAF", "CUCUMBER", "ALL"] as FilterMode[]).map((m) => {
-              const active = filterMode === m;
+          <Ionicons name="chevron-forward" size={20} color="#9E9E9E" />
+        </View>
+
+        <Text style={styles.scanTitle}>{item.captureId || item.id}</Text>
+        <Text style={styles.scanMeta}>
+          {timeAgo(item.updatedAtMs || item.createdAtMs)} • {new Date(item.updatedAtMs || item.createdAtMs || Date.now()).toLocaleString()}
+        </Text>
+
+        <Text style={styles.scanIssues} numberOfLines={2}>
+          {item.diseases.length ? item.diseases.map(niceDiseaseName).join(" • ") : "No disease detected"}
+        </Text>
+
+        {item.diseases.length > 0 ? (
+          <View style={styles.scanSeverityChips}>
+            {item.diseases.map((disease) => {
+              const chipColor = diseaseColor(disease);
               return (
-                <TouchableOpacity
-                  key={m}
-                  onPress={() => setFilterMode(m)}
-                  style={[styles.tab, active && styles.tabActive]}
-                  activeOpacity={0.85}
+                <View
+                  key={`${item.id}-${disease}`}
+                  style={[styles.scanSeverityChip, { backgroundColor: `${chipColor}14` }]}
                 >
-                  <Text style={[styles.tabText, active && styles.tabTextActive]}>
-                    {m === "LEAF" ? "Leaf" : m === "CUCUMBER" ? "Cucumber" : "All"}
+                  <Text style={[styles.scanSeverityChipText, { color: chipColor }]}>
+                    {niceDiseaseName(disease)}: {severityLevelOnly(item, disease)}
                   </Text>
-                </TouchableOpacity>
+                </View>
               );
             })}
           </View>
+        ) : null}
 
-          {activeDoc ? (
-            <CapturePreview data={activeDoc} />
-          ) : (
-            <View style={styles.card}>
-              <Text style={styles.helper}>No scan selected.</Text>
+        <View style={styles.scanStatsRow}>
+          <Text style={styles.scanStat}>Leaf: {item.counts.leaf}</Text>
+          <Text style={styles.scanStat}>Flower: {item.counts.flower}</Text>
+          <Text style={styles.scanStat}>Pump: {item.pump1Ms + item.pump2Ms}ms</Text>
+        </View>
+      </View>
+    </TouchableOpacity>
+  );
+}
+
+function DiseaseIssues({ metrics }: { metrics: CaptureMetrics }) {
+  if (!metrics.scanned) {
+    return (
+      <View style={styles.emptyDetailCard}>
+        <Ionicons name="time-outline" size={26} color="#90A4AE" />
+        <Text style={styles.emptyDetailTitle}>No completed scan data</Text>
+        <Text style={styles.emptyDetailText}>This capture has no completed leaf output yet.</Text>
+      </View>
+    );
+  }
+
+  if (metrics.diseases.length === 0) {
+    return (
+      <View style={styles.healthyCard}>
+        <Ionicons name="shield-checkmark-outline" size={28} color="#2E7D32" />
+        <View style={{ flex: 1 }}>
+          <Text style={styles.healthyTitle}>No disease detected</Text>
+          <Text style={styles.healthyText}>The latest leaf scan did not detect downy mildew, powdery mildew, or water stress.</Text>
+        </View>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.issuesList}>
+      {metrics.diseases.map((disease) => {
+        const color = diseaseColor(disease);
+        const bg = diseaseBg(disease);
+
+        return (
+          <View key={disease} style={styles.issueCard}>
+            <View style={[styles.issueIconBox, { backgroundColor: bg }]}>
+              <Ionicons name={diseaseIcon(disease) as any} size={23} color={color} />
             </View>
-          )}
 
-          <View style={[styles.card, { marginTop: 16 }]}>
-            <Text style={[styles.title, { marginBottom: 10 }]}>Scans for this Plant</Text>
-
-            {filteredList.length === 0 ? (
-              <Text style={styles.helper}>
-                {filterMode === "LEAF"
-                  ? "No leaf-detected scans for this plant."
-                  : filterMode === "CUCUMBER"
-                  ? "No cucumber-detected scans for this plant."
-                  : "No scans yet."}
+            <View style={{ flex: 1 }}>
+              <Text style={styles.issueTitle}>{niceDiseaseName(disease)}</Text>
+              <Text style={[styles.issueSeverity, { color }]}>
+                Severity Level: {severityLevelOnly(metrics, disease)}
               </Text>
-            ) : (
-              <FlatList
-                data={filteredList}
-                keyExtractor={(it) => it.id}
-                scrollEnabled={false}
-                renderItem={({ item }) => {
-                  const isActive = item.id === activeId;
-                  const thumb = item.annotatedUrl || item.imageUrl || "";
-                  const ms = tsToMs(item.updatedAt) || tsToMs(item.createdAt);
+              <Text style={styles.issueSeverity}>
+                {severityNumbersOnly(metrics, disease)}
+              </Text>
+              <Text style={styles.issueAction}>{pumpTextForDisease(disease, metrics.pump1Ms, metrics.pump2Ms)}</Text>
+            </View>
+          </View>
+        );
+      })}
+    </View>
+  );
+}
 
-                  const summary = item.outputs?.summary ?? {};
-                  const decision = String(summary.captureDecision || summary.decision || "NO_SPRAY");
-                  const pump1 = Number(summary.pump1DurationMs ?? 0);
-                  const pump2 = Number(summary.pump2DurationMs ?? 0);
-                  const leaf = getLeafCount(item);
-                  const cuc = getCucumberCount(item);
+function SeverityTable({ metrics }: { metrics: CaptureMetrics }) {
+  const entries = Object.entries(metrics.diseaseSeverity ?? {});
 
-                  return (
-                    <TouchableOpacity
-                      onPress={() => setActiveId(item.id)}
-                      style={[styles.scanRow, isActive && styles.scanRowActive]}
-                      activeOpacity={0.85}
-                    >
-                      <View style={styles.thumbBox}>
-                        {thumb ? (
-                          <Image source={{ uri: thumb }} style={styles.thumb} />
-                        ) : (
-                          <View style={[styles.thumb, { alignItems: "center", justifyContent: "center" }]}>
-                            <Ionicons name="image-outline" size={18} color="#9E9E9E" />
-                          </View>
-                        )}
-                      </View>
+  if (entries.length === 0) {
+    return (
+      <View style={styles.emptySmallCard}>
+        <Text style={styles.emptySmallText}>No severity summary saved for this scan.</Text>
+      </View>
+    );
+  }
 
-                      <View style={{ flex: 1 }}>
-                        <Text style={styles.scanTitle} numberOfLines={1}>
-                          {item.id}
-                        </Text>
-                        <Text style={styles.scanMeta}>
-                          {ms ? timeAgo(ms) : "N/A"} • {decision} • P1 {pump1}ms • P2 {pump2}ms • Leaf {leaf} • Cuc {cuc}
-                        </Text>
-                      </View>
+  return (
+    <View style={styles.severityList}>
+      {entries.map(([name, stat]: any) => {
+        const color = diseaseColor(name);
+        const bg = diseaseBg(name);
 
-                      <Ionicons name="chevron-forward" size={18} color={isActive ? "#2E7D32" : "#BDBDBD"} />
-                    </TouchableOpacity>
-                  );
-                }}
-              />
-            )}
+        return (
+          <View key={name} style={styles.severityCard}>
+            <View style={[styles.severityIcon, { backgroundColor: bg }]}>
+              <Ionicons name={diseaseIcon(name) as any} size={18} color={color} />
+            </View>
+
+            <View style={{ flex: 1 }}>
+              <Text style={styles.severityName}>{niceDiseaseName(name)}</Text>
+              <Text style={styles.severityMeta}>
+                Affected leaves: {toNumber(stat?.affectedLeaves, 0)}
+              </Text>
+            </View>
+
+            <View style={styles.severityRight}>
+              <Text style={[styles.severityLevel, { color }]}>{String(stat?.severityLevel || "N/A")}</Text>
+              <Text style={styles.severityNumbers}>
+                Max {formatPercent(stat?.maxSeverityPercent ?? 0, 2)} • Avg {formatPercent(stat?.avgSeverityPercent ?? 0, 2)}
+              </Text>
+            </View>
+          </View>
+        );
+      })}
+    </View>
+  );
+}
+
+function PerLeafList({ metrics }: { metrics: CaptureMetrics }) {
+  const rows = metrics.perLeaf.slice(0, 25);
+
+  if (rows.length === 0) {
+    return (
+      <View style={styles.emptySmallCard}>
+        <Text style={styles.emptySmallText}>No per-leaf severity rows saved for this scan.</Text>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.leafList}>
+      {rows.map((leaf, idx) => {
+        const firstDisease = leaf.diseases[0] ?? "leaf";
+        const color = diseaseColor(firstDisease);
+        const bg = diseaseBg(firstDisease);
+
+        return (
+          <View key={`${leaf.index}-${idx}`} style={styles.leafRow}>
+            <View style={[styles.leafIndexBox, { backgroundColor: bg }]}>
+              <Text style={[styles.leafIndexText, { color }]}>{leaf.index}</Text>
+            </View>
+
+            <View style={{ flex: 1 }}>
+              <Text style={styles.leafTitle}>{leaf.label}</Text>
+              <Text style={styles.leafMeta} numberOfLines={1}>
+                {leaf.diseases.length ? leaf.diseases.map(niceDiseaseName).join(" • ") : "No disease class"}
+              </Text>
+            </View>
+
+            <View style={styles.leafRight}>
+              <Text style={[styles.leafSeverityLevel, { color }]}>{leaf.severityLevel}</Text>
+              <Text style={styles.leafPercent}>
+                {formatPercent(leaf.totalSeverityPercent ?? leaf.maxSeverityPercent ?? 0, 2)}
+              </Text>
+            </View>
+          </View>
+        );
+      })}
+    </View>
+  );
+}
+
+function LegendList({ metrics }: { metrics: CaptureMetrics }) {
+  if (metrics.legend.length === 0) return null;
+
+  return (
+    <View style={styles.legendWrap}>
+      {metrics.legend.map((item, idx) => (
+        <View key={`${item.name}-${idx}`} style={styles.legendItem}>
+          <View
+            style={[
+              styles.legendColor,
+              { backgroundColor: item.color ?? bgrToRgbCss(item.colorBGR) },
+            ]}
+          />
+          <Text style={styles.legendText}>{niceDiseaseName(item.name)}</Text>
+        </View>
+      ))}
+    </View>
+  );
+}
+
+function CaptureFullDetail({ metrics }: { metrics: CaptureMetrics }) {
+  const aspectRatio = getImageAspectRatio(metrics.raw);
+  const statusColor = getDotColor(metrics.status, metrics.scanned);
+
+  return (
+    <ScrollView contentContainerStyle={styles.detailContent}>
+      <View style={styles.imageCard}>
+        {metrics.annotatedUrl ? (
+          <Image source={{ uri: metrics.annotatedUrl }} style={[styles.detailImage, { aspectRatio }]} />
+        ) : (
+          <View style={[styles.noImageBox, { aspectRatio }]}>
+            <Ionicons name="image-outline" size={42} color="#90A4AE" />
+            <Text style={styles.noImageText}>No image available</Text>
+          </View>
+        )}
+      </View>
+
+      <View style={styles.summaryCard}>
+        <View style={styles.summaryTopRow}>
+          <View>
+            <Text style={styles.summaryTitle}>Leaf Scan Summary</Text>
+            <Text style={styles.summarySub}>
+              {metrics.updatedAtMs || metrics.createdAtMs
+                ? `${new Date(metrics.updatedAtMs || metrics.createdAtMs).toLocaleString()} • ${timeAgo(metrics.updatedAtMs || metrics.createdAtMs)}`
+                : "Time: N/A"}
+            </Text>
           </View>
 
-          <View style={{ height: 30 }} />
-        </ScrollView>
-      </SafeAreaView>
+          <View style={[styles.statusBadge, { backgroundColor: `${statusColor}18` }]}>
+            <View style={[styles.statusDot, { backgroundColor: statusColor }]} />
+            <Text style={[styles.statusText, { color: statusColor }]}>{statusText(metrics.status)}</Text>
+          </View>
+        </View>
+
+        <View style={styles.statGrid}>
+          <StatBox value={metrics.counts.leaf} label="Leaves" />
+          <StatBox value={metrics.counts.flower} label="Flowers" />
+          <StatBox value={metrics.diseases.length} label="Issues" />
+        </View>
+      </View>
+
+      <SectionHeader title="Detected Disease & Stress" subtitle="Cucumber harvest outputs are hidden here; this screen only shows leaf outputs." />
+      <DiseaseIssues metrics={metrics} />
+
+      <SectionHeader title="Disease & Water Stress Severity" subtitle="Severity level is shown for every detected issue saved in the scan output." />
+      <SeverityTable metrics={metrics} />
+
+      <SectionHeader title="Pump Status & Alert Output" />
+      <RobotActionCard metrics={metrics} />
+
+      <SectionHeader title="Leaf Severity Details" subtitle="Top affected leaves from the model output." />
+      <PerLeafList metrics={metrics} />
+
+      <LegendList metrics={metrics} />
+    </ScrollView>
+  );
+}
+
+export default function DetectionDetailScreen({ route, navigation }: any) {
+  const tunnelId: string = route?.params?.tunnelId ?? "";
+  const plantId: string = route?.params?.plantId ?? "";
+  const captureId: string | undefined = route?.params?.captureId;
+  const filterMode: FilterMode = route?.params?.filterMode ?? "LEAF";
+
+  const [loading, setLoading] = useState(true);
+  const [captures, setCaptures] = useState<CaptureItem[]>([]);
+  const [selectedCapture, setSelectedCapture] = useState<CaptureMetrics | null>(null);
+
+  useEffect(() => {
+    if (!tunnelId || !plantId) {
+      setCaptures([]);
+      setLoading(false);
+      return;
+    }
+
+    setLoading(true);
+
+    const ref = collection(db, "tunnels", tunnelId, "plants", plantId, "captures");
+
+    return onSnapshot(
+      ref,
+      (snap) => {
+        const list = snap.docs
+          .map((docSnap) => {
+            const metrics = extractCaptureMetrics(docSnap.data(), docSnap.id) as CaptureItem;
+            return { ...metrics, id: docSnap.id };
+          })
+          .filter((item) => matchesFilter(item, filterMode))
+          .sort((a, b) => (b.updatedAtMs || b.createdAtMs) - (a.updatedAtMs || a.createdAtMs));
+
+        setCaptures(list);
+        setLoading(false);
+      },
+      () => {
+        setCaptures([]);
+        setLoading(false);
+      }
     );
+  }, [tunnelId, plantId, filterMode]);
+
+  useEffect(() => {
+    if (!tunnelId || !plantId || !captureId) {
+      setSelectedCapture(null);
+      return;
+    }
+
+    const ref = doc(db, "tunnels", tunnelId, "plants", plantId, "captures", captureId);
+
+    return onSnapshot(ref, (snap) => {
+      if (!snap.exists()) {
+        setSelectedCapture(null);
+        return;
+      }
+
+      setSelectedCapture(extractCaptureMetrics(snap.data(), snap.id));
+    });
+  }, [tunnelId, plantId, captureId]);
+
+  const screenTitle = captureId ? "Capture Scan Detail" : "Capture Scans";
+  const filteredCount = useMemo(() => captures.length, [captures.length]);
+
+  function openCapture(item: CaptureItem) {
+    navigation.navigate("DetectionDetail", {
+      tunnelId,
+      plantId,
+      captureId: item.id,
+      filterMode,
+    });
   }
 
-  // Single capture mode (backward compatible)
-  if (!captureId) {
+  if (loading && !captureId) {
     return (
-      <SafeAreaView style={{ flex: 1, backgroundColor: "#fff" }}>
-        <View style={styles.center}>
-          <Text style={styles.helper}>Missing captureId (or tunnelId/plantId).</Text>
+      <SafeAreaView style={styles.safe}>
+        <View style={styles.centerBox}>
+          <ActivityIndicator size="large" color="#2E7D32" />
+          <Text style={styles.centerText}>Loading plant capture scans...</Text>
         </View>
       </SafeAreaView>
     );
   }
 
-  if (singleLoading) {
+  if (captureId) {
     return (
-      <SafeAreaView style={{ flex: 1, backgroundColor: "#fff" }}>
-        <View style={styles.center}>
-          <ActivityIndicator />
-          <Text style={styles.helper}>Loading scan…</Text>
-        </View>
-      </SafeAreaView>
-    );
-  }
-
-  if (!singleDoc) {
-    return (
-      <SafeAreaView style={{ flex: 1, backgroundColor: "#fff" }}>
-        <View style={styles.center}>
-          <Text style={styles.helper}>Scan not found.</Text>
-          <Text style={styles.helperSmall}>captureId: {captureId}</Text>
-        </View>
+      <SafeAreaView style={styles.safe}>
+        {!selectedCapture ? (
+          <View style={styles.centerBox}>
+            <ActivityIndicator size="large" color="#2E7D32" />
+            <Text style={styles.centerText}>Loading capture details...</Text>
+          </View>
+        ) : (
+          <CaptureFullDetail metrics={selectedCapture} />
+        )}
       </SafeAreaView>
     );
   }
 
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: "#fff" }}>
-      <ScrollView contentContainerStyle={styles.container} showsVerticalScrollIndicator={false}>
-        <Text style={styles.h1}>Detection Detail</Text>
-        <Text style={styles.sub}>captureId: {captureId}</Text>
-        <CapturePreview data={singleDoc} />
-        <View style={{ height: 24 }} />
+    <SafeAreaView style={styles.safe}>
+      <ScrollView contentContainerStyle={styles.listContent}>
+        <View style={styles.listHeaderCard}>
+          <View style={styles.listIconBox}>
+            <Ionicons name="images-outline" size={28} color="#fff" />
+          </View>
+
+          <View style={{ flex: 1 }}>
+            <Text style={styles.listTitle}>{screenTitle}</Text>
+            <Text style={styles.listSub}>
+              Plant {plantId} • {filteredCount} leaf scan{filteredCount === 1 ? "" : "s"}
+            </Text>
+          </View>
+        </View>
+
+        <Text style={styles.helpText}>
+          Showing only leaf-related capture scans: downy mildew, powdery mildew, water stress, severity, pump status, and leaf counts.
+        </Text>
+
+        {captures.length === 0 ? (
+          <View style={styles.emptyListCard}>
+            <Ionicons name="leaf-outline" size={36} color="#90A4AE" />
+            <Text style={styles.emptyListTitle}>No leaf capture scans found</Text>
+            <Text style={styles.emptyListText}>
+              This plant has no completed leaf output in its captures subcollection yet.
+            </Text>
+          </View>
+        ) : (
+          <View style={styles.scanList}>
+            {captures.map((item) => (
+              <CaptureScanCard key={item.id} item={item} onPress={() => openCapture(item)} />
+            ))}
+          </View>
+        )}
       </ScrollView>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { padding: 16, backgroundColor: "#fff", flexGrow: 1 },
-
-  center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 18 },
-  helper: { color: "#757575", marginTop: 8, fontWeight: "700" },
-  helperSmall: { color: "#9E9E9E", marginTop: 8, fontSize: 12 },
-
-  h1: { fontSize: 18, fontWeight: "900", color: "#1B5E20" },
-  sub: { marginTop: 6, color: "#777", fontWeight: "700" },
-
-  image: { width: "100%", backgroundColor: "#000", borderRadius: 14, marginTop: 12 },
-  imagePlaceholder: { height: 240, alignItems: "center", justifyContent: "center", backgroundColor: "#F5F5F5" },
-
-  card: {
-    marginTop: 14,
-    padding: 14,
+  safe: { flex: 1, backgroundColor: "#F9F9F9" },
+  centerBox: { flex: 1, justifyContent: "center", alignItems: "center", padding: 24 },
+  centerText: { marginTop: 12, color: "#78909C", fontWeight: "700" },
+  listContent: { padding: 16, paddingBottom: 30 },
+  listHeaderCard: {
+    backgroundColor: "#2E7D32",
+    borderRadius: 22,
+    padding: 18,
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 14,
+  },
+  listIconBox: {
+    width: 52,
+    height: 52,
     borderRadius: 16,
+    backgroundColor: "rgba(255,255,255,0.18)",
+    justifyContent: "center",
+    alignItems: "center",
+    marginRight: 14,
+  },
+  listTitle: { color: "#fff", fontSize: 21, fontWeight: "900" },
+  listSub: { color: "#E8F5E9", fontSize: 13, marginTop: 4, fontWeight: "700" },
+  helpText: { color: "#78909C", fontSize: 12, lineHeight: 18, marginBottom: 14, fontWeight: "700" },
+  scanList: { gap: 12 },
+  scanCard: {
+    backgroundColor: "#fff",
+    borderRadius: 22,
+    overflow: "hidden",
     borderWidth: 1,
-    borderColor: "#eee",
-    backgroundColor: "#FAFAFA",
+    borderColor: "#EEEEEE",
   },
-  title: { fontWeight: "900", color: "#1B5E20", fontSize: 16, marginBottom: 8 },
-  line: { marginTop: 6, fontWeight: "700", color: "#333" },
-
-  actionBox: {
-    marginTop: 12,
-    padding: 12,
-    borderRadius: 14,
-    backgroundColor: "#F1F8E9",
+  scanImageWrap: { width: "100%", height: 170, backgroundColor: "#ECEFF1" },
+  scanImage: { width: "100%", height: "100%", resizeMode: "cover" },
+  scanImagePlaceholder: { flex: 1, justifyContent: "center", alignItems: "center" },
+  scanBody: { padding: 14 },
+  scanTopRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 8 },
+  scanStatusPill: { flexDirection: "row", alignItems: "center", paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999 },
+  scanDot: { width: 7, height: 7, borderRadius: 4, marginRight: 6 },
+  scanStatusText: { fontSize: 12, fontWeight: "900" },
+  scanTitle: { fontSize: 15, fontWeight: "900", color: "#263238" },
+  scanMeta: { color: "#90A4AE", fontSize: 11, fontWeight: "700", marginTop: 3 },
+  scanIssues: { color: "#424242", fontSize: 13, fontWeight: "800", marginTop: 8, lineHeight: 18 },
+  scanSeverityChips: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 8 },
+  scanSeverityChip: { borderRadius: 999, paddingHorizontal: 9, paddingVertical: 5 },
+  scanSeverityChipText: { fontSize: 10, fontWeight: "900" },
+  scanStatsRow: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 10 },
+  scanStat: { backgroundColor: "#F5F5F5", borderRadius: 999, paddingHorizontal: 10, paddingVertical: 5, fontSize: 11, color: "#616161", fontWeight: "800" },
+  emptyListCard: {
+    backgroundColor: "#fff",
+    borderRadius: 22,
+    padding: 24,
+    alignItems: "center",
     borderWidth: 1,
-    borderColor: "#C8E6C9",
+    borderColor: "#EEEEEE",
   },
-  actionTitle: { fontWeight: "900", color: "#1B5E20", marginBottom: 4 },
-  actionText: { fontWeight: "800", color: "#333", lineHeight: 19 },
-  actionMeta: { marginTop: 5, fontWeight: "700", color: "#616161", fontSize: 12 },
-  warningLine: { marginTop: 5, fontWeight: "900", color: "#EF6C00", fontSize: 12 },
-  safeLine: { marginTop: 5, fontWeight: "800", color: "#2E7D32", fontSize: 12 },
-
-  severityRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 12,
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: "#EEEEEE",
-  },
-  severityName: { fontWeight: "900", color: "#333", textTransform: "capitalize" },
-  severityMeta: { marginTop: 3, fontWeight: "700", color: "#757575", fontSize: 12 },
-  severityBadge: {
-    alignItems: "flex-end",
-    backgroundColor: "#FFF3E0",
-    borderRadius: 12,
-    paddingHorizontal: 10,
-    paddingVertical: 7,
-  },
-  severityLevel: { fontWeight: "900", color: "#EF6C00", fontSize: 12 },
-  severityPercent: { fontWeight: "800", color: "#616161", fontSize: 11, marginTop: 2 },
-
-  sprayYes: { color: "#D32F2F" },
-  sprayNo: { color: "#2E7D32" },
-
-  legendRow: { flexDirection: "row", alignItems: "center", marginTop: 10, gap: 10 },
-  swatch: { width: 18, height: 18, borderRadius: 4, borderWidth: 1, borderColor: "#ddd" },
-  legendText: { fontWeight: "700", color: "#333" },
-
-  leafRow: { flexDirection: "row", justifyContent: "space-between", marginTop: 10 },
-  leafName: { fontWeight: "800", color: "#333" },
-  leafSev: { fontWeight: "900", color: "#D32F2F" },
-
-  tabs: { flexDirection: "row", gap: 10, marginTop: 12 },
-  tab: {
-    flex: 1,
-    paddingVertical: 10,
-    borderRadius: 14,
-    backgroundColor: "#EEEEEE",
-    alignItems: "center",
-  },
-  tabActive: { backgroundColor: "#2E7D32" },
-  tabText: { fontWeight: "900", color: "#333" },
-  tabTextActive: { color: "#fff" },
-
-  scanRow: {
-    flexDirection: "row",
-    gap: 12,
-    alignItems: "center",
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: "#EEE",
-  },
-  scanRowActive: { backgroundColor: "#E8F5E9", borderRadius: 12, paddingHorizontal: 10 },
-
-  thumbBox: { width: 54, height: 54, borderRadius: 12, overflow: "hidden", backgroundColor: "#F5F5F5" },
-  thumb: { width: "100%", height: "100%" },
-
-  scanTitle: { fontWeight: "900", color: "#333", fontSize: 12 },
-  scanMeta: { color: "#777", marginTop: 2, fontWeight: "700", fontSize: 11 },
+  emptyListTitle: { marginTop: 10, color: "#263238", fontSize: 16, fontWeight: "900" },
+  emptyListText: { marginTop: 5, color: "#78909C", fontSize: 12, textAlign: "center", lineHeight: 18 },
+  detailContent: { padding: 16, paddingBottom: 34 },
+  imageCard: { backgroundColor: "#fff", borderRadius: 24, overflow: "hidden", borderWidth: 1, borderColor: "#EEEEEE", marginBottom: 14 },
+  detailImage: { width: "100%", resizeMode: "cover" },
+  noImageBox: { width: "100%", justifyContent: "center", alignItems: "center", backgroundColor: "#ECEFF1" },
+  noImageText: { marginTop: 8, color: "#78909C", fontWeight: "800" },
+  summaryCard: { backgroundColor: "#fff", borderRadius: 22, padding: 16, borderWidth: 1, borderColor: "#EEEEEE", marginBottom: 18 },
+  summaryTopRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start", gap: 12 },
+  summaryTitle: { fontSize: 18, fontWeight: "900", color: "#263238" },
+  summarySub: { fontSize: 12, color: "#78909C", marginTop: 4, fontWeight: "700", lineHeight: 17 },
+  statusBadge: { flexDirection: "row", alignItems: "center", paddingHorizontal: 10, paddingVertical: 7, borderRadius: 999 },
+  statusDot: { width: 7, height: 7, borderRadius: 4, marginRight: 6 },
+  statusText: { fontSize: 12, fontWeight: "900" },
+  statGrid: { flexDirection: "row", gap: 10, marginTop: 14 },
+  statBox: { flex: 1, backgroundColor: "#FAFAFA", borderRadius: 16, padding: 12, borderWidth: 1, borderColor: "#EEEEEE" },
+  statValue: { color: "#263238", fontSize: 20, fontWeight: "900" },
+  statLabel: { color: "#78909C", fontSize: 11, fontWeight: "800", marginTop: 2 },
+  sectionHeader: { marginTop: 4, marginBottom: 10 },
+  sectionTitle: { fontSize: 16, fontWeight: "900", color: "#263238" },
+  sectionSubtitle: { color: "#78909C", fontSize: 12, marginTop: 3, lineHeight: 17 },
+  emptyDetailCard: { backgroundColor: "#fff", borderRadius: 20, padding: 18, alignItems: "center", borderWidth: 1, borderColor: "#EEEEEE", marginBottom: 16 },
+  emptyDetailTitle: { marginTop: 6, color: "#263238", fontSize: 15, fontWeight: "900" },
+  emptyDetailText: { marginTop: 3, color: "#78909C", fontSize: 12 },
+  healthyCard: { backgroundColor: "#E8F5E9", borderRadius: 20, padding: 16, flexDirection: "row", alignItems: "center", gap: 14, marginBottom: 16 },
+  healthyTitle: { color: "#2E7D32", fontSize: 15, fontWeight: "900" },
+  healthyText: { color: "#2E7D32", fontSize: 12, marginTop: 2, lineHeight: 17 },
+  issuesList: { gap: 10, marginBottom: 16 },
+  issueCard: { backgroundColor: "#fff", borderRadius: 20, padding: 14, flexDirection: "row", alignItems: "center", gap: 14, borderWidth: 1, borderColor: "#EEEEEE" },
+  issueIconBox: { width: 44, height: 44, borderRadius: 15, justifyContent: "center", alignItems: "center" },
+  issueTitle: { color: "#263238", fontSize: 15, fontWeight: "900" },
+  issueSeverity: { color: "#757575", fontSize: 12, marginTop: 3, lineHeight: 17 },
+  issueAction: { color: "#424242", fontSize: 12, marginTop: 3, fontWeight: "800" },
+  severityList: { gap: 10, marginBottom: 16 },
+  severityCard: { backgroundColor: "#fff", borderRadius: 18, padding: 13, flexDirection: "row", alignItems: "center", gap: 12, borderWidth: 1, borderColor: "#EEEEEE" },
+  severityIcon: { width: 38, height: 38, borderRadius: 13, justifyContent: "center", alignItems: "center" },
+  severityName: { color: "#263238", fontSize: 14, fontWeight: "900" },
+  severityMeta: { color: "#78909C", fontSize: 11, marginTop: 2, fontWeight: "700" },
+  severityRight: { alignItems: "flex-end", maxWidth: 132 },
+  severityLevel: { fontSize: 13, fontWeight: "900" },
+  severityNumbers: { color: "#78909C", fontSize: 10, marginTop: 2, fontWeight: "700", textAlign: "right" },
+  emptySmallCard: { backgroundColor: "#fff", borderRadius: 18, padding: 14, borderWidth: 1, borderColor: "#EEEEEE", marginBottom: 16 },
+  emptySmallText: { color: "#78909C", fontSize: 12, fontWeight: "700" },
+  robotCard: { backgroundColor: "#fff", borderRadius: 22, padding: 16, borderWidth: 1, borderColor: "#EEEEEE", marginBottom: 16 },
+  robotTopRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start", gap: 12 },
+  robotTitle: { color: "#263238", fontSize: 16, fontWeight: "900" },
+  robotSub: { color: "#78909C", fontSize: 12, marginTop: 3, lineHeight: 17, fontWeight: "700" },
+  decisionPill: { paddingHorizontal: 10, paddingVertical: 7, borderRadius: 999 },
+  decisionPillText: { fontSize: 11, fontWeight: "900" },
+  pumpGrid: { flexDirection: "row", gap: 10, marginTop: 14 },
+  pumpBox: { flex: 1, backgroundColor: "#FAFAFA", borderRadius: 16, padding: 10, borderWidth: 1, borderColor: "#EEEEEE" },
+  pumpTitle: { color: "#263238", fontSize: 12, fontWeight: "900", marginTop: 5 },
+  pumpValue: { color: "#111", fontSize: 14, fontWeight: "900", marginTop: 2 },
+  pumpHint: { color: "#90A4AE", fontSize: 9, fontWeight: "700", marginTop: 2 },
+  leafList: { gap: 8, marginBottom: 16 },
+  leafRow: { backgroundColor: "#fff", borderRadius: 16, padding: 12, flexDirection: "row", alignItems: "center", gap: 12, borderWidth: 1, borderColor: "#EEEEEE" },
+  leafIndexBox: { width: 36, height: 36, borderRadius: 12, justifyContent: "center", alignItems: "center" },
+  leafIndexText: { fontSize: 13, fontWeight: "900" },
+  leafTitle: { color: "#263238", fontSize: 13, fontWeight: "900" },
+  leafMeta: { color: "#78909C", fontSize: 11, marginTop: 2, fontWeight: "700" },
+  leafRight: { alignItems: "flex-end" },
+  leafSeverityLevel: { fontSize: 12, fontWeight: "900" },
+  leafPercent: { color: "#78909C", fontSize: 11, marginTop: 2, fontWeight: "800" },
+  legendWrap: { flexDirection: "row", flexWrap: "wrap", gap: 10, backgroundColor: "#fff", borderRadius: 18, padding: 14, borderWidth: 1, borderColor: "#EEEEEE" },
+  legendItem: { flexDirection: "row", alignItems: "center", gap: 6 },
+  legendColor: { width: 14, height: 14, borderRadius: 7 },
+  legendText: { color: "#616161", fontSize: 12, fontWeight: "800" },
 });

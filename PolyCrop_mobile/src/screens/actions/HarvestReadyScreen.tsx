@@ -40,6 +40,19 @@ type PlantDoc = {
   lastRipe?: boolean | null;
   lastRipeCucumberCount?: number | null;
   lastRipeCucumbers?: any[];
+  lastAllCucumbers?: any[];
+  lastCucumberMeasurements?: any[];
+};
+
+type CucumberMeasurement = {
+  index: number;
+  label: string;
+  lengthCm: number | null;
+  diameterCm: number | null;
+  lengthPx: number | null;
+  diameterPx: number | null;
+  confidence: number | null;
+  ripe: boolean | null;
 };
 
 type DisplayMetrics = {
@@ -49,6 +62,8 @@ type DisplayMetrics = {
   lengthCm: number | null;
   diameterCm: number | null;
   ripe: boolean;
+  cucumbers: CucumberMeasurement[];
+  scanCount?: number;
 };
 
 function parseIdToRowCol(id: string): { row?: number; column?: number } {
@@ -77,20 +92,222 @@ function formatCm(value: number | null, decimals = 1) {
   return `${value.toFixed(decimals)} cm`;
 }
 
+function formatPx(value: number | null) {
+  if (value === null || value <= 0) return "N/A";
+  return `${Math.round(value)} px`;
+}
+
+function normalizeCucumberArray(sourceRaw: any[]): CucumberMeasurement[] {
+  const source = Array.isArray(sourceRaw) ? sourceRaw : [];
+
+  return source
+    .map((cucumber: any, idx: number): CucumberMeasurement => {
+      const index = toNumberOrNull(cucumber?.index);
+      const cm =
+        cucumber?.cm && typeof cucumber.cm === "object" ? cucumber.cm : {};
+      const pixel =
+        cucumber?.pixel && typeof cucumber.pixel === "object"
+          ? cucumber.pixel
+          : {};
+
+      return {
+        index: index !== null ? index : idx,
+        label: `Cucumber ${(index !== null ? index : idx) + 1}`,
+        lengthCm: roundOrNull(cm?.lengthCm, 2),
+        diameterCm: roundOrNull(cm?.diameterCm, 2),
+        lengthPx: roundOrNull(pixel?.lengthPx, 0),
+        diameterPx: roundOrNull(pixel?.diameterPx, 0),
+        confidence: roundOrNull(cucumber?.conf, 2),
+        ripe: typeof cucumber?.ripe === "boolean" ? cucumber.ripe : null,
+      };
+    })
+    .sort((a, b) => a.index - b.index);
+}
+
+function normalizeCucumberMeasurements(plant: PlantDoc): CucumberMeasurement[] {
+  const source = Array.isArray(plant.lastAllCucumbers)
+    ? plant.lastAllCucumbers
+    : Array.isArray(plant.lastCucumberMeasurements)
+    ? plant.lastCucumberMeasurements
+    : Array.isArray(plant.lastRipeCucumbers)
+    ? plant.lastRipeCucumbers
+    : [];
+
+  const measurements = normalizeCucumberArray(source);
+
+  if (
+    measurements.length === 0 &&
+    (plant.lastCucumberLengthCm || plant.lastCucumberDiameterCm)
+  ) {
+    measurements.push({
+      index: 0,
+      label: "Cucumber 1",
+      lengthCm: roundOrNull(plant.lastCucumberLengthCm, 2),
+      diameterCm: roundOrNull(plant.lastCucumberDiameterCm, 2),
+      lengthPx: null,
+      diameterPx: null,
+      confidence: null,
+      ripe: typeof plant.lastRipe === "boolean" ? plant.lastRipe : null,
+    });
+  }
+
+  return measurements;
+}
+
+function timestampToMillis(value: any): number {
+  if (!value) return 0;
+  if (typeof value?.toMillis === "function") return value.toMillis();
+  if (typeof value?.seconds === "number") return value.seconds * 1000;
+  if (typeof value === "number") return value;
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}
+
+function getCaptureSummary(data: any) {
+  return data?.outputs?.summary && typeof data.outputs.summary === "object"
+    ? data.outputs.summary
+    : {};
+}
+
+function getCaptureCucumbers(data: any): CucumberMeasurement[] {
+  const summary = getCaptureSummary(data);
+  const ripeness =
+    data?.outputs?.ripeness && typeof data.outputs.ripeness === "object"
+      ? data.outputs.ripeness
+      : {};
+
+  const source = Array.isArray(summary.allCucumbers)
+    ? summary.allCucumbers
+    : Array.isArray(ripeness.cucumbers)
+    ? ripeness.cucumbers
+    : Array.isArray(data?.allCucumbers)
+    ? data.allCucumbers
+    : Array.isArray(summary.ripeCucumbers)
+    ? summary.ripeCucumbers
+    : Array.isArray(data?.ripeCucumbers)
+    ? data.ripeCucumbers
+    : [];
+
+  return normalizeCucumberArray(source);
+}
+
+function getCaptureOutputMetrics(data: any): DisplayMetrics {
+  const summary = getCaptureSummary(data);
+  const cucumbers = getCaptureCucumbers(data);
+
+  const countFromSummary = toNumberOrNull(summary?.counts?.cucumber);
+  const cucumberCount =
+    countFromSummary !== null
+      ? Math.max(0, countFromSummary)
+      : Math.max(0, cucumbers.length);
+
+  const ripeFromSummary = toNumberOrNull(
+    summary?.ripeCucumberCount ?? data?.ripeCucumberCount
+  );
+
+  const ripeFromCucumbers = cucumbers.filter((c) => c.ripe === true).length;
+
+  const ripeCucumberCount =
+    ripeFromSummary !== null
+      ? Math.max(0, ripeFromSummary)
+      : Math.max(0, ripeFromCucumbers);
+
+  return {
+    cucumberCount,
+    ripeCucumberCount,
+    distanceCm: roundOrNull(summary?.distanceCm ?? data?.distanceCm, 1),
+    lengthCm: roundOrNull(
+      summary?.cucumberLengthCm ?? data?.cucumberLengthCm,
+      2
+    ),
+    diameterCm: roundOrNull(
+      summary?.cucumberDiameterCm ?? data?.cucumberDiameterCm,
+      2
+    ),
+    ripe:
+      ripeCucumberCount > 0 ||
+      summary?.ripe === true ||
+      data?.ripe === true,
+    cucumbers,
+  };
+}
+
+function buildPlantMetricsFromCaptureDocs(docs: any[]): DisplayMetrics {
+  let totalCucumberCount = 0;
+  let totalRipeCucumberCount = 0;
+  let scanCount = 0;
+
+  let latestMillis = -1;
+  let latestDistanceCm: number | null = null;
+  let latestLengthCm: number | null = null;
+  let latestDiameterCm: number | null = null;
+  let latestCucumbers: CucumberMeasurement[] = [];
+
+  docs.forEach((docSnap: any) => {
+    const data: any = docSnap.data() || {};
+    const status = String(data.status ?? "").toUpperCase();
+
+    if (status && status !== "DONE") return;
+
+    const metrics = getCaptureOutputMetrics(data);
+
+    scanCount += 1;
+    totalCucumberCount += metrics.cucumberCount;
+    totalRipeCucumberCount += metrics.ripeCucumberCount;
+
+    const millis = timestampToMillis(
+      data.updatedAt ??
+        data.createdAt ??
+        data.processedAt ??
+        data.outputs?.meta?.createdAt
+    );
+
+    if (millis >= latestMillis) {
+      latestMillis = millis;
+      latestDistanceCm = metrics.distanceCm;
+      latestLengthCm = metrics.lengthCm;
+      latestDiameterCm = metrics.diameterCm;
+      latestCucumbers = metrics.cucumbers;
+    }
+  });
+
+  return {
+    cucumberCount: totalCucumberCount,
+    ripeCucumberCount: totalRipeCucumberCount,
+    distanceCm: latestDistanceCm,
+    lengthCm: latestLengthCm,
+    diameterCm: latestDiameterCm,
+    ripe: totalRipeCucumberCount > 0,
+    cucumbers: latestCucumbers,
+    scanCount,
+  };
+}
+
 function getBackendMetrics(
   plant: PlantDoc,
   fallbackCucumberCount: number
 ): DisplayMetrics {
+  const cucumbers = normalizeCucumberMeasurements(plant);
+
   const countFromPlant = toNumberOrNull(plant?.lastCounts?.cucumber);
   const cucumberCount =
     countFromPlant !== null
       ? Math.max(0, countFromPlant)
+      : cucumbers.length > 0
+      ? cucumbers.length
       : Math.max(0, Number(fallbackCucumberCount ?? 0));
 
+  const ripeFromMeasurements = cucumbers.filter((c) => c.ripe === true).length;
   const ripeCountFromPlant = toNumberOrNull(plant?.lastRipeCucumberCount);
+
   const ripeCucumberCount =
     ripeCountFromPlant !== null
       ? Math.max(0, ripeCountFromPlant)
+      : ripeFromMeasurements > 0
+      ? ripeFromMeasurements
       : plant?.lastRipe === true
       ? 1
       : 0;
@@ -104,6 +321,8 @@ function getBackendMetrics(
     lengthCm: roundOrNull(plant?.lastCucumberLengthCm, 2),
     diameterCm: roundOrNull(plant?.lastCucumberDiameterCm, 2),
     ripe,
+    cucumbers,
+    scanCount: plant.lastCaptureId ? 1 : 0,
   };
 }
 
@@ -130,8 +349,8 @@ export default function HarvestReadyScreen({ navigation }: any) {
 
   const [plants, setPlants] = useState<PlantDoc[]>([]);
   const [selectedPlant, setSelectedPlant] = useState<PlantDoc | null>(null);
-  const [captureCountsByPlant, setCaptureCountsByPlant] = useState<
-    Record<string, number>
+  const [captureMetricsByPlant, setCaptureMetricsByPlant] = useState<
+    Record<string, DisplayMetrics>
   >({});
 
   useEffect(() => {
@@ -159,7 +378,7 @@ export default function HarvestReadyScreen({ navigation }: any) {
 
   useEffect(() => {
     if (!tunnelId || assignedPlants.length === 0) {
-      setCaptureCountsByPlant({});
+      setCaptureMetricsByPlant({});
       return;
     }
 
@@ -174,21 +393,11 @@ export default function HarvestReadyScreen({ navigation }: any) {
       );
 
       return onSnapshot(ref, (snap) => {
-        let cucumberCount = 0;
+        const metrics = buildPlantMetricsFromCaptureDocs(snap.docs);
 
-        snap.forEach((docSnap) => {
-          const data: any = docSnap.data() || {};
-          const status = String(data.status ?? "").toUpperCase();
-
-          if (status && status !== "DONE") return;
-
-          const count = Number(data?.outputs?.summary?.counts?.cucumber ?? 0);
-          cucumberCount += Number.isFinite(count) ? count : 0;
-        });
-
-        setCaptureCountsByPlant((prev) => ({
+        setCaptureMetricsByPlant((prev) => ({
           ...prev,
-          [plant.id]: cucumberCount,
+          [plant.id]: metrics,
         }));
       });
     });
@@ -199,7 +408,10 @@ export default function HarvestReadyScreen({ navigation }: any) {
   }, [assignedPlants, tunnelId]);
 
   useEffect(() => {
-    if (selectedPlant && !assignedPlants.some((p) => p.id === selectedPlant.id)) {
+    if (
+      selectedPlant &&
+      !assignedPlants.some((p) => p.id === selectedPlant.id)
+    ) {
       setSelectedPlant(null);
     }
   }, [assignedPlants, selectedPlant]);
@@ -223,14 +435,18 @@ export default function HarvestReadyScreen({ navigation }: any) {
     const map: Record<string, DisplayMetrics> = {};
 
     for (const plant of assignedPlants) {
-      map[plant.id] = getBackendMetrics(
-        plant,
-        captureCountsByPlant[plant.id] ?? 0
-      );
+      const captureMetrics = captureMetricsByPlant[plant.id];
+
+      if (captureMetrics && (captureMetrics.scanCount ?? 0) > 0) {
+        map[plant.id] = captureMetrics;
+        continue;
+      }
+
+      map[plant.id] = getBackendMetrics(plant, 0);
     }
 
     return map;
-  }, [assignedPlants, captureCountsByPlant]);
+  }, [assignedPlants, captureMetricsByPlant]);
 
   const harvestReadyPlants = useMemo(
     () => assignedPlants.filter((p) => displayMetricsByPlant[p.id]?.ripe),
@@ -255,6 +471,8 @@ export default function HarvestReadyScreen({ navigation }: any) {
   const selectedMetrics = selectedPlant
     ? displayMetricsByPlant[selectedPlant.id]
     : null;
+
+  const selectedCucumbers = selectedMetrics?.cucumbers ?? [];
 
   const selectedRFID = selectedPlant
     ? [selectedPlant.rfidA, selectedPlant.rfidB].filter(Boolean).join(" / ")
@@ -396,9 +614,9 @@ export default function HarvestReadyScreen({ navigation }: any) {
 
                               <View style={styles.countBadge}>
                                 <Text style={styles.countText}>
-                                  {metrics?.ripe
-                                    ? metrics?.ripeCucumberCount ?? 0
-                                    : metrics?.cucumberCount ?? 0}
+                                  {`${metrics?.ripeCucumberCount ?? 0}/${
+                                    metrics?.cucumberCount ?? 0
+                                  }`}
                                 </Text>
                               </View>
                             </View>
@@ -407,7 +625,10 @@ export default function HarvestReadyScreen({ navigation }: any) {
                               {toShortPlantLabel(plant)}
                             </Text>
 
-                            <Text style={styles.plantCardRfid} numberOfLines={1}>
+                            <Text
+                              style={styles.plantCardRfid}
+                              numberOfLines={1}
+                            >
                               {[plant.rfidA, plant.rfidB]
                                 .filter(Boolean)
                                 .join(" / ")}
@@ -423,20 +644,24 @@ export default function HarvestReadyScreen({ navigation }: any) {
 
             <View style={styles.legendContainer}>
               <View style={styles.legendItem}>
-                <View style={[styles.legendDot, { backgroundColor: "#EF6C00" }]} />
+                <View
+                  style={[styles.legendDot, { backgroundColor: "#EF6C00" }]}
+                />
                 <Text style={styles.legendText}>Harvest Ready</Text>
               </View>
 
               <View style={styles.legendItem}>
-                <View style={[styles.legendDot, { backgroundColor: "#2E7D32" }]} />
+                <View
+                  style={[styles.legendDot, { backgroundColor: "#2E7D32" }]}
+                />
                 <Text style={styles.legendText}>Growing</Text>
               </View>
 
               <View style={styles.legendItem}>
                 <View style={styles.legendBadgeMini}>
-                  <Text style={styles.legendBadgeText}>2</Text>
+                  <Text style={styles.legendBadgeText}>1/3</Text>
                 </View>
-                <Text style={styles.legendText}>Cucumbers</Text>
+                <Text style={styles.legendText}>Ripe / total</Text>
               </View>
             </View>
           </View>
@@ -489,8 +714,12 @@ export default function HarvestReadyScreen({ navigation }: any) {
               </Text>
 
               <Text style={styles.detailSubtitle}>
-                Length: {formatCm(selectedMetrics.lengthCm, 2)} • Diameter:{" "}
-                {formatCm(selectedMetrics.diameterCm, 2)}
+                Scans used: {selectedMetrics.scanCount ?? 0}
+              </Text>
+
+              <Text style={styles.detailSubtitle}>
+                Latest scan length: {formatCm(selectedMetrics.lengthCm, 2)} •
+                Diameter: {formatCm(selectedMetrics.diameterCm, 2)}
               </Text>
 
               <Text style={styles.detailSubtitle}>
@@ -514,17 +743,113 @@ export default function HarvestReadyScreen({ navigation }: any) {
             </View>
           </View>
 
+          <View style={styles.cucumberList}>
+            <Text style={styles.cucumberListTitle}>
+              Individual cucumber outputs
+            </Text>
+
+            {selectedCucumbers.length > 0 ? (
+              <ScrollView style={styles.cucumberScroll} nestedScrollEnabled>
+                {selectedCucumbers.map((cucumber) => {
+                  const isRipe = cucumber.ripe === true;
+
+                  return (
+                    <View
+                      key={`${selectedPlant.id}-${cucumber.index}`}
+                      style={styles.cucumberCard}
+                    >
+                      <View style={styles.cucumberCardHeader}>
+                        <Text style={styles.cucumberTitle}>
+                          {cucumber.label}
+                        </Text>
+
+                        <View
+                          style={[
+                            styles.cucumberStatusPill,
+                            {
+                              backgroundColor: isRipe ? "#FFF3E0" : "#E8F5E9",
+                            },
+                          ]}
+                        >
+                          <Text
+                            style={[
+                              styles.cucumberStatusText,
+                              { color: isRipe ? "#EF6C00" : "#2E7D32" },
+                            ]}
+                          >
+                            {cucumber.ripe === null
+                              ? "UNKNOWN"
+                              : isRipe
+                              ? "RIPE"
+                              : "UNRIPE"}
+                          </Text>
+                        </View>
+                      </View>
+
+                      <View style={styles.cucumberMetricGrid}>
+                        <Text style={styles.cucumberMetric}>
+                          Length: {formatCm(cucumber.lengthCm, 2)}
+                        </Text>
+
+                        <Text style={styles.cucumberMetric}>
+                          Diameter: {formatCm(cucumber.diameterCm, 2)}
+                        </Text>
+
+                        <Text style={styles.cucumberMetric}>
+                          Length Px: {formatPx(cucumber.lengthPx)}
+                        </Text>
+
+                        <Text style={styles.cucumberMetric}>
+                          Diameter Px: {formatPx(cucumber.diameterPx)}
+                        </Text>
+
+                        <Text style={styles.cucumberMetric}>
+                          Confidence:{" "}
+                          {cucumber.confidence !== null
+                            ? `${Math.round(cucumber.confidence * 100)}%`
+                            : "N/A"}
+                        </Text>
+                      </View>
+                    </View>
+                  );
+                })}
+              </ScrollView>
+            ) : (
+              <Text style={styles.noCucumberText}>
+                No separate cucumber size measurements saved yet. Capture again
+                after updating the backend.
+              </Text>
+            )}
+          </View>
+
           {tunnelId ? (
             <TouchableOpacity
               style={styles.viewScansBtn}
               activeOpacity={0.85}
               onPress={() => {
+                if (!selectedPlant || !tunnelId) return;
+
+                const plant = selectedPlant;
+
                 setSelectedPlant(null);
-                navigation.navigate("DetectionDetail", {
+
+                const params = {
                   tunnelId,
-                  plantId: selectedPlant.id,
-                  filterMode: "CUCUMBER",
-                });
+                  plantId: plant.id,
+                  plantTitle: toPlantTitle(plant),
+                  row: plant.row,
+                  column: plant.column,
+                  rfidA: plant.rfidA,
+                  rfidB: plant.rfidB,
+                };
+
+                let rootNavigation = navigation;
+
+                while (rootNavigation?.getParent?.()) {
+                  rootNavigation = rootNavigation.getParent();
+                }
+
+                rootNavigation.navigate("CucumberScans", params);
               }}
             >
               <Ionicons name="images-outline" size={18} color="#fff" />
@@ -613,7 +938,11 @@ const styles = StyleSheet.create({
   entrancePillText: { color: "#2E7D32", fontSize: 12, fontWeight: "700" },
 
   horizontalPad: { paddingHorizontal: 16, paddingBottom: 4 },
-  columnHeaderRow: { flexDirection: "row", alignItems: "center", marginBottom: 8 },
+  columnHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 8,
+  },
   axisCorner: { width: 34 },
   columnHeaderCell: { width: CELL_SIZE, alignItems: "center" },
   rowHeaderCell: { width: 34, alignItems: "center", justifyContent: "center" },
@@ -639,7 +968,7 @@ const styles = StyleSheet.create({
   },
   statusDot: { width: 12, height: 12, borderRadius: 6 },
   countBadge: {
-    minWidth: 22,
+    minWidth: 34,
     height: 22,
     borderRadius: 11,
     backgroundColor: "#1B5E20",
@@ -663,7 +992,7 @@ const styles = StyleSheet.create({
   legendDot: { width: 14, height: 14, borderRadius: 7 },
   legendText: { color: "#666", fontSize: 13, fontWeight: "600" },
   legendBadgeMini: {
-    minWidth: 18,
+    minWidth: 30,
     height: 18,
     borderRadius: 9,
     backgroundColor: "#1B5E20",
@@ -675,6 +1004,7 @@ const styles = StyleSheet.create({
 
   bottomSheet: {
     position: "absolute",
+    maxHeight: "78%",
     left: 12,
     right: 12,
     bottom: 12,
@@ -719,6 +1049,58 @@ const styles = StyleSheet.create({
   detailSubtitle: { fontSize: 13, color: "#666", marginBottom: 3 },
   bigCountBadge: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 14 },
   bigCountText: { color: "#fff", fontSize: 12, fontWeight: "800" },
+
+  cucumberList: {
+    marginTop: 14,
+    borderTopWidth: 1,
+    borderTopColor: "#EEEEEE",
+    paddingTop: 12,
+  },
+  cucumberListTitle: {
+    color: "#222",
+    fontSize: 14,
+    fontWeight: "800",
+    marginBottom: 8,
+  },
+  cucumberScroll: { maxHeight: 180 },
+  cucumberCard: {
+    backgroundColor: "#FAFAFA",
+    borderWidth: 1,
+    borderColor: "#ECECEC",
+    borderRadius: 14,
+    padding: 10,
+    marginBottom: 8,
+  },
+  cucumberCardHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 8,
+  },
+  cucumberTitle: { color: "#222", fontSize: 13, fontWeight: "800" },
+  cucumberStatusPill: {
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 999,
+  },
+  cucumberStatusText: { fontSize: 11, fontWeight: "900" },
+  cucumberMetricGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  cucumberMetric: {
+    width: "47%",
+    color: "#666",
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  noCucumberText: {
+    color: "#777",
+    fontSize: 12,
+    lineHeight: 17,
+    fontWeight: "600",
+  },
   viewScansBtn: {
     marginTop: 16,
     backgroundColor: "#2E7D32",

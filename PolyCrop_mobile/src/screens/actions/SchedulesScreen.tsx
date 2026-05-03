@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { getAuth } from "firebase/auth";
 import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Dimensions } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useTunnelHeader } from "../../hooks/useTunnelHeader";
@@ -184,37 +185,147 @@ export default function SchedulesScreen() {
     setNpk(stageMixes[sid]);
   };
 
+  // const sendScheduledDispenseCommand = async () => {
+  //   if (!selectedTunnelId || isAutoSendingCommand) return;
+
+  //   const sid = toStageId(stage);
+  //   const activeMix = stageMixes[sid];
+  //   const now = new Date();
+  //   const nowIso = now.toISOString();
+  //   const dateKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  //   const commandId = `cmd_auto_${Date.now()}`;
+
+  //   try {
+  //     setIsAutoSendingCommand(true);
+
+  //     await setDoc(
+  //       doc(db, "deviceCommands", "liquid-system-01"),
+  //       {
+  //         commandId,
+  //         type: "dispense_all",
+  //         c1ml: activeMix.n,
+  //         c2ml: activeMix.p,
+  //         c3ml: activeMix.k,
+  //         status: "PENDING",
+  //         requestedBy: `schedule:${selectedTunnelId}`,
+  //         requestedAt: nowIso,
+  //         lastUpdatedAt: nowIso,
+  //         tunnelId: selectedTunnelId,
+  //         source: "scheduled_fertigation",
+  //         stage: sid,
+  //       },
+  //       { merge: true }
+  //     );
+
+  //     await updateDoc(doc(db, "tunnels", selectedTunnelId), {
+  //       lastAutoDispenseDateKey: dateKey,
+  //       lastAutoDispenseAt: serverTimestamp(),
+  //       lastAutoDispenseCommandId: commandId,
+  //       updatedAt: serverTimestamp(),
+  //     });
+
+  //     setLastAutoDispenseDateKey(dateKey);
+  //     setConfigStatusText(`Auto dispense sent at ${now.toLocaleString()}`);
+  //   } catch (error) {
+  //     console.log("auto dispense command error:", error);
+  //   } finally {
+  //     setIsAutoSendingCommand(false);
+  //   }
+  // };
+
+  // const handleApplyConfiguration = async () => {
+  //   if (!selectedTunnelId || isSavingConfig) return;
+
+  //   try {
+  //     setIsSavingConfig(true);
+
+  //     const sid = toStageId(stage);
+  //     const selectedStage = stages.find((s) => s.id === sid) ?? stages[1];
+
+  //     await updateDoc(doc(db, "tunnels", selectedTunnelId), {
+  //       configuredStage: sid,
+  //       configuredStageTitle: selectedStage.title,
+  //       configuredStageSubtitle: selectedStage.subtitle,
+  //       stageMixes,
+  //       dailyFertigationTime: dailyScheduleTime,
+  //       updatedAt: serverTimestamp(),
+  //     });
+
+  //     setConfigStatusText(`Applied: ${selectedStage.title} at ${dailyScheduleTime}`);
+  //   } catch (error) {
+  //     console.log("apply config update error:", error);
+  //   } finally {
+  //     setIsSavingConfig(false);
+  //   }
+  // };
+
   const sendScheduledDispenseCommand = async () => {
     if (!selectedTunnelId || isAutoSendingCommand) return;
 
     const sid = toStageId(stage);
     const activeMix = stageMixes[sid];
+
     const now = new Date();
     const nowIso = now.toISOString();
-    const dateKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+
+    const selectedHourNumber = Number(selectedHour);
+    const selectedMinuteNumber = Number(selectedMinute);
+    if (!Number.isFinite(selectedHourNumber) || !Number.isFinite(selectedMinuteNumber)) return;
+
+    let hour24 = selectedHourNumber % 12;
+    if (selectedMeridiem === "PM") hour24 += 12;
+
+    const dateKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(
+      2,
+      "0"
+    )}-${String(now.getDate()).padStart(2, "0")}_${String(hour24).padStart(
+      2,
+      "0"
+    )}:${String(selectedMinuteNumber).padStart(2, "0")}`;
+
     const commandId = `cmd_auto_${Date.now()}`;
 
     try {
       setIsAutoSendingCommand(true);
 
-      await setDoc(
-        doc(db, "deviceCommands", "liquid-system-01"),
-        {
-          commandId,
-          type: "dispense_all",
-          c1ml: activeMix.n,
-          c2ml: activeMix.p,
-          c3ml: activeMix.k,
-          status: "PENDING",
-          requestedBy: `schedule:${selectedTunnelId}`,
-          requestedAt: nowIso,
-          lastUpdatedAt: nowIso,
-          tunnelId: selectedTunnelId,
-          source: "scheduled_fertigation",
-          stage: sid,
-        },
-        { merge: true }
-      );
+      console.log("[AutoDispense] Sending PENDING command", {
+        commandId,
+        selectedTunnelId,
+        dateKey,
+        c1ml: Number(activeMix.n),
+        c2ml: Number(activeMix.p),
+        c3ml: Number(activeMix.k),
+      });
+
+      // This is what starts Pico dispensing
+      await setDoc(doc(db, "deviceCommands", "liquid-system-01"), {
+        deviceId: "liquid-system-01",
+        commandId,
+        type: "dispense_all",
+
+        // N, P, K values
+        c1ml: Number(activeMix.n),
+        c2ml: Number(activeMix.p),
+        c3ml: Number(activeMix.k),
+
+        status: "PENDING",
+        executionStatus: "WAITING_DEVICE",
+
+        requestedBy: `schedule:${selectedTunnelId}`,
+        requestedAt: nowIso,
+        lastUpdatedAt: nowIso,
+
+        tunnelId: selectedTunnelId,
+        source: "scheduled_fertigation",
+        stage: sid,
+        dailyFertigationTime: dailyScheduleTime,
+
+        startedAt: "",
+        completedAt: "",
+        handledByDeviceId: "",
+        handledByUid: "",
+        lastLogId: "",
+      });
 
       await updateDoc(doc(db, "tunnels", selectedTunnelId), {
         lastAutoDispenseDateKey: dateKey,
@@ -240,7 +351,13 @@ export default function SchedulesScreen() {
 
       const sid = toStageId(stage);
       const selectedStage = stages.find((s) => s.id === sid) ?? stages[1];
+      const activeMix = stageMixes[sid];
 
+      const now = new Date();
+      const nowIso = now.toISOString();
+      const scheduledCommandId = `scheduled_${selectedTunnelId}_${Date.now()}`;
+
+      // 1. Save configuration to tunnel
       await updateDoc(doc(db, "tunnels", selectedTunnelId), {
         configuredStage: sid,
         configuredStageTitle: selectedStage.title,
@@ -250,14 +367,48 @@ export default function SchedulesScreen() {
         updatedAt: serverTimestamp(),
       });
 
-      setConfigStatusText(`Applied: ${selectedStage.title} at ${dailyScheduleTime}`);
+      // 2. Save NPK values to /deviceCommands/liquid-system-01
+      // IMPORTANT: status is SCHEDULED, so Pico will NOT start immediately.
+      await setDoc(doc(db, "deviceCommands", "liquid-system-01"), {
+        deviceId: "liquid-system-01",
+        commandId: scheduledCommandId,
+        type: "dispense_all",
+
+        // N, P, K values
+        c1ml: Number(activeMix.n),
+        c2ml: Number(activeMix.p),
+        c3ml: Number(activeMix.k),
+
+        status: "SCHEDULED",
+        executionStatus: "WAITING_FOR_TIME",
+
+        requestedBy: `schedule:${selectedTunnelId}`,
+        requestedAt: nowIso,
+        lastUpdatedAt: nowIso,
+
+        tunnelId: selectedTunnelId,
+        source: "scheduled_fertigation_config",
+        stage: sid,
+        dailyFertigationTime: dailyScheduleTime,
+
+        startedAt: "",
+        completedAt: "",
+        handledByDeviceId: "",
+        handledByUid: "",
+        lastLogId: "",
+      });
+
+      setConfigStatusText(
+        `Applied: ${selectedStage.title} at ${dailyScheduleTime} | N ${activeMix.n.toFixed(
+          0
+        )} ml, P ${activeMix.p.toFixed(0)} ml, K ${activeMix.k.toFixed(0)} ml`
+      );
     } catch (error) {
       console.log("apply config update error:", error);
     } finally {
       setIsSavingConfig(false);
     }
   };
-
   const handlePlantingDone = async () => {
     if (!selectedTunnelId || isUpdatingPlanting) return;
 
@@ -323,54 +474,57 @@ export default function SchedulesScreen() {
     );
   }, []);
 
-  // Listen for flower detections in captures
+
   useEffect(() => {
-    if (!selectedTunnelId) {
+  const currentUser = getAuth().currentUser;
+
+  if (!selectedTunnelId || !currentUser) {
+    setIsFloweringSeason(false);
+    setFlowerCount(0);
+    return;
+  }
+
+  const capturesQuery = query(
+    collection(db, "captures"),
+    where("ownerId", "==", currentUser.uid),
+    where("meta.tunnelId", "==", selectedTunnelId),
+    where("status", "==", "DONE"),
+    orderBy(documentId(), "desc"),
+    limit(50)
+  );
+
+  return onSnapshot(
+    capturesQuery,
+    (snap) => {
+      let hasFlowers = false;
+      let totalFlowers = 0;
+      let latestDate = "";
+
+      snap.docs.forEach((doc) => {
+        const data = doc.data() as any;
+        const flowerCount = data?.outputs?.summary?.counts?.flower || 0;
+
+        if (flowerCount > 0) {
+          hasFlowers = true;
+          totalFlowers += flowerCount;
+
+          if (!latestDate && data?.createdAt) {
+            latestDate = formatReadingTs(data.createdAt);
+          }
+        }
+      });
+
+      setIsFloweringSeason(hasFlowers);
+      setFlowerCount(totalFlowers);
+      setLastDetectionDate(latestDate);
+    },
+    (err) => {
+      console.log("captures listener error:", err);
       setIsFloweringSeason(false);
       setFlowerCount(0);
-      return;
     }
-
-    const capturesQuery = query(
-      collection(db, "captures"),
-      where("meta.tunnelId", "==", selectedTunnelId),
-      where("status", "==", "DONE"),
-      orderBy(documentId(), "desc"),
-      limit(50)
-    );
-
-    return onSnapshot(
-      capturesQuery,
-      (snap) => {
-        let hasFlowers = false;
-        let totalFlowers = 0;
-        let latestDate = "";
-
-        snap.docs.forEach((doc) => {
-          const data = doc.data() as any;
-          const flowerCount = data?.outputs?.summary?.counts?.flower || 0;
-          
-          if (flowerCount > 0) {
-            hasFlowers = true;
-            totalFlowers += flowerCount;
-            
-            if (!latestDate && data?.createdAt) {
-              latestDate = formatReadingTs(data.createdAt);
-            }
-          }
-        });
-
-        setIsFloweringSeason(hasFlowers);
-        setFlowerCount(totalFlowers);
-        setLastDetectionDate(latestDate);
-      },
-      (err) => {
-        console.log("captures listener error:", err);
-        setIsFloweringSeason(false);
-        setFlowerCount(0);
-      }
-    );
-  }, [selectedTunnelId]);
+  );
+}, [selectedTunnelId]);
 
   useEffect(() => {
     const sid = toStageId(stage);
@@ -503,10 +657,24 @@ export default function SchedulesScreen() {
       if (selectedMeridiem === "PM") hour24 += 12;
 
       const isScheduledMinute = now.getHours() === hour24 && now.getMinutes() === selectedMinuteNumber;
-      if (!isScheduledMinute) return;
 
-      const todayKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-      if (lastAutoDispenseDateKey === todayKey) return;
+      const todayTimeKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
+        now.getDate()
+      ).padStart(2, "0")}_${String(hour24).padStart(2, "0")}:${String(selectedMinuteNumber).padStart(2, "0")}`;
+
+      console.log("[AutoDispense Timer]", {
+        phoneHour: now.getHours(),
+        phoneMinute: now.getMinutes(),
+        selectedHour: hour24,
+        selectedMinute: selectedMinuteNumber,
+        selectedMeridiem,
+        isScheduledMinute,
+        todayTimeKey,
+        lastAutoDispenseDateKey,
+      });
+
+      if (!isScheduledMinute) return;
+      if (lastAutoDispenseDateKey === todayTimeKey) return;
 
       sendScheduledDispenseCommand();
     }, 15000);

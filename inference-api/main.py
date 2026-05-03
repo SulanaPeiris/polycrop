@@ -1,9 +1,9 @@
+# main.py
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import io
-import urllib.parse
-import uuid
-from typing import Dict, List, Any, Optional
+from typing import Optional
 
 import numpy as np
 import cv2
@@ -14,498 +14,75 @@ import firebase_admin
 from firebase_admin import credentials, firestore, storage
 from pathlib import Path
 
+from detection_utils import (
+    safe_float,
+    upload_with_permanent_url,
+    draw_detection_boxes,
+    add_legend,
+)
+
+from cucumber_detection import (
+    CONF_CUCUMBER,
+    detect_cucumbers,
+    draw_cucumber_measurement_labels,
+)
+
+from leaf_detection import (
+    CONF_LEAF,
+    detect_leaves,
+)
+
+from flower_detection import (
+    CONF_FLOWER,
+    detect_flowers,
+)
+
+from ripe_detection import (
+    load_camera_calibration,
+    compute_cucumber_size_and_ripeness,
+)
+
+from disease_detection import (
+    CONF_DISEASE,
+    DISEASE_ALPHA,
+    DISEASE_SPRAY_THRESHOLD_PERCENT,
+    DISEASE_COLORS_BGR,
+    run_disease_on_leaf_crops,
+    build_disease_action,
+)
+
+
 # ====== CONFIG ======
 BUCKET_NAME = "polycrop.firebasestorage.app"
 
-# Per-model thresholds
-CONF_CUCUMBER = 0.35
-CONF_LEAF = 0.25
-CONF_FLOWER = 0.30
-CONF_DISEASE = 0.25  # disease seg model
 
-# Overlay alpha (0..1)
-DISEASE_ALPHA = 0.45
-
-# ====== DISEASE ACTION / PUMP CONFIG ======
-# Disease severity is calculated as: diseased_mask_area / leaf_area * 100
-# Downy mildew   -> Pump 1
-# Powdery mildew -> Pump 2
-# Water stress   -> alert only, no spray pump
-DISEASE_SPRAY_THRESHOLD_PERCENT = 1.0
-
-PUMP_DURATION_MS_BY_LEVEL = {
-    "LOW": 2000,
-    "MEDIUM": 3000,
-    "HIGH": 5000,
-}
-
-# ====== CUCUMBER SIZE / RIPENESS CONFIG ======
-# We estimate real-world size from: (cucumber bbox pixels) × (cm_per_px)
-# where cm_per_px scales linearly with distance.
-#
-# ✅ You MUST calibrate cmPerPxAtBaseDistance for your phone camera.
-# How:
-#   1) Place a ruler/object of known width (e.g. 10cm) at a known distance (e.g. 80cm)
-#   2) Capture an image and measure the object's width in pixels (px)
-#   3) cmPerPxAtBaseDistance = 10 / px
-#   4) Store it in Firestore (recommended): tunnels/{tunnelId}.cameraCalib
-#      { baseDistanceCm: 80, cmPerPxAtBaseDistance: 0.0123 }
-#
-# If calibration is missing, we return bbox pixels but we DO NOT claim cm measurements.
-DEFAULT_BASE_DISTANCE_CM = 80.0
-
-# Sri Lanka salad cucumber ripe range
-RIPE_MIN_LENGTH_CM = 15.0
-RIPE_MAX_LENGTH_CM = 16.0
-RIPE_MIN_DIAMETER_CM = 2.5
-RIPE_MAX_DIAMETER_CM = 3.0
-
-# Disease class colors (BGR for OpenCV)
-# Adjust names to match your model.names exactly (we map by name)
-DISEASE_COLORS_BGR = {
-    "downy_mildew": (0, 255, 255),     # yellow/cyan-ish
-    "powdery_mildew": (255, 0, 255),   # magenta
-    "water_stress": (0, 165, 255),     # orange
-}
-
-# ====== Firebase Admin init (guard for reload) ======
+# ====== Firebase Admin init ======
 if not firebase_admin._apps:
     sa_path = Path(__file__).parent / "serviceAccountKey.json"
+
     if sa_path.exists():
         cred = credentials.Certificate(str(sa_path))
         firebase_admin.initialize_app(cred, {"storageBucket": BUCKET_NAME})
     else:
-        # Fall back to Application Default Credentials if available.
         firebase_admin.initialize_app(options={"storageBucket": BUCKET_NAME})
+
 
 db = firestore.client()
 bucket = storage.bucket()
 
 
-def safe_float(x) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-
-def load_camera_calibration(tunnel_id: Optional[str], meta: dict) -> dict:
-    """Get camera calibration from capture meta OR tunnel doc.
-
-    Expected shape:
-      { baseDistanceCm: number, cmPerPxAtBaseDistance: number }
-    """
-    calib = (meta.get("cameraCalib") or {}) if isinstance(meta, dict) else {}
-
-    # Merge with tunnel calibration if present
-    if tunnel_id:
-        try:
-            t_snap = db.collection("tunnels").document(tunnel_id).get()
-            if t_snap.exists:
-                t = t_snap.to_dict() or {}
-                t_calib = t.get("cameraCalib") or t.get("cameraCalibration") or {}
-                if isinstance(t_calib, dict):
-                    for k, v in t_calib.items():
-                        calib.setdefault(k, v)
-        except Exception:
-            pass
-
-    base_distance = safe_float(calib.get("baseDistanceCm"))
-    cm_per_px = safe_float(calib.get("cmPerPxAtBaseDistance"))
-
-    return {
-        "baseDistanceCm": base_distance if base_distance is not None else DEFAULT_BASE_DISTANCE_CM,
-        "cmPerPxAtBaseDistance": cm_per_px,
-    }
-
-
-def normalize_disease_name(name: str) -> str:
-    """Normalize model class names so Pump logic works even if labels contain spaces/capital letters."""
-    return str(name or "").strip().lower().replace(" ", "_").replace("-", "_")
-
-
-def get_severity_level(percent: float) -> str:
-    p = float(percent or 0.0)
-    if p >= 25.0:
-        return "HIGH"
-    if p >= 10.0:
-        return "MEDIUM"
-    if p >= DISEASE_SPRAY_THRESHOLD_PERCENT:
-        return "LOW"
-    return "NONE"
-
-
-def get_pump_duration_ms(percent: float) -> int:
-    level = get_severity_level(percent)
-    return PUMP_DURATION_MS_BY_LEVEL.get(level, 0)
-
-
-def build_disease_action(per_leaf: List[dict]) -> dict:
-    """
-    Convert disease severity into robot action.
-
-    Rules:
-      downy_mildew   -> Pump 1
-      powdery_mildew -> Pump 2
-      water_stress   -> mobile alert only
-    """
-    disease_stats: Dict[str, dict] = {}
-
-    for leaf in per_leaf:
-        sev_map = leaf.get("severityByDiseasePercent") or {}
-
-        for raw_name, raw_percent in sev_map.items():
-            name = normalize_disease_name(raw_name)
-            percent = float(raw_percent or 0.0)
-
-            if name not in disease_stats:
-                disease_stats[name] = {
-                    "detected": True,
-                    "affectedLeaves": 0,
-                    "totalSeverityPercent": 0.0,
-                    "maxSeverityPercent": 0.0,
-                    "avgSeverityPercent": 0.0,
-                    "severityLevel": "NONE",
-                }
-
-            disease_stats[name]["affectedLeaves"] += 1
-            disease_stats[name]["totalSeverityPercent"] += percent
-            disease_stats[name]["maxSeverityPercent"] = max(
-                disease_stats[name]["maxSeverityPercent"],
-                percent,
-            )
-
-    for name, stat in disease_stats.items():
-        affected = max(1, int(stat.get("affectedLeaves", 1)))
-        avg = float(stat.get("totalSeverityPercent", 0.0)) / affected
-        max_sev = float(stat.get("maxSeverityPercent", 0.0))
-
-        stat["totalSeverityPercent"] = round(float(stat.get("totalSeverityPercent", 0.0)), 2)
-        stat["avgSeverityPercent"] = round(avg, 2)
-        stat["maxSeverityPercent"] = round(max_sev, 2)
-        stat["severityLevel"] = get_severity_level(max_sev)
-
-    downy = disease_stats.get("downy_mildew")
-    powdery = disease_stats.get("powdery_mildew")
-    water = disease_stats.get("water_stress")
-
-    downy_sev = float(downy.get("maxSeverityPercent", 0.0)) if downy else 0.0
-    powdery_sev = float(powdery.get("maxSeverityPercent", 0.0)) if powdery else 0.0
-    water_sev = float(water.get("maxSeverityPercent", 0.0)) if water else 0.0
-
-    pump1_ms = get_pump_duration_ms(downy_sev) if downy_sev >= DISEASE_SPRAY_THRESHOLD_PERCENT else 0
-    pump2_ms = get_pump_duration_ms(powdery_sev) if powdery_sev >= DISEASE_SPRAY_THRESHOLD_PERCENT else 0
-    water_stress_alert = water_sev >= DISEASE_SPRAY_THRESHOLD_PERCENT
-
-    if pump1_ms > 0 and pump2_ms > 0:
-        decision = "PUMP1_PUMP2"
-        action_label = "Downy mildew and powdery mildew detected. Pump 1 and Pump 2 required."
-    elif pump1_ms > 0:
-        decision = "PUMP1"
-        action_label = "Downy mildew detected. Pump 1 required."
-    elif pump2_ms > 0:
-        decision = "PUMP2"
-        action_label = "Powdery mildew detected. Pump 2 required."
-    elif water_stress_alert:
-        decision = "ALERT_ONLY"
-        action_label = "Water stress detected. User alert required. No spray pump."
-    else:
-        decision = "NO_SPRAY"
-        action_label = "No treatment required."
-
-    return {
-        "captureDecision": decision,
-        "sprayRecommended": bool(pump1_ms > 0 or pump2_ms > 0),
-        "sprayDurationMs": int(max(pump1_ms, pump2_ms)),  # backward compatibility
-        "pump1DurationMs": int(pump1_ms),
-        "pump2DurationMs": int(pump2_ms),
-        "waterStressAlert": bool(water_stress_alert),
-        "diseaseSeverity": disease_stats,
-        "actionLabel": action_label,
-    }
-
-
 app = FastAPI(title="PolyCrop Processor (YOLO + Disease Seg + Annotated Upload)")
+
 
 # ====== Load YOLO models ======
 yolo_cucumber = YOLO("weights/best.pt")
 yolo_leaf = YOLO("weights/cucumber_leaf_detection.pt")
 yolo_flower = YOLO("weights/cucumber_flower_detection.pt")
-
-# Disease segmentation model (YOLOv8-seg)
 yolo_disease = YOLO("weights/disease_detection_v2.pt")
 
 
 class ProcessRequest(BaseModel):
     captureId: str
-
-
-def run_yolo_boxes(model: YOLO, pil_img: Image.Image, conf=0.25):
-    results = model.predict(pil_img, conf=conf, verbose=False)
-    r0 = results[0]
-    dets = []
-    if r0.boxes is None:
-        return dets
-
-    boxes = r0.boxes.xyxy.cpu().numpy()
-    scores = r0.boxes.conf.cpu().numpy()
-
-    for (x1, y1, x2, y2), s in zip(boxes, scores):
-        dets.append({
-            "box": [float(x1), float(y1), float(x2), float(y2)],
-            "conf": float(s),
-        })
-    return dets
-
-
-def clamp_box(box, w, h):
-    x1, y1, x2, y2 = box
-    x1 = max(0, min(int(x1), w - 1))
-    y1 = max(0, min(int(y1), h - 1))
-    x2 = max(0, min(int(x2), w))
-    y2 = max(0, min(int(y2), h))
-    if x2 <= x1:
-        x2 = min(w, x1 + 1)
-    if y2 <= y1:
-        y2 = min(h, y1 + 1)
-    return x1, y1, x2, y2
-
-
-def pick_primary_det(dets: List[dict]) -> Optional[dict]:
-    """Pick the most likely main cucumber detection.
-    Uses (area × (0.5 + conf)) to prefer large + confident boxes.
-    """
-    if not dets:
-        return None
-
-    def score(d: dict) -> float:
-        x1, y1, x2, y2 = d.get("box", [0, 0, 0, 0])
-        area = max(0.0, (x2 - x1)) * max(0.0, (y2 - y1))
-        conf = float(d.get("conf", 0.0) or 0.0)
-        return area * (0.5 + conf)
-
-    return max(dets, key=score)
-
-
-def compute_cucumber_size_and_ripeness(
-    cuc_dets: List[dict],
-    img_w: int,
-    img_h: int,
-    distance_cm: Optional[float],
-    calib: dict,
-) -> dict:
-    """
-    Estimate size for every detected cucumber.
-    A cucumber is ripe when:
-    length = 15–16 cm
-    diameter = 2.5–3.0 cm
-    """
-
-    if not cuc_dets:
-        return {
-            "available": False,
-            "reason": "no_cucumber_detected",
-            "distanceCm": distance_cm,
-            "cucumbers": [],
-            "ripeCount": 0,
-            "hasRipe": False,
-            "ripe": False,  # compatibility field
-        }
-
-    cm_per_px_base = safe_float(calib.get("cmPerPxAtBaseDistance"))
-    base_distance = float(calib.get("baseDistanceCm") or DEFAULT_BASE_DISTANCE_CM)
-
-    result = {
-        "available": True,
-        "distanceCm": distance_cm,
-        "calibration": {
-            "baseDistanceCm": base_distance,
-            "cmPerPxAtBaseDistance": cm_per_px_base,
-        },
-        "rules": {
-            "minLengthCm": RIPE_MIN_LENGTH_CM,
-            "maxLengthCm": RIPE_MAX_LENGTH_CM,
-            "minDiameterCm": RIPE_MIN_DIAMETER_CM,
-            "maxDiameterCm": RIPE_MAX_DIAMETER_CM,
-        },
-        "cucumbers": [],
-        "ripeCount": 0,
-        "hasRipe": False,
-        "ripe": False,  # compatibility field
-    }
-
-    if distance_cm is None:
-        result["reason"] = "missing_distanceCm"
-
-    if cm_per_px_base is None:
-        result["reason"] = "missing_camera_calibration"
-
-    cm_per_px = None
-    if distance_cm is not None and cm_per_px_base is not None:
-        cm_per_px = cm_per_px_base * (float(distance_cm) / base_distance)
-
-    for index, det in enumerate(cuc_dets):
-        x1, y1, x2, y2 = clamp_box(det["box"], img_w, img_h)
-
-        px_w = max(1, x2 - x1)
-        px_h = max(1, y2 - y1)
-
-        length_px = float(max(px_w, px_h))
-        diameter_px = float(min(px_w, px_h))
-
-        cucumber_obj = {
-            "index": index,
-            "box": [int(x1), int(y1), int(x2), int(y2)],
-            "conf": float(det.get("conf", 0.0) or 0.0),
-            "pixel": {
-                "lengthPx": length_px,
-                "diameterPx": diameter_px,
-                "bboxW": int(px_w),
-                "bboxH": int(px_h),
-            },
-            "cm": None,
-            "ripe": None,
-        }
-
-        if cm_per_px is not None:
-            length_cm = length_px * cm_per_px
-            diameter_cm = diameter_px * cm_per_px
-
-            is_ripe = (
-                RIPE_MIN_LENGTH_CM <= length_cm <= RIPE_MAX_LENGTH_CM
-                and RIPE_MIN_DIAMETER_CM <= diameter_cm <= RIPE_MAX_DIAMETER_CM
-            )
-
-            cucumber_obj["cm"] = {
-                "cmPerPx": round(cm_per_px, 6),
-                "lengthCm": round(length_cm, 2),
-                "diameterCm": round(diameter_cm, 2),
-            }
-            cucumber_obj["ripe"] = bool(is_ripe)
-
-            if is_ripe:
-                result["ripeCount"] += 1
-
-        result["cucumbers"].append(cucumber_obj)
-
-    result["hasRipe"] = result["ripeCount"] > 0
-    result["ripe"] = result["hasRipe"]
-    return result
-
-
-def upload_with_permanent_url(path: str, jpg_bytes: bytes):
-    token = str(uuid.uuid4())
-    blob = bucket.blob(path)
-    blob.metadata = {"firebaseStorageDownloadTokens": token}
-    blob.upload_from_string(jpg_bytes, content_type="image/jpeg")
-
-    encoded = urllib.parse.quote(path, safe="")
-    url = f"https://firebasestorage.googleapis.com/v0/b/{BUCKET_NAME}/o/{encoded}?alt=media&token={token}"
-    return path, url
-
-
-def draw_detection_boxes(img_bgr, dets, color_bgr, thickness=2):
-    for d in dets:
-        x1, y1, x2, y2 = map(int, d["box"])
-        cv2.rectangle(img_bgr, (x1, y1), (x2, y2), color_bgr, thickness)
-
-
-def add_legend(img_bgr, legend_items: List[Dict[str, Any]]):
-    if not legend_items:
-        return
-
-    pad = 12
-    box_w = 260
-    row_h = 26
-    title_h = 28
-    box_h = title_h + row_h * len(legend_items) + pad
-
-    x0, y0 = 16, 16
-    x1, y1 = x0 + box_w, y0 + box_h
-
-    cv2.rectangle(img_bgr, (x0, y0), (x1, y1), (0, 0, 0), -1)
-    cv2.rectangle(img_bgr, (x0, y0), (x1, y1), (255, 255, 255), 1)
-
-    cv2.putText(img_bgr, "Disease Legend", (x0 + 10, y0 + 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-    y = y0 + title_h
-    for item in legend_items:
-        name = item["name"]
-        color = item["color_bgr"]
-
-        cv2.rectangle(img_bgr, (x0 + 10, y), (x0 + 30, y + 18), color, -1)
-        cv2.rectangle(img_bgr, (x0 + 10, y), (x0 + 30, y + 18), (255, 255, 255), 1)
-
-        cv2.putText(img_bgr, name.replace("_", " "), (x0 + 40, y + 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-        y += row_h
-
-
-def run_disease_on_leaf_crops(pil_img: Image.Image, leaf_dets: List[dict], conf=0.25):
-    w, h = pil_img.size
-    overlay = np.zeros((h, w, 3), dtype=np.uint8)
-
-    disease_names = yolo_disease.model.names if hasattr(yolo_disease, "model") else yolo_disease.names
-
-    diseases_found = set()
-    per_leaf = []
-
-    for i, d in enumerate(leaf_dets):
-        x1, y1, x2, y2 = clamp_box(d["box"], w, h)
-        leaf_w = max(1, x2 - x1)
-        leaf_h = max(1, y2 - y1)
-        leaf_area = float(leaf_w * leaf_h)
-
-        crop = pil_img.crop((x1, y1, x2, y2))
-        r = yolo_disease.predict(crop, conf=conf, verbose=False)[0]
-
-        leaf_disease_area_by_name: Dict[str, float] = {}
-        leaf_diseases = set()
-
-        if r.masks is not None and r.boxes is not None and len(r.masks.data) > 0:
-            masks = r.masks.data.cpu().numpy()
-            cls_ids = r.boxes.cls.cpu().numpy().astype(int)
-
-            for j in range(len(masks)):
-                name = disease_names.get(int(cls_ids[j]), f"class_{int(cls_ids[j])}")
-                m = masks[j] > 0.5
-                area_px = float(m.sum())
-                if area_px < 10:
-                    continue
-
-                leaf_disease_area_by_name[name] = leaf_disease_area_by_name.get(name, 0.0) + area_px
-                leaf_diseases.add(name)
-                diseases_found.add(name)
-
-                m_resized = cv2.resize(m.astype(np.uint8), (leaf_w, leaf_h), interpolation=cv2.INTER_NEAREST).astype(bool)
-
-                color = DISEASE_COLORS_BGR.get(name, (0, 255, 0))
-                region = overlay[y1:y2, x1:x2]
-                region[m_resized] = color
-                overlay[y1:y2, x1:x2] = region
-
-        severity_by_name = {}
-        total_disease_px = 0.0
-        for name, area_px in leaf_disease_area_by_name.items():
-            sev = (area_px / leaf_area) * 100.0
-            severity_by_name[name] = round(sev, 2)
-            total_disease_px += area_px
-
-        total_sev = round((total_disease_px / leaf_area) * 100.0, 2)
-
-        per_leaf.append({
-            "leafIndex": i,
-            "box": [x1, y1, x2, y2],
-            "leafAreaPx": int(leaf_area),
-            "diseases": sorted(list(leaf_diseases)),
-            "severityByDiseasePercent": severity_by_name,
-            "totalSeverityPercent": total_sev,
-        })
-
-    return per_leaf, overlay, diseases_found
 
 
 @app.get("/health")
@@ -516,80 +93,137 @@ def health():
 @app.post("/process")
 def process(req: ProcessRequest):
     cap_ref = db.collection("captures").document(req.captureId)
+
     try:
         print("[process] reading capture", req.captureId)
         snap = cap_ref.get(timeout=10)
+
     except Exception as e:
         print("[process] firestore read failed", repr(e))
         raise HTTPException(status_code=500, detail=f"Failed to read capture: {e}")
+
     if not snap.exists:
         raise HTTPException(status_code=404, detail="Capture not found")
 
     cap = snap.to_dict() or {}
+
     storage_path = cap.get("storagePath")
+
     if not storage_path:
         raise HTTPException(status_code=400, detail="Capture missing storagePath")
 
     meta = cap.get("meta") or {}
+
     tunnel_id: Optional[str] = meta.get("tunnelId")
     plant_id: Optional[str] = meta.get("plantId")
     robot_id: Optional[str] = meta.get("robotId")
     request_id: Optional[str] = meta.get("requestId")
 
-    # ultrasonic distance (cm) should be saved into capture.meta.distanceCm
     distance_cm: Optional[float] = safe_float(meta.get("distanceCm"))
 
     try:
         src_blob = bucket.blob(storage_path)
         img_bytes = src_blob.download_as_bytes()
+
     except Exception as e:
         print("[process] storage download failed", repr(e))
-        raise HTTPException(status_code=500, detail=f"Failed to download capture image: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to download capture image: {e}",
+        )
 
     pil = Image.open(io.BytesIO(img_bytes))
     pil = ImageOps.exif_transpose(pil).convert("RGB")
+
     w, h = pil.size
+
     if w > h:
         pil = pil.rotate(90, expand=True)
         w, h = pil.size
 
-    cuc = run_yolo_boxes(yolo_cucumber, pil, conf=CONF_CUCUMBER)
-    leaf = run_yolo_boxes(yolo_leaf, pil, conf=CONF_LEAF)
-    flower = run_yolo_boxes(yolo_flower, pil, conf=CONF_FLOWER)
+    # ====== Separate detections ======
+    cuc = detect_cucumbers(yolo_cucumber, pil, conf=CONF_CUCUMBER)
+    leaf = detect_leaves(yolo_leaf, pil, conf=CONF_LEAF)
+    flower = detect_flowers(yolo_flower, pil, conf=CONF_FLOWER)
 
-    camera_calib = load_camera_calibration(tunnel_id, meta)
-    ripeness = compute_cucumber_size_and_ripeness(cuc, w, h, distance_cm, camera_calib)
+    # ====== Ripe detection / cucumber measurement ======
+    camera_calib = load_camera_calibration(db, tunnel_id, meta)
 
-    per_leaf, disease_overlay, diseases_found = run_disease_on_leaf_crops(pil, leaf, conf=CONF_DISEASE)
+    ripeness = compute_cucumber_size_and_ripeness(
+        cuc,
+        w,
+        h,
+        distance_cm,
+        camera_calib,
+    )
 
+    # ====== Disease detection on leaf crops ======
+    per_leaf, disease_overlay, diseases_found = run_disease_on_leaf_crops(
+        yolo_disease,
+        pil,
+        leaf,
+        conf=CONF_DISEASE,
+    )
+
+    # ====== Annotated image generation ======
     img_bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
-    # ✅ SAFE BLEND
     blended = img_bgr.copy()
+
     if disease_overlay is not None:
         mask_any = disease_overlay.sum(axis=2) > 0
+
         if mask_any.any():
-            blended_full = cv2.addWeighted(img_bgr, 1.0 - DISEASE_ALPHA, disease_overlay, DISEASE_ALPHA, 0)
+            blended_full = cv2.addWeighted(
+                img_bgr,
+                1.0 - DISEASE_ALPHA,
+                disease_overlay,
+                DISEASE_ALPHA,
+                0,
+            )
             blended[mask_any] = blended_full[mask_any]
 
     draw_detection_boxes(blended, cuc, (0, 255, 0))
     draw_detection_boxes(blended, leaf, (255, 255, 0))
     draw_detection_boxes(blended, flower, (255, 0, 255))
 
+    draw_cucumber_measurement_labels(
+        blended,
+        ripeness.get("cucumbers", []),
+    )
+
     legend_items = []
     disease_names_sorted = sorted(list(diseases_found))
+
     for name in disease_names_sorted:
-        legend_items.append({"name": name, "color_bgr": DISEASE_COLORS_BGR.get(name, (0, 255, 0))})
+        legend_items.append({
+            "name": name,
+            "color_bgr": DISEASE_COLORS_BGR.get(name, (0, 255, 0)),
+        })
+
     add_legend(blended, legend_items)
 
-    ok, buf = cv2.imencode(".jpg", blended, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    ok, buf = cv2.imencode(
+        ".jpg",
+        blended,
+        [int(cv2.IMWRITE_JPEG_QUALITY), 90],
+    )
+
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to encode annotated image")
+
     annotated_bytes = buf.tobytes()
 
     annotated_path = storage_path.replace("/captures/", "/captures_annotated/")
-    annotated_storage_path, annotated_url = upload_with_permanent_url(annotated_path, annotated_bytes)
 
+    annotated_storage_path, annotated_url = upload_with_permanent_url(
+        bucket,
+        BUCKET_NAME,
+        annotated_path,
+        annotated_bytes,
+    )
+
+    # ====== Disease action / pump decision ======
     disease_action = build_disease_action(per_leaf)
 
     spray_recommended = disease_action["sprayRecommended"]
@@ -601,33 +235,63 @@ def process(req: ProcessRequest):
     disease_severity = disease_action["diseaseSeverity"]
     action_label = disease_action["actionLabel"]
 
-    # ✅ Ripe cucumber summary from all detected cucumbers
-    all_cucumbers = ripeness.get("cucumbers", []) if isinstance(ripeness.get("cucumbers", []), list) else []
+    # ====== Ripe cucumber summary from all detected cucumbers ======
+    all_cucumbers = (
+        ripeness.get("cucumbers", [])
+        if isinstance(ripeness.get("cucumbers", []), list)
+        else []
+    )
+
     ripe_cucumbers = [c for c in all_cucumbers if c.get("ripe") is True]
     ripe_count = len(ripe_cucumbers)
     has_ripe = ripe_count > 0
 
-    # Prefer displaying the first ripe cucumber size.
-    # If no ripe cucumber exists, display the first detected cucumber size.
-    display_cucumber = ripe_cucumbers[0] if ripe_cucumbers else (all_cucumbers[0] if all_cucumbers else None)
-    cm_obj = display_cucumber.get("cm") if display_cucumber and isinstance(display_cucumber.get("cm"), dict) else None
+    display_cucumber = (
+        ripe_cucumbers[0]
+        if ripe_cucumbers
+        else (all_cucumbers[0] if all_cucumbers else None)
+    )
+
+    cm_obj = (
+        display_cucumber.get("cm")
+        if display_cucumber and isinstance(display_cucumber.get("cm"), dict)
+        else None
+    )
+
     cucumber_len_cm = cm_obj.get("lengthCm") if cm_obj else None
     cucumber_diam_cm = cm_obj.get("diameterCm") if cm_obj else None
 
     outputs = {
-        "image": {"width": w, "height": h},
-        "yolo": {"cucumber": cuc, "leaf": leaf, "flower": flower},
+        "image": {
+            "width": w,
+            "height": h,
+        },
+        "yolo": {
+            "cucumber": cuc,
+            "leaf": leaf,
+            "flower": flower,
+        },
         "ripeness": ripeness,
         "disease": {
             "perLeaf": per_leaf,
-            "legend": [{"name": it["name"], "colorBGR": list(it["color_bgr"])} for it in legend_items],
+            "legend": [
+                {
+                    "name": it["name"],
+                    "colorBGR": list(it["color_bgr"]),
+                }
+                for it in legend_items
+            ],
             "threshold": CONF_DISEASE,
         },
         "summary": {
             "diseases": disease_names_sorted,
             "sprayRecommended": spray_recommended,
             "spraySeverityThresholdPercent": DISEASE_SPRAY_THRESHOLD_PERCENT,
-            "counts": {"cucumber": len(cuc), "leaf": len(leaf), "flower": len(flower)},
+            "counts": {
+                "cucumber": len(cuc),
+                "leaf": len(leaf),
+                "flower": len(flower),
+            },
             "decision": decision,
             "captureDecision": decision,
             "sprayDurationMs": spray_duration_ms,
@@ -641,11 +305,17 @@ def process(req: ProcessRequest):
             "ripeCucumberCount": ripe_count,
             "ripeCucumbers": ripe_cucumbers,
             "allCucumbers": all_cucumbers,
+            "cucumberMeasurements": all_cucumbers,
             "cucumberLengthCm": cucumber_len_cm,
             "cucumberDiameterCm": cucumber_diam_cm,
         },
         "meta": meta,
-        "thresholds": {"cucumber": CONF_CUCUMBER, "leaf": CONF_LEAF, "flower": CONF_FLOWER, "disease": CONF_DISEASE},
+        "thresholds": {
+            "cucumber": CONF_CUCUMBER,
+            "leaf": CONF_LEAF,
+            "flower": CONF_FLOWER,
+            "disease": CONF_DISEASE,
+        },
     }
 
     cap_ref.update({
@@ -656,9 +326,15 @@ def process(req: ProcessRequest):
         "updatedAt": firestore.SERVER_TIMESTAMP,
     })
 
-    # Mirror into plant (so your app pages work)
+    # ====== Mirror into plant ======
     if tunnel_id and plant_id:
-        plant_ref = db.collection("tunnels").document(tunnel_id).collection("plants").document(plant_id)
+        plant_ref = (
+            db.collection("tunnels")
+            .document(tunnel_id)
+            .collection("plants")
+            .document(plant_id)
+        )
+
         plant_ref.set({
             "lastScanAt": firestore.SERVER_TIMESTAMP,
             "lastCaptureId": req.captureId,
@@ -679,10 +355,13 @@ def process(req: ProcessRequest):
             "lastRipe": has_ripe,
             "lastRipeCucumberCount": ripe_count,
             "lastRipeCucumbers": ripe_cucumbers,
+            "lastAllCucumbers": all_cucumbers,
+            "lastCucumberMeasurements": all_cucumbers,
             "updatedAt": firestore.SERVER_TIMESTAMP,
         }, merge=True)
 
         plant_cap_ref = plant_ref.collection("captures").document(req.captureId)
+
         plant_cap_ref.set({
             "captureId": req.captureId,
             "status": "DONE",
@@ -699,15 +378,19 @@ def process(req: ProcessRequest):
             "ripe": has_ripe,
             "ripeCucumberCount": ripe_count,
             "ripeCucumbers": ripe_cucumbers,
+            "allCucumbers": all_cucumbers,
+            "cucumberMeasurements": all_cucumbers,
             "cucumberLengthCm": cucumber_len_cm,
             "cucumberDiameterCm": cucumber_diam_cm,
             "updatedAt": firestore.SERVER_TIMESTAMP,
         }, merge=True)
 
-    # Create water stress alert for the mobile app
+    # ====== Create water stress alert for mobile app ======
     owner_id = cap.get("ownerId")
+
     if owner_id and tunnel_id and plant_id and water_stress_alert:
         alert_ref = db.collection("alerts").document(f"{req.captureId}_water_stress")
+
         alert_ref.set({
             "ownerId": owner_id,
             "tunnelId": tunnel_id,
@@ -716,16 +399,20 @@ def process(req: ProcessRequest):
             "type": "WATER_STRESS",
             "severity": "WARNING",
             "title": "Water Stress Detected",
-            "description": f"Water stress detected in plant {plant_id}. Please inspect irrigation or moisture condition.",
+            "description": (
+                f"Water stress detected in plant {plant_id}. "
+                "Please inspect irrigation or moisture condition."
+            ),
             "diseaseSeverity": disease_severity.get("water_stress"),
             "read": False,
             "createdAt": firestore.SERVER_TIMESTAMP,
             "updatedAt": firestore.SERVER_TIMESTAMP,
         }, merge=True)
 
-    # Robot decision (optional)
+    # ====== Robot decision ======
     if robot_id and request_id:
         robot_ref = db.collection("robots").document(robot_id)
+
         robot_ref.set({
             "robotId": robot_id,
             "captureStatus": "DECIDED",

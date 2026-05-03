@@ -14,32 +14,35 @@
 #include "addons/RTDBHelper.h"
 
 // ================= WIFI =================
+// Replace with your real WiFi details
 #define WIFI_SSID "Dialog 4G 931"
 #define WIFI_PASSWORD "9e0Ff6c3"
 
 // ================= FIREBASE =================
+// Replace with your real Firebase Web API key
 #define API_KEY "AIzaSyA7mJ-uud7w7DDM94LGA4z-G8HJa2Q2qFA"
 #define DATABASE_URL "https://rfid-robot-ff91d-default-rtdb.firebaseio.com" // not used
 #define FIREBASE_PROJECT_ID "polycrop"
 
-// ✅ LoRa gateway (receiver) id
+// ✅ LoRa gateway receiver ID
 #define GATEWAY_ID "LORA_RX_01"
 
 // collections
 #define GATEWAYS_COLLECTION "loraGateways"
 #define READINGS_SUBCOLLECTION "loraReadings"
+#define FAULT_LOGS_SUBCOLLECTION "sensorFaultLogs"
 
 // ================= FIREBASE OBJECTS =================
 FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
 
-// ================= OLED (I2C) =================
+// ================= OLED I2C =================
 #define I2C_SDA 21
 #define I2C_SCL 22
 Adafruit_SH1107 display(128, 128, &Wire);
 
-// ================= LoRa (SX1278) =================
+// ================= LoRa SX1278 =================
 #define LORA_SCK  18
 #define LORA_MISO 19
 #define LORA_MOSI 23
@@ -56,6 +59,9 @@ unsigned long lastPacketMs = 0;
 const unsigned long WAITING_TIMEOUT_MS = 3000;
 bool showingWaiting = false;
 
+// ✅ Fault timeout for real sensor downtime log
+const unsigned long SENSOR_TIMEOUT_FAULT_MS = 60000;
+
 // ✅ assigned tunnel fetched from Firestore
 String assignedTunnelId = "";
 unsigned long lastAssignFetchMs = 0;
@@ -64,6 +70,14 @@ const unsigned long ASSIGN_REFRESH_MS = 30000;
 // ✅ gateway doc ensure retry
 unsigned long lastEnsureMs = 0;
 const unsigned long ENSURE_INTERVAL_MS = 15000;
+
+// ✅ prevent duplicate fault logs
+unsigned long lastFaultLogMs = 0;
+const unsigned long FAULT_LOG_COOLDOWN_MS = 60000;
+String lastFaultKey = "";
+
+unsigned long lastTimeoutFaultLogMs = 0;
+bool timeoutFaultActive = false;
 
 // ================= ANOMALY THRESHOLDS =================
 const float TEMP_MIN_C = 0.0;
@@ -92,7 +106,13 @@ void serialLine() {
   Serial.println("----------------------------------------");
 }
 
-void serialStatus(const String &title, const String &line1 = "", const String &line2 = "", const String &line3 = "", const String &line4 = "") {
+void serialStatus(
+  const String &title,
+  const String &line1 = "",
+  const String &line2 = "",
+  const String &line3 = "",
+  const String &line4 = ""
+) {
   serialLine();
   Serial.println(title);
 
@@ -193,7 +213,12 @@ void drawStatusRow(int y, const String &label, const String &value) {
   display.print(shortText(value, 11));
 }
 
-void oledStatus(const String &line1, const String &line2 = "", const String &line3 = "", const String &line4 = "") {
+void oledStatus(
+  const String &line1,
+  const String &line2 = "",
+  const String &line3 = "",
+  const String &line4 = ""
+) {
   display.clearDisplay();
   display.setTextColor(SH110X_WHITE);
 
@@ -295,16 +320,11 @@ void drawData(float t1, float h1, float t2, float h2, int rssi, float snr) {
   display.print("Tunnel: ");
   display.print(shortText(assignedTunnelId.length() ? assignedTunnelId : "NOT SET", 14));
 
-  // Sensor cards
   drawCard(0, 31, 62, 26, "TEMP 1", String(t1, 1) + " C");
-
   drawCard(66, 31, 62, 26, "HUM 1", String(h1, 1) + " %");
-
   drawCard(0, 62, 62, 26, "TEMP 2", String(t2, 1) + " C");
-
   drawCard(66, 62, 62, 26, "HUM 2", String(h2, 1) + " %");
 
-  // Average summary area
   display.drawRoundRect(0, 93, 128, 17, 4, SH110X_WHITE);
 
   display.setCursor(5, 98);
@@ -316,7 +336,6 @@ void drawData(float t1, float h1, float t2, float h2, int rssi, float snr) {
   display.print(avgH, 1);
   display.print("%");
 
-  // Signal footer
   display.drawLine(0, 114, 128, 114, SH110X_WHITE);
 
   display.setCursor(0, 118);
@@ -346,16 +365,19 @@ void drawData(float t1, float h1, float t2, float h2, int rssi, float snr) {
   serialLine();
 }
 
-// ================= TIME (TLS) =================
+// ================= TIME TLS =================
 bool initTime() {
   configTime(19800, 0, "pool.ntp.org", "time.nist.gov"); // Sri Lanka UTC+5:30
+
   time_t now = time(nullptr);
   int retry = 0;
+
   while (now < 1700000000 && retry < 60) {
     delay(500);
     now = time(nullptr);
     retry++;
   }
+
   return now >= 1700000000;
 }
 
@@ -368,17 +390,22 @@ String nowRFC3339Z() {
 
   char buf[25];
   strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+
   return String(buf);
 }
 
 // ================= WIFI =================
 void connectWiFiWithOLED() {
   oledStatus("WiFi: Connecting...", WIFI_SSID);
+
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
   unsigned long start = millis();
+
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
     delay(300);
   }
+
   oledStatus(String("WiFi: ") + (WiFi.status() == WL_CONNECTED ? "Connected" : "FAILED"));
   delay(700);
 }
@@ -386,11 +413,12 @@ void connectWiFiWithOLED() {
 // ================= FIREBASE INIT =================
 bool initFirebaseWithOLED() {
   oledStatus("Firebase: Init...");
+
   config.api_key = API_KEY;
   config.token_status_callback = tokenStatusCallback;
 
   if (Firebase.signUp(&config, &auth, "", "")) {
-    Serial.println("Firebase Auth Ready (anonymous)");
+    Serial.println("Firebase Auth Ready anonymous");
   } else {
     Serial.print("Signup error: ");
     Serial.println(config.signer.signupError.message.c_str());
@@ -403,12 +431,14 @@ bool initFirebaseWithOLED() {
   Firebase.reconnectWiFi(true);
 
   unsigned long start = millis();
+
   while (!Firebase.ready() && millis() - start < 8000) {
     delay(200);
   }
 
   oledStatus("Firebase: " + String(Firebase.ready() ? "Ready" : "Not ready"));
   delay(700);
+
   return Firebase.ready();
 }
 
@@ -430,16 +460,18 @@ bool initLoRaWithOLED() {
 
   oledStatus("LoRa: Receiver Ready");
   delay(700);
+
   return true;
 }
 
 // ================= PARSE =================
-// incoming: counter,t1,h1,t2,h2
+// incoming format: counter,t1,h1,t2,h2
 bool parseCSV5(const String &s, String &counterStr, float &t1, float &h1, float &t2, float &h2) {
   int p1 = s.indexOf(',');
   int p2 = s.indexOf(',', p1 + 1);
   int p3 = s.indexOf(',', p2 + 1);
   int p4 = s.indexOf(',', p3 + 1);
+
   if (p1 < 0 || p2 < 0 || p3 < 0 || p4 < 0) return false;
 
   counterStr = s.substring(0, p1);
@@ -447,6 +479,7 @@ bool parseCSV5(const String &s, String &counterStr, float &t1, float &h1, float 
   h1 = s.substring(p2 + 1, p3).toFloat();
   t2 = s.substring(p3 + 1, p4).toFloat();
   h2 = s.substring(p4 + 1).toFloat();
+
   return true;
 }
 
@@ -461,10 +494,16 @@ bool validRange(float v, float lo, float hi) {
 }
 
 void computeAnomaly(
-  bool &s1TempValid, bool &s2TempValid, bool &s1HumValid, bool &s2HumValid,
-  bool &tempMismatch, bool &humMismatch,
-  float &tempDiff, float &humDiff,
-  String &level, String &message
+  bool &s1TempValid,
+  bool &s2TempValid,
+  bool &s1HumValid,
+  bool &s2HumValid,
+  bool &tempMismatch,
+  bool &humMismatch,
+  float &tempDiff,
+  float &humDiff,
+  String &level,
+  String &message
 ) {
   s1TempValid = validRange(lastT1, TEMP_MIN_C, TEMP_MAX_C);
   s2TempValid = validRange(lastT2, TEMP_MIN_C, TEMP_MAX_C);
@@ -480,12 +519,12 @@ void computeAnomaly(
     tempDiff = fabs(lastT1 - lastT2);
     tempMismatch = tempDiff > TEMP_MISMATCH_C;
   }
+
   if (s1HumValid && s2HumValid) {
     humDiff = fabs(lastH1 - lastH2);
     humMismatch = humDiff > HUM_MISMATCH_PCT;
   }
 
-  // severity
   if (!s1TempValid || !s2TempValid || !s1HumValid || !s2HumValid) {
     level = "FAULT";
   } else if (tempMismatch || humMismatch) {
@@ -494,8 +533,8 @@ void computeAnomaly(
     level = "OK";
   }
 
-  // message
   String msg = "";
+
   if (level == "OK") {
     msg = "All sensors OK";
   } else {
@@ -507,12 +546,34 @@ void computeAnomaly(
     if (humMismatch)  msg += "Humidity mismatch; ";
   }
 
-  // trim
   msg.trim();
   message = msg;
 }
 
-// ================= ENSURE GATEWAY DOC (AUTO CREATE) =================
+String getFaultType(
+  bool s1TempValid,
+  bool s2TempValid,
+  bool s1HumValid,
+  bool s2HumValid,
+  bool tempMismatch,
+  bool humMismatch
+) {
+  if (!s1TempValid || !s2TempValid || !s1HumValid || !s2HumValid) {
+    return "INVALID_SENSOR_READING";
+  }
+
+  if (tempMismatch) {
+    return "TEMPERATURE_MISMATCH";
+  }
+
+  if (humMismatch) {
+    return "HUMIDITY_MISMATCH";
+  }
+
+  return "SENSOR_WARNING";
+}
+
+// ================= ENSURE GATEWAY DOC AUTO CREATE =================
 void ensureGatewayDoc() {
   if (!Firebase.ready()) return;
 
@@ -525,7 +586,11 @@ void ensureGatewayDoc() {
 
   if (!Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", path.c_str(), content.raw())) {
     String reason = fbdo.errorReason();
-    if (reason.indexOf("ALREADY_EXISTS") >= 0 || reason.indexOf("already exists") >= 0) return;
+
+    if (reason.indexOf("ALREADY_EXISTS") >= 0 || reason.indexOf("already exists") >= 0) {
+      return;
+    }
+
     Serial.print("ensureGatewayDoc FAILED: ");
     Serial.println(reason);
   }
@@ -546,6 +611,7 @@ void fetchAssignedTunnelId() {
 
   FirebaseJsonData data;
   json.get(data, "fields/assignedTunnelId/stringValue");
+
   if (data.success) {
     assignedTunnelId = data.to<String>();
   }
@@ -565,7 +631,7 @@ void updateGatewayDoc(const String &anLevel) {
   content.set("fields/lastSeenAt/timestampValue", nowRFC3339Z());
   content.set("fields/lastRssi/integerValue", (int)lastRSSI);
   content.set("fields/lastSnr/doubleValue", isnan(lastSNR) ? 0.0 : lastSNR);
-  content.set("fields/health/stringValue", anLevel); // ✅ quick health status
+  content.set("fields/health/stringValue", anLevel);
 
   String mask = "gatewayId,assignedTunnelId,lastSeenAt,lastRssi,lastSnr,health";
 
@@ -575,26 +641,213 @@ void updateGatewayDoc(const String &anLevel) {
   }
 }
 
+// ================= FAULT LOG WRITE =================
+void maybeWriteSensorFaultLog(
+  const String &anLevel,
+  const String &anMessage,
+  bool s1TempValid,
+  bool s2TempValid,
+  bool s1HumValid,
+  bool s2HumValid,
+  bool tempMismatch,
+  bool humMismatch,
+  float tempDiff,
+  float humDiff
+) {
+  if (!Firebase.ready()) return;
+  if (assignedTunnelId.length() == 0) return;
+
+  if (anLevel == "OK") {
+    lastFaultKey = "";
+    return;
+  }
+
+  String faultType = getFaultType(
+    s1TempValid,
+    s2TempValid,
+    s1HumValid,
+    s2HumValid,
+    tempMismatch,
+    humMismatch
+  );
+
+  String faultKey = anLevel + "|" + faultType + "|" + anMessage;
+
+  if (faultKey == lastFaultKey && millis() - lastFaultLogMs < FAULT_LOG_COOLDOWN_MS) {
+    return;
+  }
+
+  String logPath =
+    String("tunnels/") +
+    assignedTunnelId +
+    "/" +
+    String(FAULT_LOGS_SUBCOLLECTION) +
+    "/" +
+    makeDocId();
+
+  FirebaseJson log;
+
+  log.set("fields/gatewayId/stringValue", String(GATEWAY_ID));
+  log.set("fields/tunnelId/stringValue", assignedTunnelId);
+  log.set("fields/type/stringValue", faultType);
+  log.set("fields/level/stringValue", anLevel);
+  log.set("fields/message/stringValue", anMessage);
+  log.set("fields/status/stringValue", "ACTIVE");
+
+  log.set("fields/s1_temp/doubleValue", lastT1);
+  log.set("fields/s1_hum/doubleValue", lastH1);
+  log.set("fields/s2_temp/doubleValue", lastT2);
+  log.set("fields/s2_hum/doubleValue", lastH2);
+
+  log.set("fields/s1_temp_valid/booleanValue", s1TempValid);
+  log.set("fields/s2_temp_valid/booleanValue", s2TempValid);
+  log.set("fields/s1_hum_valid/booleanValue", s1HumValid);
+  log.set("fields/s2_hum_valid/booleanValue", s2HumValid);
+
+  log.set("fields/tempMismatch/booleanValue", tempMismatch);
+  log.set("fields/humMismatch/booleanValue", humMismatch);
+
+  if (isfinite(tempDiff)) {
+    log.set("fields/tempDiff/doubleValue", tempDiff);
+  }
+
+  if (isfinite(humDiff)) {
+    log.set("fields/humDiff/doubleValue", humDiff);
+  }
+
+  log.set("fields/rssi/integerValue", (int)lastRSSI);
+  log.set("fields/snr/doubleValue", isnan(lastSNR) ? 0.0 : lastSNR);
+  log.set("fields/createdAt/timestampValue", nowRFC3339Z());
+
+  bool ok = Firebase.Firestore.createDocument(
+    &fbdo,
+    FIREBASE_PROJECT_ID,
+    "",
+    logPath.c_str(),
+    log.raw()
+  );
+
+  if (ok) {
+    Serial.println("Sensor fault log created.");
+    Serial.print("Fault Type: ");
+    Serial.println(faultType);
+
+    lastFaultKey = faultKey;
+    lastFaultLogMs = millis();
+  } else {
+    Serial.print("Sensor fault log FAILED: ");
+    Serial.println(fbdo.errorReason());
+  }
+}
+
+void writeSensorTimeoutFaultIfNeeded() {
+  if (!Firebase.ready()) return;
+  if (assignedTunnelId.length() == 0) return;
+
+  unsigned long nowMs = millis();
+
+  if (!haveData) {
+    return;
+  }
+
+  if (nowMs - lastPacketMs < SENSOR_TIMEOUT_FAULT_MS) {
+    timeoutFaultActive = false;
+    return;
+  }
+
+  if (timeoutFaultActive && nowMs - lastTimeoutFaultLogMs < FAULT_LOG_COOLDOWN_MS) {
+    return;
+  }
+
+  String logPath =
+    String("tunnels/") +
+    assignedTunnelId +
+    "/" +
+    String(FAULT_LOGS_SUBCOLLECTION) +
+    "/" +
+    makeDocId();
+
+  FirebaseJson log;
+
+  log.set("fields/gatewayId/stringValue", String(GATEWAY_ID));
+  log.set("fields/tunnelId/stringValue", assignedTunnelId);
+  log.set("fields/type/stringValue", "SENSOR_TIMEOUT");
+  log.set("fields/level/stringValue", "FAULT");
+  log.set("fields/message/stringValue", "No LoRa sensor packet received for more than 60 seconds");
+  log.set("fields/status/stringValue", "ACTIVE");
+
+  log.set("fields/s1_temp/doubleValue", lastT1);
+  log.set("fields/s1_hum/doubleValue", lastH1);
+  log.set("fields/s2_temp/doubleValue", lastT2);
+  log.set("fields/s2_hum/doubleValue", lastH2);
+
+  log.set("fields/rssi/integerValue", (int)lastRSSI);
+  log.set("fields/snr/doubleValue", isnan(lastSNR) ? 0.0 : lastSNR);
+  log.set("fields/createdAt/timestampValue", nowRFC3339Z());
+
+  bool ok = Firebase.Firestore.createDocument(
+    &fbdo,
+    FIREBASE_PROJECT_ID,
+    "",
+    logPath.c_str(),
+    log.raw()
+  );
+
+  if (ok) {
+    Serial.println("Sensor timeout fault log created.");
+
+    timeoutFaultActive = true;
+    lastTimeoutFaultLogMs = nowMs;
+
+    updateGatewayDoc("FAULT");
+  } else {
+    Serial.print("Sensor timeout fault log FAILED: ");
+    Serial.println(fbdo.errorReason());
+  }
+}
+
 // ================= FIRESTORE WRITE =================
 bool storeToFirestore() {
   if (!Firebase.ready()) return false;
   if (assignedTunnelId.length() == 0) return false;
 
-  // Compute anomaly
   bool s1TempValid, s2TempValid, s1HumValid, s2HumValid;
   bool tempMismatch, humMismatch;
   float tempDiff, humDiff;
   String anLevel, anMessage;
-  computeAnomaly(s1TempValid, s2TempValid, s1HumValid, s2HumValid, tempMismatch, humMismatch, tempDiff, humDiff, anLevel, anMessage);
 
-  String readingPath = String("tunnels/") + assignedTunnelId + "/" + String(READINGS_SUBCOLLECTION) + "/" + makeDocId();
-  String summaryPath  = String("tunnels/") + assignedTunnelId + "/sensorSummary/latest";
+  computeAnomaly(
+    s1TempValid,
+    s2TempValid,
+    s1HumValid,
+    s2HumValid,
+    tempMismatch,
+    humMismatch,
+    tempDiff,
+    humDiff,
+    anLevel,
+    anMessage
+  );
+
+  String readingPath =
+    String("tunnels/") +
+    assignedTunnelId +
+    "/" +
+    String(READINGS_SUBCOLLECTION) +
+    "/" +
+    makeDocId();
+
+  String summaryPath =
+    String("tunnels/") +
+    assignedTunnelId +
+    "/sensorSummary/latest";
 
   float avgT = (lastT1 + lastT2) / 2.0;
   float avgH = (lastH1 + lastH2) / 2.0;
 
-  // 1) Create reading doc
+  // 1. Create reading doc
   FirebaseJson reading;
+
   reading.set("fields/gatewayId/stringValue", String(GATEWAY_ID));
   reading.set("fields/counter/stringValue", lastCounter);
 
@@ -610,7 +863,6 @@ bool storeToFirestore() {
   reading.set("fields/snr/doubleValue", isnan(lastSNR) ? 0.0 : lastSNR);
   reading.set("fields/ts/timestampValue", nowRFC3339Z());
 
-  // anomaly fields (flat)
   reading.set("fields/an_level/stringValue", anLevel);
   reading.set("fields/an_message/stringValue", anMessage);
   reading.set("fields/an_s1_temp_valid/booleanValue", s1TempValid);
@@ -619,17 +871,31 @@ bool storeToFirestore() {
   reading.set("fields/an_s2_hum_valid/booleanValue", s2HumValid);
   reading.set("fields/an_tempMismatch/booleanValue", tempMismatch);
   reading.set("fields/an_humMismatch/booleanValue", humMismatch);
-  if (isfinite(tempDiff)) reading.set("fields/an_tempDiff/doubleValue", tempDiff);
-  if (isfinite(humDiff))  reading.set("fields/an_humDiff/doubleValue", humDiff);
 
-  bool ok1 = Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", readingPath.c_str(), reading.raw());
+  if (isfinite(tempDiff)) {
+    reading.set("fields/an_tempDiff/doubleValue", tempDiff);
+  }
+
+  if (isfinite(humDiff)) {
+    reading.set("fields/an_humDiff/doubleValue", humDiff);
+  }
+
+  bool ok1 = Firebase.Firestore.createDocument(
+    &fbdo,
+    FIREBASE_PROJECT_ID,
+    "",
+    readingPath.c_str(),
+    reading.raw()
+  );
+
   if (!ok1) {
     Serial.print("Reading create FAILED: ");
     Serial.println(fbdo.errorReason());
   }
 
-  // 2) Patch summary/latest (fast UI)
+  // 2. Patch summary/latest for fast mobile UI
   FirebaseJson summary;
+
   summary.set("fields/gatewayId/stringValue", String(GATEWAY_ID));
   summary.set("fields/counter/stringValue", lastCounter);
 
@@ -645,7 +911,6 @@ bool storeToFirestore() {
   summary.set("fields/snr/doubleValue", isnan(lastSNR) ? 0.0 : lastSNR);
   summary.set("fields/lastSeenAt/timestampValue", nowRFC3339Z());
 
-  // anomaly fields
   summary.set("fields/an_level/stringValue", anLevel);
   summary.set("fields/an_message/stringValue", anMessage);
   summary.set("fields/an_s1_temp_valid/booleanValue", s1TempValid);
@@ -654,21 +919,51 @@ bool storeToFirestore() {
   summary.set("fields/an_s2_hum_valid/booleanValue", s2HumValid);
   summary.set("fields/an_tempMismatch/booleanValue", tempMismatch);
   summary.set("fields/an_humMismatch/booleanValue", humMismatch);
-  if (isfinite(tempDiff)) summary.set("fields/an_tempDiff/doubleValue", tempDiff);
-  if (isfinite(humDiff))  summary.set("fields/an_humDiff/doubleValue", humDiff);
+
+  if (isfinite(tempDiff)) {
+    summary.set("fields/an_tempDiff/doubleValue", tempDiff);
+  }
+
+  if (isfinite(humDiff)) {
+    summary.set("fields/an_humDiff/doubleValue", humDiff);
+  }
 
   String mask =
     "gatewayId,counter,s1_temp,s2_temp,avg_temp,s1_hum,s2_hum,avg_hum,"
     "rssi,snr,lastSeenAt,"
-    "an_level,an_message,an_s1_temp_valid,an_s2_temp_valid,an_s1_hum_valid,an_s2_hum_valid,an_tempMismatch,an_humMismatch,an_tempDiff,an_humDiff";
+    "an_level,an_message,an_s1_temp_valid,an_s2_temp_valid,"
+    "an_s1_hum_valid,an_s2_hum_valid,an_tempMismatch,an_humMismatch,"
+    "an_tempDiff,an_humDiff";
 
-  bool ok2 = Firebase.Firestore.patchDocument(&fbdo, FIREBASE_PROJECT_ID, "", summaryPath.c_str(), summary.raw(), mask.c_str());
+  bool ok2 = Firebase.Firestore.patchDocument(
+    &fbdo,
+    FIREBASE_PROJECT_ID,
+    "",
+    summaryPath.c_str(),
+    summary.raw(),
+    mask.c_str()
+  );
+
   if (!ok2) {
     Serial.print("Summary patch FAILED: ");
     Serial.println(fbdo.errorReason());
   }
 
   updateGatewayDoc(anLevel);
+
+  maybeWriteSensorFaultLog(
+    anLevel,
+    anMessage,
+    s1TempValid,
+    s2TempValid,
+    s1HumValid,
+    s2HumValid,
+    tempMismatch,
+    humMismatch,
+    tempDiff,
+    humDiff
+  );
+
   return ok1 && ok2;
 }
 
@@ -677,8 +972,9 @@ void setup() {
   Serial.begin(115200);
 
   Wire.begin(I2C_SDA, I2C_SCL);
+
   if (!oledBegin()) {
-    Serial.println("OLED not found at 0x3C/0x3D");
+    Serial.println("OLED not found at 0x3C or 0x3D");
     while (1) delay(10);
   }
 
@@ -687,7 +983,7 @@ void setup() {
 
   connectWiFiWithOLED();
 
-  oledStatus("Time: Syncing (NTP)...");
+  oledStatus("Time: Syncing NTP...");
   bool timeOk = initTime();
   oledStatus(String("Time: ") + (timeOk ? "OK" : "FAILED"));
   delay(700);
@@ -698,8 +994,8 @@ void setup() {
     while (1) delay(10);
   }
 
-  // ✅ create gateway doc so loraGateways appears
-  fetchAssignedTunnelId(); // ok if not exists
+  // Create gateway doc so loraGateways appears
+  fetchAssignedTunnelId();
   ensureGatewayDoc();
   updateGatewayDoc("OK");
 
@@ -716,7 +1012,7 @@ void setup() {
 void loop() {
   Firebase.ready(); // keep token alive
 
-  // periodic ensure (if first create failed due to auth delay)
+  // periodic ensure
   if (Firebase.ready() && (millis() - lastEnsureMs > ENSURE_INTERVAL_MS)) {
     ensureGatewayDoc();
     lastEnsureMs = millis();
@@ -729,9 +1025,13 @@ void loop() {
   }
 
   int packetSize = LoRa.parsePacket();
+
   if (packetSize) {
     String incoming = "";
-    while (LoRa.available()) incoming += (char)LoRa.read();
+
+    while (LoRa.available()) {
+      incoming += (char)LoRa.read();
+    }
 
     serialLine();
     Serial.println("LORA PACKET RECEIVED");
@@ -747,21 +1047,31 @@ void loop() {
 
     if (parseCSV5(incoming, counterStr, t1, h1, t2, h2)) {
       lastPacketMs = millis();
+      timeoutFaultActive = false;
 
       lastCounter = counterStr;
-      lastT1 = t1; lastH1 = h1;
-      lastT2 = t2; lastH2 = h2;
+      lastT1 = t1;
+      lastH1 = h1;
+      lastT2 = t2;
+      lastH2 = h2;
       lastRSSI = rssi;
       lastSNR = snr;
       haveData = true;
 
       drawData(t1, h1, t2, h2, rssi, snr);
+    } else {
+      Serial.println("Invalid LoRa CSV packet format.");
     }
   }
 
   if ((millis() - lastPacketMs) > WAITING_TIMEOUT_MS) {
-    if (!showingWaiting) showWaitingScreen();
+    if (!showingWaiting) {
+      showWaitingScreen();
+    }
   }
+
+  // Real downtime fault log after 60 seconds without LoRa data
+  writeSensorTimeoutFaultIfNeeded();
 
   if (haveData && (millis() - lastStoreMs >= STORE_INTERVAL_MS)) {
     lastStoreMs = millis();
@@ -769,8 +1079,10 @@ void loop() {
     if (WiFi.status() != WL_CONNECTED) {
       oledStatus("WiFi: Reconnecting...");
       connectWiFiWithOLED();
-      oledStatus("Time: Syncing (NTP)...");
+
+      oledStatus("Time: Syncing NTP...");
       initTime();
+
       fetchAssignedTunnelId();
       showWaitingScreen();
     }

@@ -12,7 +12,14 @@ export type RootStackParamList = {
   // Disease ✅ captureId not imageId
   DiseaseDashboard: undefined;
   DetectionFeed: undefined;
-  DetectionDetail: { tunnelId: string; plantId: string; captureId?: string };
+  DetectionDetail: {
+    tunnelId: string;
+    plantId: string;
+    captureId?: string;
+    imageId?: string;
+    id?: string;
+    filterMode?: "LEAF" | "CUCUMBER" | "ALL";
+  };
 
   // Alerts
   AlertDetail: { alertId: string };
@@ -24,6 +31,23 @@ export type RootStackParamList = {
   Schedules: undefined;
   ManualOverride: undefined;
   HarvestReady: undefined;
+
+  CucumberScans: {
+  tunnelId: string;
+  plantId: string;
+  plantTitle?: string;
+  row?: number;
+  column?: number;
+  rfidA?: string | null;
+  rfidB?: string | null;
+};
+
+CucumberScanDetail: {
+  tunnelId: string;
+  plantId: string;
+  captureId: string;
+  plantTitle?: string;
+};
 
   // System
   SystemHealth: undefined;

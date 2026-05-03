@@ -43,6 +43,9 @@ import TunnelSetupScreen from "../screens/settings/TunnelSetupScreen";
 import EditTunnelScreen from "../screens/settings/EditTunnelScreen";
 import TunnelSettingsScreen from "../screens/settings/TunnelSettingsScreen";
 
+import CucumberScansScreen from "../screens/actions/CucumberScansScreen";
+import CucumberScanDetailScreen from "../screens/actions/CucumberScanDetailScreen";
+
 // ... previous imports ...
 
 function AppContent() {
@@ -81,7 +84,17 @@ function AppContent() {
           <Stack.Screen name="Schedules" component={SchedulesScreen} options={{ title: "Schedules" }} />
           <Stack.Screen name="ManualOverride" component={ManualOverrideScreen} options={{ title: "Manual Override" }} />
           <Stack.Screen name="HarvestReady" component={HarvestReadyScreen} options={{ title: "Harvest Ready" }} />
+<Stack.Screen
+  name="CucumberScans"
+  component={CucumberScansScreen}
+  options={{ title: "Cucumber Scans" }}
+/>
 
+<Stack.Screen
+  name="CucumberScanDetail"
+  component={CucumberScanDetailScreen}
+  options={{ title: "Cucumber Scan Detail" }}
+/>
           {/* System */}
           <Stack.Screen name="SystemHealth" component={SystemHealthScreen} options={{ title: "System Health" }} />
           <Stack.Screen name="SensorFaultLogs" component={SensorFaultLogsScreen} options={{ title: "Sensor Fault Logs" }} />
