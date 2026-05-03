@@ -16,8 +16,8 @@
 #include "addons/RTDBHelper.h"
 
 // === FIREBASE ADDITION: CREDENTIALS ===
-#define WIFI_SSID "Janith"
-#define WIFI_PASSWORD "11223344"
+#define WIFI_SSID "Dialog 4G 931"
+#define WIFI_PASSWORD "9e0Ff6c3"
 #define API_KEY "AIzaSyA7mJ-uud7w7DDM94LGA4z-G8HJa2Q2qFA"
 
 // ====== FIRESTORE ======
@@ -445,6 +445,10 @@ void markCaptureDoneOnRobotDoc() {
   pushDataToFirebase();
 }
 
+// Servo helper forward declarations
+void setServoAngleForStepper(int angle);
+void setServoForScanDirection();
+
 void sprayOnePump(int pumpNo, int ms) {
   if (ms <= 0) return;
 
@@ -454,6 +458,11 @@ void sprayOnePump(int pumpNo, int ms) {
   pushDataToFirebase();
   logScanEvent(pumpLabel + "_START", currentPositionLabel + " stop#" + String(stepperStopIndex) + " ms=" + String(ms));
 
+  // Keep servo fixed according to stepper direction
+  // Upward  -> 90°
+  // Downward -> 40°
+  setServoForScanDirection();
+
   // Pump ON
   if (pumpNo == 1) {
     pump1On();
@@ -461,23 +470,7 @@ void sprayOnePump(int pumpNo, int ms) {
     pump2On();
   }
 
-  // Optional nozzle wiggle - kept same behavior as old sprayNow()
-  nozzleServo.attach(SERVO_PIN, 500, 2400);
-  delay(100);
-
-  nozzleServo.write(SERVO_ANGLE_A);
-  delay(200);
-
-  if (ms >= 2000) {
-    nozzleServo.write(SERVO_ANGLE_B);
-    delay(ms - 400);
-    nozzleServo.write(SERVO_ANGLE_A);
-    delay(200);
-  } else {
-    delay(ms);
-  }
-
-  nozzleServo.detach();
+  delay(ms);
 
   // Pump OFF
   if (pumpNo == 1) {
@@ -485,6 +478,9 @@ void sprayOnePump(int pumpNo, int ms) {
   } else {
     pump2Off();
   }
+
+  // After spraying, keep servo still fixed to scan direction
+  setServoForScanDirection();
 
   actuatorStatus = "OFF";
   pushDataToFirebase();
@@ -662,6 +658,26 @@ String getPositionLabelFromCount(int count) {
   return "NONE";
 }
 
+void setServoAngleForStepper(int angle) {
+  if (!nozzleServo.attached()) {
+    nozzleServo.attach(SERVO_PIN, 500, 2400);
+    delay(100);
+  }
+
+  nozzleServo.write(angle);
+  delay(300);
+}
+
+void setServoForScanDirection() {
+  if (movingForward) {
+    // Upward movement -> keep servo at 90 degrees
+    setServoAngleForStepper(SERVO_ANGLE_B);
+  } else {
+    // Downward movement -> keep servo at 40 degrees
+    setServoAngleForStepper(SERVO_ANGLE_A);
+  }
+}
+
 void moveForwardToClearMarker() {
   forward();
   delay(500);   // move forward to leave the black marker
@@ -672,19 +688,14 @@ void moveForwardToClearMarker() {
 void startStepperScanSequence() {
   Serial.println(">>> ENTERED startStepperScanSequence()");
 
-  // Servo to 90 before stepper starts
-  if (!nozzleServo.attached()) {
-    nozzleServo.attach(SERVO_PIN, 500, 2400);
-    delay(100);
-  }
-  nozzleServo.write(SERVO_ANGLE_B);   // 90 deg
-  delay(500);
+  movingForward = true;
+  nextStop = STEPS_PER_STOP;
+  stepperPauseActive = false;
+  captureWaitActive = false;
+  stepperStopIndex = 0;
 
-movingForward = true;
-nextStop = STEPS_PER_STOP;
-stepperPauseActive = false;
-captureWaitActive = false;
-stepperStopIndex = 0;
+  // Upward scan start වෙන්න කලින් servo එක 90° fixed කරන්න
+  setServoForScanDirection();
 
   stepper.setCurrentPosition(0);
   stepper.moveTo(nextStop);
@@ -963,26 +974,25 @@ void handleStepperScanMode() {
 
       logScanEvent("STEPPER_NEXT_FORWARD", currentPositionLabel + " next forward target " + String(nextStop / MOTOR_STEPS_PER_REV) + " rounds");
 
+      // Upward movement එකට කලින් servo 90° fixed කරන්න
+      setServoForScanDirection();
+
       stepper.moveTo(nextStop);
       return;
-        } else {
-  // Reached top, set servo to 40 before going down
-  if (!nozzleServo.attached()) {
-    nozzleServo.attach(SERVO_PIN, 500, 2400);
-    delay(100);
-  }
-  nozzleServo.write(SERVO_ANGLE_A);   // 40 deg
-  delay(500);
+    } else {
+      // Reached top. Now downward movement starts.
+      movingForward = false;
+      nextStop -= STEPS_PER_STOP;
 
-  movingForward = false;
-  nextStop -= STEPS_PER_STOP;
+      // Downward scan start වෙන්න කලින් servo එක 40° fixed කරන්න
+      setServoForScanDirection();
 
-  Serial.println("50 rounds reached. Servo set to 40. Switching to CCW.");
-  logScanEvent("STEPPER_SWITCH_CCW", currentPositionLabel + " reached 50 rounds, servo=40, switching to CCW");
+      Serial.println("50 rounds reached. Servo set to 40. Switching to CCW.");
+      logScanEvent("STEPPER_SWITCH_CCW", currentPositionLabel + " reached 50 rounds, servo=40, switching to CCW");
 
-  stepper.moveTo(nextStop);
-  return;
-}
+      stepper.moveTo(nextStop);
+      return;
+    }
   } else {
     if (nextStop > 0) {
       nextStop -= STEPS_PER_STOP;
@@ -992,6 +1002,9 @@ void handleStepperScanMode() {
       Serial.println(" rounds");
 
       logScanEvent("STEPPER_NEXT_BACKWARD", currentPositionLabel + " next backward target " + String(nextStop / MOTOR_STEPS_PER_REV) + " rounds");
+
+      // Downward movement එකට කලින් servo 40° fixed කරන්න
+      setServoForScanDirection();
 
       stepper.moveTo(nextStop);
       return;
